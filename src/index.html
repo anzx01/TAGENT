@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>智能操作助手</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: rgba(30, 30, 40, 0.95);
+      border-radius: 12px;
+      font-family: "Microsoft YaHei", sans-serif;
+      overflow: hidden;
+      user-select: none;
+    }
+    .bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      height: 60px;
+    }
+    .btn {
+      padding: 8px 16px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      color: #fff;
+      transition: opacity 0.2s;
+      min-width: 64px;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.35; cursor: default; }
+    .btn-record { background: #e74c3c; }
+    .btn-stop { background: #f39c12; }
+    .btn-play { background: #27ae60; }
+    .status {
+      font-size: 12px;
+      color: #aaa;
+      margin-left: 6px;
+      white-space: nowrap;
+    }
+    .status.recording { color: #e74c3c; }
+    .status.replaying { color: #27ae60; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <button class="btn btn-record" id="btnRecord">录制</button>
+    <button class="btn btn-stop" id="btnStop" disabled>停止</button>
+    <button class="btn btn-play" id="btnPlay">回放</button>
+    <span class="status" id="status">就绪</span>
+  </div>
+
+  <script>
+    const API = "http://127.0.0.1:18899";
+    const btnRecord = document.getElementById("btnRecord");
+    const btnStop = document.getElementById("btnStop");
+    const btnPlay = document.getElementById("btnPlay");
+    const statusEl = document.getElementById("status");
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = "status" + (cls ? " " + cls : "");
+    }
+
+    function setRecording(on) {
+      btnRecord.disabled = on;
+      btnStop.disabled = !on;
+      btnPlay.disabled = on;
+    }
+
+    btnRecord.addEventListener("click", async () => {
+      try {
+        const res = await fetch(API + "/record/start", { method: "POST" });
+        const data = await res.json();
+        if (data.ok) {
+          setStatus("录制中…", "recording");
+          setRecording(true);
+        } else {
+          setStatus(data.msg || "失败");
+        }
+      } catch (e) {
+        setStatus("服务未连接");
+      }
+    });
+
+    btnStop.addEventListener("click", async () => {
+      try {
+        const res = await fetch(API + "/record/stop", { method: "POST" });
+        const data = await res.json();
+        if (data.ok) {
+          setStatus(`已保存 ${data.event_count} 步`);
+          setRecording(false);
+        } else {
+          setStatus(data.msg || "失败");
+        }
+      } catch (e) {
+        setStatus("服务未连接");
+      }
+    });
+
+    btnPlay.addEventListener("click", async () => {
+      try {
+        const res = await fetch(API + "/replay/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ recording_id: null }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          setStatus("回放中…", "replaying");
+        } else {
+          setStatus(data.msg || "失败");
+        }
+      } catch (e) {
+        setStatus("服务未连接");
+      }
+    });
+  </script>
+</body>
+</html>

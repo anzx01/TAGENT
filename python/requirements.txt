@@ -1,0 +1,6 @@
+pynput==1.8.2
+pyautogui==0.9.54
+mss==10.2.0
+uiautomation==2.0.29
+fastapi==0.141.1
+uvicorn==0.52.1
