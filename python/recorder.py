@@ -420,6 +420,17 @@ class Recorder:
                     step["client_y"] = cy
                 except Exception:
                     pass
+        else:
+            # 键盘动作（input_text/key_press）：捕获前台窗口，回放时用于定位焦点
+            hwnd = win32gui.GetForegroundWindow()
+            if hwnd:
+                hwnd = win32gui.GetAncestor(hwnd, 2)  # GA_ROOT
+                window_title = win32gui.GetWindowText(hwnd)
+                try:
+                    rect = win32gui.GetWindowRect(hwnd)
+                    win_size = (rect[2] - rect[0], rect[3] - rect[1])
+                except Exception:
+                    pass
 
         step["hwnd"] = hwnd
         step["window"] = window_title
@@ -457,7 +468,7 @@ class Recorder:
 
         # 截图（仅鼠标动作截图；渲染较重，放后台线程避免阻塞事件分类）
         if action in ("click", "right_click", "double_click", "scroll"):
-            shot_name = f"shot_{self._shot_idx:04d}.png"
+            shot_name = f"shot_{self._shot_idx:04d}.jpg"
             self._shot_idx += 1
             step["screenshot"] = shot_name
             win_size = step.get("win_size")
@@ -474,14 +485,18 @@ class Recorder:
                 if img is None:
                     return
                 img = renderer.draw_grid(img)
-                # 坐标标记：窗口截图用客户区百分比，全屏截图用屏幕百分比
+                # 坐标标记
                 if client_x is not None and win_size:
                     mp_x = round(client_x / win_size[0] * 100, 1)
                     mp_y = round(client_y / win_size[1] * 100, 1)
                 else:
                     mp_x, mp_y = pct_x, pct_y
                 img = renderer.draw_marker(img, mp_x, mp_y)
-                img.save(str(shot_dir / shot_name))
+                # 阶段4.4 截屏压缩：JPEG quality=70 替代 PNG（体积减小 ~90%）
+                shot_name_jpg = shot_name.replace(".png", ".jpg")
+                # JPEG 不支持 RGBA/透明通道，需先转换为 RGB
+                save_img = img.convert("RGB") if img.mode != "RGB" else img
+                save_img.save(str(shot_dir / shot_name_jpg), "JPEG", quality=70)
 
             t = threading.Thread(target=_shoot, daemon=True)
             t.start()

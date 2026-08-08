@@ -54,6 +54,7 @@
     .status.recording { color: #e74c3c; }
     .status.replaying { color: #27ae60; }
     .status.paused { color: #f39c12; }
+    .status.error { color: #e74c3c; }
     .panel {
       position: absolute;
       top: 65px;
@@ -249,9 +250,21 @@
         setStatus("已停止回放"); setReplaying(false); stopPoll();
       } catch (_) { setStatus("服务未连接"); }
     });
-    btnList.addEventListener("click", () => {
+    btnList.addEventListener("click", async () => {
       panel.classList.toggle("show");
       if (panel.classList.contains("show")) refreshTasks();
+      // 悬浮条窗口固定 60px 高，任务库展开时需撑高窗口，否则面板在窗口外不可见
+      try {
+        const t = window.__TAURI__;
+        if (t && t.window && t.window.getCurrentWindow) {
+          const w = t.window.getCurrentWindow();
+          const h = panel.classList.contains("show") ? 500 : 60;
+          await w.setSize(new t.window.LogicalSize(360, h));
+          alert("resize ok: " + h);
+        } else {
+          alert("无 tauri window API: " + typeof window.__TAURI__);
+        }
+      } catch (e) { alert("面板窗口调整失败: " + e.message); }
     });
 
     // ---------- 退出应用（右上角 ✕）----------
@@ -285,7 +298,12 @@
             setStatus("等待接管", "paused");
             setReplaying(false);
             stopPoll();
-          } else setStatus("回放中…", "replaying");
+          } else if (d.error) {
+            setStatus(`步骤出错: ${d.step_desc || ''}`, "error");
+          } else {
+            const stepInfo = d.step_desc ? ` (${d.current_step + 1}/${d.total}: ${d.step_desc})` : '';
+            setStatus("回放中…" + stepInfo, "replaying");
+          }
         } catch (_) { stopPoll(); }
       }, 800);
     }
@@ -306,11 +324,12 @@
       showModal(`
         <h4>请接管操作</h4>
         <p style="font-size:12px;color:#ccc;margin-bottom:10px;">
-          回放遇到不确定情况已暂停。请像平时一样手动完成这一步的剩余操作，完成后点击下方按钮：
+          回放遇到不确定情况已暂停。你可以：
         </p>
         <button class="primary" onclick="hideModal();resumeReplay()">已接管完成，继续</button>
+        <button class="cancel" onclick="hideModal();rerecordStep()">重新演示此步</button>
         <button class="cancel" onclick="hideModal();stopReplay()">停止回放</button>
-        <div class="hint">助手会把你的操作记录为纠错（阶段3.2），下次遇到同样情况会自动使用。</div>
+        <div class="hint">接管：手动完成此步，助手记录为纠错；重新演示：从此步开始重新录制替代操作。</div>
       `);
     }
     async function resumeReplay() {
@@ -319,6 +338,18 @@
         const data = await res.json();
         setStatus(data.msg || "已继续");
         if (data.ok) startPoll();
+      } catch (_) { setStatus("服务未连接"); }
+    }
+    async function rerecordStep() {
+      try {
+        const res = await fetch(API + "/replay/rerecord", { method: "POST" });
+        const data = await res.json();
+        if (data.ok) {
+          setStatus("重新演示中：请操作正确步骤…", "recording");
+          setRecording(true);
+        } else {
+          setStatus(data.msg || "操作失败");
+        }
       } catch (_) { setStatus("服务未连接"); }
     }
     async function stopReplay() {
@@ -391,6 +422,15 @@
       const target = pendingAppendTarget;
       pendingAppendTarget = null;
       try {
+        const dry = await fetch(`${API}/recordings/${target}/merge/${recId}`,
+          { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dry: true }) });
+        const dryData = await dry.json();
+        if (dryData.warning && !confirm(dryData.warning)) {
+          setStatus("已取消合并，追加录制保留为独立任务");
+          refreshTasks();
+          return;
+        }
         const res = await fetch(`${API}/recordings/${target}/merge/${recId}`, { method: "POST" });
         const data = await res.json();
         if (data.ok) setStatus(`已合并：任务现有 ${data.steps} 步，去重 ${data.removed} 步`);

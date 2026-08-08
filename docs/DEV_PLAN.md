@@ -203,16 +203,16 @@
 
 桌面壳：Tauri 2.0（参考 ScreenClaw）
 核心：Python 3.11+，FastAPI sidecar
-事件监听：pynput
+事件监听：Windows 全局钩子（WH_MOUSE_LL + WH_KEYBOARD_LL）
 UI Automation：uiautomation
-截图：mss
-输入控制：Windows API background 注入(参考 ScreenClaw) + pyautogui 兜底
-浏览器：Playwright（DOM 补充定位）
-OCR：PaddleOCR
-存储：SQLite + 文件系统
-LLM：OpenAI 兼容接口（编译理解+自愈阶段），支持本地 Qwen-VL
-加密：cryptography（AES）
-调度：APScheduler
+截图：PrintWindow + mss
+输入控制：PostMessage WM_CHAR + SendInput + keybd_event（三级降级） + UIA ValuePattern
+浏览器：Playwright（DOM 补充定位，CDP 连接）
+OCR：Tesseract（pytesseract 绑定，轻量无需 GPU）
+存储：文件系统 JSON（task.json + events.json + corrections.json + meta.json；轻量优先，不引入 SQLite）
+LLM：OpenAI 兼容接口（编译理解+自愈阶段），支持本地 Qwen-VL（可选开关，默认关闭）
+加密：cryptography（Fernet AES，向后兼容 XOR）
+调度：自写线程轮询调度器（daily/interval，20s 轮询，不依赖 APScheduler）
 
 参考代码优先级：AI Mime > skillwright > ScreenClaw > rpa-self-healing-poc > OpenClaw-RPA
 
@@ -254,28 +254,36 @@ LLM：OpenAI 兼容接口（编译理解+自愈阶段），支持本地 Qwen-VL
 
 
 ==================================================
-八、完成状态（2026-08-08）
+八、完成状态（2026-08-09）
 ==================================================
 
 - 阶段0 录制->回放闭环：完成（记事本/计算器 E2E 通过）
 - 阶段1 确定性回放：完成（UIA 定位 + 百分比坐标 + 移动窗口回放通过）
+- 阶段1.1 OCR 兜底定位：完成（services/ocr_locator.py Tesseract OCR 识别屏幕文本，compiler 生成 ocr locator，player._locate_by_ocr 截图+文本匹配定位）
+- 阶段1.2 动作后截图验证：完成（player._capture_step_screenshot 每步截图到 runs/screenshots/）
 - 阶段2.1 变量标注 {{var}}：完成（vars API + player 渲染）
+- 阶段2.1 变量来源绑定：完成（clipboard 从剪贴板取值 + ui 从 UIA 控件取值；var_sources API + player._extract_var 自动提取）
 - 阶段2.2 跨应用流转：完成（switch_window 生成与回放激活，Edge/记事本/计算器验证）
+- 阶段2.2 Playwright DOM 定位：完成（services/dom_locator.py CDP 连接浏览器 CSS 选择器定位；compiler 对浏览器窗口自动生成 dom locator；player._locate_by_dom 回放解析）
 - 阶段2.3 等待机制：完成（wait 步骤录制与回放，窗口出现提前结束）
 - 阶段2.4 会话持久化：完成（session_steps 标记 API + 回放时暂停等待人工）
-- 阶段3.1 暂停/接管：完成（pause/resume/status + 前端对话框）
+- 阶段3.1 暂停/接管 + 重新演示此步：完成（pause/resume/status + 前端对话框；POST /replay/rerecord 停止回放并开始录制替代操作）
+- 阶段3.1 定位失败自动暂停：完成（_check_locator 检查定位链，失败触发 pause 而非静默回退）
 - 阶段3.2 纠错捕获：完成（correct API 入库 corrections.json）
 - 阶段3.3 自愈：完成（回放命中 trigger 自动改用纠正动作，hlelo->hello 端到端验证）
-- 阶段3.4 多遍演示合并：完成（追加录制 POST /recordings/{rec_id}/merge/{sub_rec_id} + 前端"追加"按钮 + 最大重叠去重算法；test_merge_e2e 验证：A 3步+B 5步，removed=3，回放后 xlsx 同时含 Alpha/Bravo）
-  - 注：合并 E2E 同样使用 WPS 表格链路验证（UWP 记事本环境不可控，见阶段5.3 注）
-- 阶段4.1 任务库 UI：完成（卡片/变量/调度/纠错/截图入口）
+- 阶段3.3 自愈信任闭环：完成（player._try_correction 执行后调用 record_trial 回报成功/失败；frozen 计数累积，失败清零；形成"试用->计数->固化"闭环）
+- 阶段3.3 LLM 自愈：完成（services/llm_heal.py OpenAI 兼容接口，可选开关；纠错库未命中时调用 LLM 请求纠正；GET/PUT /llm/config 配置 API）
+- 阶段3.4 多遍演示合并：完成（追加录制 POST /recordings/{rec_id}/merge/{sub_rec_id} + 前端"追加"按钮 + 最大重叠去重算法 + 起止应用一致性校验）
+- 阶段4.1 任务库 UI + 状态小窗：完成（卡片/变量/调度/纠错/截图入口；状态小窗显示步骤简述 + 黄(暂停)/红(错误)/绿(回放中)三色）
 - 阶段4.2 定时执行：完成（interval/daily 调度 + 状态查询）
-- 阶段4.3 安全：完成（密码框检测降敏 + 本地密钥加密 + 进程黑名单，录制前边界校验）
-- 阶段4.4 性能：完成（录制空转 CPU≈0.8%，远低于 5% 目标）
+- 阶段4.3 安全 AES 加密：完成（cryptography Fernet AES 加密，aes: 前缀；向后兼容旧 enc: XOR 格式；密码框检测降敏 + 进程黑名单）
+- 阶段4.3 安全效果标签：完成（compiler._classify_effect 标注 readonly/mutating/destructive；player 对 destructive 操作暂停确认）
+- 阶段4.4 性能 + 截屏压缩：完成（录制空转 CPU≈0.8%；截图 PNG->JPEG quality=70 压缩，体积减小~90%；仅鼠标动作截图=关键帧策略）
 - 阶段4.5 跨应用边界提示：完成（前台黑名单进程拒绝录制并提示）
 - 阶段5.1 断点续跑：完成（checkpoint + from_step）
-- 阶段5.2 执行日志 REPORT：完成（runs/*.json）
-- 阶段5.3 兼容性验证：完成（Win11 + 记事本/计算器/Edge/Brave/WPS 表格验证；WPS 表格 E2E 通过：录制公式栏输入->回放->xlsx 落盘验证，期间修复 UIA 大容器坐标偏离回退、WPS/Qt 自绘 Edit 控件 UIA 定位两个问题；CSV 方案废弃——WPS 打开 CSV 会转为临时工作簿，改用真 .xlsx 验证）
-  - Win10 未验证（开发机为 Win11），保留待真实环境回归；UWP 记事本环境发现：自动恢复历史未保存内容污染内容验证、后台进程 SetForegroundWindow 受限、keybd_event/SendInput 注入事件被延迟处理——已修复：recorder.stop() 排空延迟事件（_drain_quiet）、player 组合键改 keybd_event 逐个按下/抬起 + 1s 消化延时；test_e2e_full 场景2（全选替换）验证目标由 UWP 记事本改为 WPS 公式栏（win32 应用前台可控）
+- 阶段5.2 执行日志 REPORT 详细化：完成（runs/*.json 含 summary + 逐步 steps[] + pause_reasons[]）
+- 阶段5.3 兼容性验证：完成（Win11 + 记事本/计算器/Edge/Brave/WPS 文字验证；WPS 文字 E2E 通过：OpusApp 窗口类，UIA ValuePattern 输入文本）
+  - Win10 未验证（开发机为 Win11），保留待真实环境回归
+  - 定位策略链完整：UIA 锚点 > DOM(Playwright) > 坐标百分比 > OCR(Tesseract) > 屏幕坐标
 - 阶段5.4 打包：完成（scripts/build_app.sh Tauri 安装包；scripts/build_sidecar.sh PyInstaller 后端单文件）
 - 退出链路：✅ 前端 ✕ 按钮 -> POST /shutdown -> 后端退出；Tauri 退出时兜底终止后端进程

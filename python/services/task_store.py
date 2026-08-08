@@ -72,6 +72,24 @@ class TaskStore:
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return True
 
+    # ---------- 阶段2.1：变量来源绑定 ----------
+
+    def get_var_sources(self, rec_id: str) -> dict:
+        """获取变量来源定义: {var_name: {type, ...}}"""
+        meta = self.load_meta(rec_id)
+        return meta.get("var_sources", {})
+
+    def set_var_source(self, rec_id: str, var_name: str, source: dict | None):
+        """设置变量来源。source: {type: "clipboard"|"ui", ...} 或 None 删除"""
+        meta = self.load_meta(rec_id)
+        sources = meta.get("var_sources", {})
+        if source is None:
+            sources.pop(var_name, None)
+        else:
+            sources[var_name] = source
+        meta["var_sources"] = sources
+        self.save_meta(rec_id, meta)
+
     # ---------- 阶段4.2：定时调度配置 ----------
 
     def schedule(self, rec_id: str) -> dict | None:

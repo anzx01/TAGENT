@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from paths import BASE_DIR
 from recorder import Recorder
 from player import Player
 from compiler import Compiler
@@ -57,10 +58,10 @@ async def guard(request: Request, call_next):
     return await call_next(request)
 
 
-DATA_DIR = Path(__file__).parent.parent / "recordings"
+DATA_DIR = BASE_DIR / "recordings"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-TASKS_DB = Path(__file__).parent.parent / "data" / "schedules.json"
+TASKS_DB = BASE_DIR / "data" / "schedules.json"
 
 # 当前录制会话
 _recorder: Recorder | None = None
@@ -100,14 +101,16 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
 
     # 阶段2.4：会话步骤（登录/2FA）
     from services.task_store import TaskStore
-    session_steps = TaskStore(DATA_DIR).load_meta(rec_id).get("session_steps", [])
+    _ts = TaskStore(DATA_DIR)
+    session_steps = _ts.load_meta(rec_id).get("session_steps", [])
+    var_sources = _ts.get_var_sources(rec_id)  # 阶段2.1：变量来源
 
     # 阶段3.3：纠错库（自愈），回放时优先尝试人工纠正动作
     from services.corrections import CorrectionStore
     corrections = CorrectionStore(rec_dir).load()
 
     # 阶段5.1：checkpoint 文件（断点续跑）
-    ckpt_dir = Path(__file__).parent.parent / "data"
+    ckpt_dir = BASE_DIR / "data"
     ckpt_dir.mkdir(exist_ok=True)
     ckpt_file = ckpt_dir / f"ckpt_{rec_id}.json"
 
@@ -115,8 +118,13 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
         try:
             _player = Player(str(path), variables=variables or {},
                              session_steps=session_steps,
-                             corrections=corrections)
+                             corrections=corrections,
+                             var_sources=var_sources)
             _player.checkpoint_path = ckpt_file
+            _player._rec_id = rec_id
+            # 阶段1.2：回放截图目录
+            ss_dir = BASE_DIR / "runs" / "screenshots" / rec_id
+            _player.screenshot_dir = str(ss_dir)
             log.info("开始回放: %s (%d 步)", path, len(_player.steps))
             result = _player.play(from_step=from_step)
             log.info("回放完成: %s", path)
@@ -124,7 +132,7 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
             _write_report(rec_id, result)
         except Exception:
             log.exception("回放出错: %s", path)
-            _write_report(rec_id, "回放异常")
+            _write_report(rec_id, {"summary": "回放异常", "steps": [], "pause_reasons": []})
         finally:
             with _player_lock:
                 _player = None
@@ -135,15 +143,21 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
     return rec_id
 
 
-def _write_report(rec_id: str, summary: str):
-    """阶段5.2：执行日志 REPORT"""
+def _write_report(rec_id: str, result):
+    """阶段5.2：执行日志 REPORT（逐步结果+暂停原因）"""
     try:
-        report_dir = Path(__file__).parent.parent / "runs"
+        report_dir = BASE_DIR / "runs"
         report_dir.mkdir(parents=True, exist_ok=True)
         fname = f"{time.strftime('%Y%m%d_%H%M%S')}_{rec_id}.json"
+        # 兼容字符串和 dict 两种格式
+        if isinstance(result, str):
+            report = {"rec_id": rec_id, "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                      "summary": result, "steps": [], "pause_reasons": []}
+        else:
+            report = {"rec_id": rec_id, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+            report.update(result)
         (report_dir / fname).write_text(
-            json.dumps({"rec_id": rec_id, "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "result": summary}, ensure_ascii=False, indent=2),
+            json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8")
     except Exception:
         log.exception("REPORT 写入失败")
@@ -297,15 +311,55 @@ def resume_replay():
 
 @app.get("/replay/status")
 def replay_status():
-    """回放状态（阶段4 状态小窗）"""
+    """回放状态（阶段4 状态小窗：步骤简述 + 暂停/错误态）"""
     if not _player:
         return {"ok": True, "playing": False}
+    current = len(_player._step_results)
+    step_desc = ""
+    step_error = False
+    if current < len(_player.steps):
+        step = _player.steps[current]
+        action = step.get("action", "")
+        text = step.get("text", step.get("key", ""))
+        step_desc = f"{action} {text}".strip()[:40]
+    # 检查最近步骤是否有错误
+    if _player._step_results:
+        last = _player._step_results[-1]
+        step_error = last.get("status") == "paused" and "失败" in last.get("detail", "")
     return {
         "ok": True,
         "playing": True,
         "paused": _player.paused,
         "total": len(_player.steps),
+        "current_step": current,
+        "step_desc": step_desc,
+        "error": step_error,
     }
+
+
+@app.post("/replay/rerecord")
+def rerecord_step():
+    """阶段3.1：'重新演示此步' -- 停止回放，开始录制替代操作"""
+    global _player, _recorder
+    if not _player:
+        return {"ok": False, "msg": "没有进行中的回放"}
+    # 记录当前步骤索引
+    current_step = len(_player._step_results)
+    rec_id = getattr(_player, '_rec_id', '')
+    # 停止回放
+    _player.stop()
+    with _player_lock:
+        _player = None
+    # 开始录制
+    with _recorder_lock:
+        if _recorder is not None:
+            _recorder.stop()
+        from recorder import Recorder
+        _recorder = Recorder()
+        _recorder.start()
+    log.info("重新演示此步：从步骤 %d 开始录制", current_step)
+    return {"ok": True, "msg": "已开始录制，请演示正确操作",
+            "from_step": current_step, "rec_id": rec_id}
 
 
 @app.get("/replay/checkpoint/{rec_id}")
@@ -313,7 +367,7 @@ def get_checkpoint(rec_id: str):
     """阶段5.1：查询断点位置（上次中断处）"""
     if _resolve_rec_dir(rec_id) is None:
         return {"ok": False, "msg": "找不到任务"}
-    ckpt = Path(__file__).parent.parent / "data" / f"ckpt_{rec_id}.json"
+    ckpt = BASE_DIR / "data" / f"ckpt_{rec_id}.json"
     if not ckpt.exists():
         return {"ok": True, "checkpoint": None}
     import json as _json
@@ -370,6 +424,47 @@ def delete_recording(rec_id: str):
     return {"ok": True}
 
 
+def _merge_warning(base: list[dict], extra: list[dict]) -> str | None:
+    """PRD 4.1：按起止应用一致性判定两次录制是否可能是同一任务的不同分支。
+    取两次录制的起始/结束窗口标题，任一方向无公共子串（>=5 字符）即视为不同应用，
+    提示用户避免误合并。"""
+    def _ends(steps: list[dict]) -> tuple[str | None, str | None]:
+        start = end = None
+        for s in steps:
+            w = s.get("window") or s.get("win")
+            if not w:
+                continue
+            if start is None:
+                start = w
+            end = w
+        return start, end
+
+    def _same_app(a: str, b: str) -> bool:
+        if a == b:
+            return True
+        la, lb = len(a), len(b)
+        if la > lb:
+            a, b = b, a
+        # 最长公共子串 >= 5 视为同一应用（容忍标题动态部分，如 *Second - Notepad）
+        n = len(a)
+        best = 0
+        for i in range(n):
+            for j in range(i + best + 1, n + 1):
+                if b.find(a[i:j]) != -1:
+                    best = j - i
+                else:
+                    break
+        return best >= 5
+
+    b0, b1 = _ends(base)
+    e0, e1 = _ends(extra)
+    if b0 and e0 and not _same_app(b0, e0):
+        return f"两次录制的起始应用不同（{e0} vs {b0}），这看起来像另一个任务，仍要合并吗？"
+    if b1 and e1 and not _same_app(b1, e1):
+        return f"两次录制的结束应用不同（{e1} vs {b1}），这看起来像另一个任务，仍要合并吗？"
+    return None
+
+
 def _same_step(a: dict, b: dict) -> bool:
     """阶段3.4：判定两步操作是否等价（用于追加录制去重）"""
     if a.get("action") != b.get("action"):
@@ -413,8 +508,9 @@ def _merge_steps(base: list[dict], extra: list[dict]) -> tuple[list[dict], int]:
 
 
 @app.post("/recordings/{rec_id}/merge/{sub_rec_id}")
-def merge_recording(rec_id: str, sub_rec_id: str):
-    """阶段3.4：把第二次追加录制的步骤合并进目标任务（重复前缀去重），并删除追加录制目录"""
+def merge_recording(rec_id: str, sub_rec_id: str, body: dict | None = None):
+    """阶段3.4：把第二次追加录制的步骤合并进目标任务（重复前缀去重），并删除追加录制目录。
+    body.dry=true 时仅做校验（起止应用一致性），不执行合并、不删除追加录制。"""
     target = _resolve_rec_dir(rec_id)
     sub = _resolve_rec_dir(sub_rec_id)
     if target is None or sub is None:
@@ -437,6 +533,10 @@ def merge_recording(rec_id: str, sub_rec_id: str):
         return {"ok": False, "msg": "追加录制没有内容"}
     if not base:
         return {"ok": False, "msg": "目标任务为空，请先完成首次录制"}
+
+    warning = _merge_warning(base, extra)
+    if body and body.get("dry"):
+        return {"ok": True, "warning": warning}
 
     merged, removed = _merge_steps(base, extra)
 
@@ -467,7 +567,7 @@ def merge_recording(rec_id: str, sub_rec_id: str):
         log.exception("合并后重编译失败: %s", e)
 
     return {"ok": True, "steps": len(merged), "removed": removed,
-            "task_path": task_path}
+            "warning": warning, "task_path": task_path}
 
 
 def _resolve_rec_dir(rec_id: str) -> Path | None:
@@ -528,7 +628,7 @@ def _list_recordings() -> list[dict]:
 if __name__ == "__main__":
     import uvicorn
     # 挂载前端静态文件（不依赖 Tauri 也能浏览器访问）
-    frontend_dir = Path(__file__).parent.parent / "src"
+    frontend_dir = BASE_DIR / "src"
     if frontend_dir.exists():
         app.mount("/ui", StaticFiles(directory=str(frontend_dir), html=True), name="ui")
 
@@ -536,5 +636,19 @@ if __name__ == "__main__":
     _scheduler = Scheduler(TASKS_DB, _scheduled_run)  # noqa: F841 (模块级状态)
     _scheduler.start()
     app.include_router(build_router(DATA_DIR, _scheduler))
+
+    # LLM 自愈配置 API
+    @app.get("/llm/config")
+    def get_llm_config():
+        from services.llm_heal import get_healer
+        h = get_healer()
+        return {"ok": True, "config": h.get_config(), "enabled": h.enabled}
+
+    @app.put("/llm/config")
+    def set_llm_config(body: dict):
+        from services.llm_heal import get_healer
+        h = get_healer()
+        h.set_config(body)
+        return {"ok": True, "enabled": h.enabled}
 
     uvicorn.run(app, host="127.0.0.1", port=18899)

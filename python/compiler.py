@@ -63,6 +63,9 @@ class Compiler:
         # 生成定位策略
         compiled["locator"] = self._build_locator(step)
 
+        # 阶段4 安全效果标签（借鉴 skillwright）
+        compiled["effect"] = self._classify_effect(step)
+
         # 保留原始坐标作为兜底
         for key in ("pct_x", "pct_y", "screen_x", "screen_y",
                     "client_x", "client_y", "window", "win_size"):
@@ -75,8 +78,30 @@ class Compiler:
 
         return compiled
 
+    # 安全效果分类关键词
+    DESTRUCTIVE_KEYWORDS = ("delete", "remove", "clear", "format", "drop", "truncate",
+                           "清空", "删除", "格式化", "卸载", "永久")
+    MUTATING_KEYWORDS = ("input", "type", "click", "press", "save", "send", "submit",
+                         "drag", "scroll", "paste")
+
+    def _classify_effect(self, step) -> str:
+        """阶段4 安全效果标签：readonly / mutating / destructive"""
+        action = step.get("action", "")
+        text = (step.get("text", "") or "").lower()
+        key = (step.get("key", "") or "").lower()
+        combined = f"{action} {text} {key}"
+        # 破坏性：含删除/清空/格式化等关键词
+        for kw in self.DESTRUCTIVE_KEYWORDS:
+            if kw in combined:
+                return "destructive"
+        # 只读：wait / switch_window / 无动作
+        if action in ("wait", "switch_window") or not action:
+            return "readonly"
+        # 修改：其他所有动作（click/input/scroll 等）
+        return "mutating"
+
     def _build_locator(self, step):
-        """构建定位策略链"""
+        """构建定位策略链：UIA > DOM > 坐标百分比 > OCR > 屏幕坐标"""
         strategies = []
         uia = step.get("uia")
 
@@ -95,7 +120,15 @@ class Compiler:
                 strat["sibling_index"] = uia["sibling_index"]
             strategies.append(strat)
 
-        # 策略2: 窗口内百分比 + 窗口标题（窗口移动/分辨率变化仍有效）
+            # 策略2: DOM 定位（仅浏览器窗口，阶段2.2）
+            window_title = step.get("window", "")
+            from services.dom_locator import is_browser_window, build_dom_locator
+            if is_browser_window(window_title):
+                dom_loc = build_dom_locator(uia)
+                if dom_loc:
+                    strategies.append(dom_loc)
+
+        # 策略3: 窗口内百分比 + 窗口标题
         if "client_x" in step and "client_y" in step and step.get("win_size"):
             w, h = step["win_size"]
             if w > 0 and h > 0:
@@ -106,7 +139,7 @@ class Compiler:
                     "window": step.get("window", ""),
                 })
 
-        # 策略3: 屏幕百分比坐标兜底
+        # 策略4: 屏幕百分比坐标
         if "pct_x" in step and "pct_y" in step:
             strategies.append({
                 "type": "coord",
@@ -115,7 +148,15 @@ class Compiler:
                 "window": step.get("window", ""),
             })
 
-        # 策略4: 纯坐标兜底
+        # 策略5: OCR 文本兜底（阶段1.1）
+        if uia and uia.get("name"):
+            strategies.append({
+                "type": "ocr",
+                "text": uia.get("name", ""),
+                "window": step.get("window", ""),
+            })
+
+        # 策略6: 纯坐标兜底
         if "screen_x" in step:
             strategies.append({
                 "type": "screen_coord",

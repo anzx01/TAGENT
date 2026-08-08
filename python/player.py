@@ -29,7 +29,7 @@ for i in range(12):
 
 class Player:
     def __init__(self, events_path, variables=None, session_steps=None,
-                 corrections=None):
+                 corrections=None, var_sources=None):
         self.events_path = Path(events_path)
         with open(self.events_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -37,12 +37,17 @@ class Player:
         self.steps = data.get("steps", [])
         self._stopped = False
         self.variables = variables or {}
+        self.var_sources = var_sources or {}  # 阶段2.1：变量来源绑定
         self.on_pause = None  # 阶段3：等待人工接管时的回调（state 更新）
         self._paused = False
         self._resume = None
         self._session_steps = set(session_steps or [])  # 阶段2.4
         self.checkpoint_path = None  # 阶段5.1：断点续跑
         self._corrections = corrections or []  # 阶段3.3：自愈库
+        self._step_results = []  # 阶段5.2：逐步结果
+        self._pause_reasons = []  # 阶段5.2：暂停原因
+        self.screenshot_dir = None  # 阶段1.2：回放截图目录
+        self._rec_id = ""  # 录制 ID（用于重新演示此步）
 
     def stop(self):
         self._stopped = True
@@ -71,9 +76,11 @@ class Player:
     def play(self, step_delay=0.5, start_delay=0.5, max_wait=15.0, from_step=0):
         """逐步回放。单步最长等待 max_wait 秒，防止录制长停顿导致回放卡死。
         from_step: 阶段5.1 断点续跑，从指定步骤继续。
-        返回 (完成步数, 是否被中断)。"""
+        返回 dict: {summary, steps, pause_reasons}。"""
         self._stopped = False
         self._paused = False
+        self._step_results = []
+        self._pause_reasons = []
         if start_delay > 0:
             time.sleep(start_delay)
         # 强制前台窗口获得焦点
@@ -102,20 +109,61 @@ class Player:
                 break
             # 阶段2.4：会话步骤（登录/2FA）暂停，等人工
             if i in self._session_steps:
+                self._pause_reasons.append({"step": i, "reason": "会话步骤(登录/2FA)"})
                 self._pause_for_human(i)
             if self._stopped:
                 break
             action = step.get("action", "?")
             text = step.get("text", step.get("key", ""))
             log.info("[回放 %d/%d] %s %s", i + 1, len(self.steps), action, text)
-            if not self._try_correction(i):
-                self._play_step(step)
+            step_ok = True
+            step_detail = ""
+            # 阶段4 安全效果标签：破坏性操作暂停确认
+            if step.get("effect") == "destructive":
+                self._pause_reasons.append({"step": i, "reason": f"破坏性操作需确认: {action} {text[:20]}"})
+                log.warning("  步骤 %d 破坏性操作，暂停确认", i)
+                self._pause_for_human(i)
+                if self._stopped:
+                    break
+            # 阶段3.1：定位失败 -> 尝试纠错库 -> 尝试 LLM -> 暂停
+            locator_failed = False
+            if step.get("action") in ("click", "right_click") and step.get("locator"):
+                if not self._check_locator(step):
+                    locator_failed = True
+                    if self._try_correction(i):
+                        step_detail = "纠错库命中"
+                    else:
+                        llm_step = self._try_llm_heal(i, step, "定位失败")
+                        if llm_step:
+                            self._play_step(llm_step)
+                            step_detail = "LLM自愈成功"
+                        else:
+                            step_ok = False
+                            step_detail = "定位失败"
+                            self._pause_reasons.append({"step": i, "reason": f"定位失败: {action}"})
+                            log.warning("  步骤 %d 定位失败，暂停等待人工", i)
+                            self._pause_for_human(i)
+                            if self._stopped:
+                                break
+            if step_ok and not locator_failed:
+                if not self._try_correction(i):
+                    self._play_step(step)
+                step_detail = step_detail or "成功"
+            # 截图验证
+            self._capture_step_screenshot(i)
+            self._step_results.append({
+                "step": i, "action": action, "text": text[:50],
+                "status": "ok" if step_ok else "paused", "detail": step_detail,
+                "ts": time.strftime("%H:%M:%S")
+            })
             done = i + 1
             self._save_checkpoint(i + 1)
             prev_t = step.get("t", 0)
             time.sleep(step_delay)
         interrupted = self._stopped
-        return f"完成 {done}/{len(self.steps)} 步" + (" (已中断)" if interrupted else "")
+        summary = f"完成 {done}/{len(self.steps)} 步" + (" (已中断)" if interrupted else "")
+        return {"summary": summary, "steps": self._step_results,
+                "pause_reasons": self._pause_reasons}
 
     def _pause_for_human(self, step_index):
         """阶段2.4：会话步骤（登录/2FA）暂停，等人工完成"""
@@ -136,8 +184,38 @@ class Player:
         except Exception:
             pass
 
+    def _check_locator(self, step):
+        """阶段3.1：检查定位策略链是否能找到元素，失败返回 False"""
+        locators = step.get("locator", [])
+        if not locators:
+            return True  # 无 locator 不检查
+        raw = (step.get("screen_x"), step.get("screen_y"))
+        for loc in locators:
+            x, y = self._try_locator(loc, raw)
+            if x is not None and y is not None:
+                return True
+        return False
+
+    def _capture_step_screenshot(self, step_idx):
+        """阶段1.2：回放每步后截图验证"""
+        if not self.screenshot_dir:
+            return
+        try:
+            fg = win32gui.GetForegroundWindow()
+            if not fg:
+                return
+            from capture import capture_window
+            img = capture_window(fg)
+            if img:
+                path = Path(self.screenshot_dir) / f"step_{step_idx:03d}.png"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                img.save(str(path))
+        except Exception as e:
+            log.debug("截图失败(step %d): %s", step_idx, e)
+
     def _try_correction(self, idx):
-        """阶段3.3 自愈：当前步骤与纠错库 trigger 匹配时，改用人工纠正后的步骤执行。"""
+        """阶段3.3 自愈：当前步骤与纠错库 trigger 匹配时，改用人工纠正后的步骤执行。
+        执行后调用 record_trial 回报成功/失败，形成信任闭环。"""
         if not self._corrections or idx == 0:
             return False
         from services.corrections import CorrectionStore as _CS
@@ -159,13 +237,43 @@ class Player:
         correct = best.get("correct", [])
         if not correct:
             return False
-        log.info("  命中纠错 %s：回放人工纠正步骤 (%d 步)", best.get("id"), len(correct))
+        corr_id = best.get("id", "")
+        log.info("  命中纠错 %s：回放人工纠正步骤 (%d 步)", corr_id, len(correct))
+        success = True
         for c in correct:
             if self._stopped:
+                success = False
                 break
             self._play_step(c)
             time.sleep(0.4)
+        # 阶段3.3 信任闭环：回报试用结果，成功+1，失败清零
+        if corr_id:
+            try:
+                from services.corrections import CorrectionStore
+                store = CorrectionStore(self.events_path.parent)
+                store.record_trial(corr_id, success)
+                frozen = best.get("frozen", 0) + (1 if success else 0)
+                log.info("  纠错 %s 信任计数 -> %d", corr_id, frozen)
+            except Exception as e:
+                log.debug("信任回报失败: %s", e)
         return True
+
+    def _try_llm_heal(self, idx, failed_step, error=""):
+        """阶段3.3 LLM 自愈：纠错库未命中时，向 LLM 请求纠正建议"""
+        try:
+            from services.llm_heal import get_healer
+            healer = get_healer()
+            if not healer.enabled:
+                return None
+            context = self.steps[max(0, idx-2):idx]
+            log.info("  尝试 LLM 自愈 (步骤 %d)...", idx)
+            result = healer.heal(failed_step, context, error)
+            if result and isinstance(result, dict):
+                log.info("  LLM 自愈建议: %s", result.get("action", "?"))
+                return result
+        except Exception as e:
+            log.debug("LLM 自愈异常: %s", e)
+        return None
 
     def _do_wait(self, step, prev_t):
         """等待步骤：等待目标窗口出现（阶段2.3），超时则继续"""
@@ -231,7 +339,61 @@ class Player:
             return self._locate_by_coord(loc)
         elif loc_type == "screen_coord":
             return loc.get("x"), loc.get("y")
+        elif loc_type == "dom":
+            return self._locate_by_dom(loc)
+        elif loc_type == "ocr":
+            return self._locate_by_ocr(loc)
         return None, None
+
+    def _locate_by_dom(self, loc):
+        """阶段2.2：Playwright DOM 定位（浏览器元素）"""
+        selector = loc.get("selector", "")
+        if not selector:
+            return None, None
+        try:
+            import asyncio
+            from services.dom_locator import get_browser_debug_port, locate_by_dom, connect_browser
+
+            port = get_browser_debug_port(win32gui.GetForegroundWindow())
+            if not port:
+                return None, None
+
+            async def _do():
+                browser, pw = await connect_browser(port)
+                if not browser:
+                    return None
+                try:
+                    contexts = browser.contexts
+                    if not contexts:
+                        return None
+                    pages = contexts[0].pages
+                    if not pages:
+                        return None
+                    # 使用第一个页面
+                    page = pages[0]
+                    return await locate_by_dom(page, selector)
+                finally:
+                    await pw.stop()
+
+            result = asyncio.new_event_loop().run_until_complete(_do())
+            return result or (None, None)
+        except Exception as e:
+            log.debug("DOM 定位失败: %s", e)
+            return None, None
+
+    def _locate_by_ocr(self, loc):
+        """阶段1.1：OCR 文本兜底定位"""
+        target_text = loc.get("text", "")
+        if not target_text:
+            return None, None
+        try:
+            from services.ocr_locator import capture_and_find
+            hwnd = win32gui.GetForegroundWindow()
+            result = capture_and_find(target_text, hwnd=hwnd)
+            return result or (None, None)
+        except Exception as e:
+            log.debug("OCR 定位失败: %s", e)
+            return None, None
 
     def _find_top_window(self, ua, loc):
         """按父窗口链定位顶级窗口，失败回退前台窗口"""
@@ -340,14 +502,28 @@ class Player:
         return int(sw * pct_x / 100), int(sh * pct_y / 100)
 
     def _do_switch_window(self, step):
-        """切换窗口：按标题/类名找窗口并激活（阶段2.2 跨应用流转）"""
+        """切换窗口：按标题/类名找窗口并激活（阶段2.2 跨应用流转）。
+        等待目标窗口出现（最多 5 秒），避免窗口尚未打开就尝试切换。"""
         title = step.get("window", "")
         hwnd = step.get("hwnd")
         if not title and not hwnd:
             return
-        h = hwnd or _find_window_by_title(title)
+        # 等待目标窗口出现（hwnd 在录制时有效，回放时需按标题重新查找）
+        h = None
+        if title:
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                h = _find_window_by_title(title)
+                if h:
+                    break
+                if self._stopped:
+                    return
+                log.info("  等待窗口出现: %r ...", title)
+                time.sleep(0.5)
+        else:
+            h = hwnd
         if not h:
-            log.info("  切换窗口失败：未找到 %r", title)
+            log.warning("  切换窗口失败：未找到 %r", title)
             return
         try:
             # 最小化当前前台，再激活目标窗口（绕过前台锁定）
@@ -364,17 +540,92 @@ class Player:
             log.warning("  切换窗口异常: %r", title)
 
     def _render_text(self, text):
-        """阶段2.1 数据泛化：替换 {{var}} 占位符为运行时的变量值"""
+        """阶段2.1 数据泛化：替换 {{var}} 占位符为运行时的变量值。
+        支持变量来源绑定（阶段2.1）：clipboard 从剪贴板取值，ui 从当前界面取值。"""
         if "{{" not in text:
             return text
         import re
+        # 先解析未提供的变量（从来源提取）
+        for m in re.finditer(r"\{\{\s*(\w+)\s*\}\}", text):
+            var_name = m.group(1).strip()
+            if var_name not in self.variables:
+                val = self._extract_var(var_name)
+                if val is not None:
+                    self.variables[var_name] = val
         def _sub(m):
             return str(self.variables.get(m.group(1).strip(), m.group(0)))
         return re.sub(r"\{\{\s*(\w+)\s*\}\}", _sub, text)
 
+    def _extract_var(self, var_name):
+        """阶段2.1：从来源提取变量值（剪贴板/UIA 控件）"""
+        sources = self.var_sources or {}
+        src = sources.get(var_name)
+        if not src:
+            return None
+        src_type = src.get("type")
+        if src_type == "clipboard":
+            try:
+                import win32clipboard
+                win32clipboard.OpenClipboard()
+                try:
+                    data = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+                    return data if data else None
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception:
+                return None
+        elif src_type == "ui":
+            try:
+                import uiautomation as ua
+                fg = win32gui.GetForegroundWindow()
+                root = ua.ControlFromHandle(fg)
+                if not root:
+                    return None
+                name = src.get("control_name", "")
+                ctrl_type = src.get("control_type", "EditControl")
+                ctrl = getattr(root, ctrl_type)(Name=name, searchDepth=32)
+                if ctrl.Exists(2.0):
+                    try:
+                        return ctrl.GetValuePattern().Value
+                    except Exception:
+                        pass
+                    try:
+                        return ctrl.Name
+                    except Exception:
+                        pass
+            except Exception:
+                return None
+        return None
+
     # ============ 动作执行 ============
 
+    def _ensure_window(self, step):
+        """确保目标窗口存在并处于前台：录制时记录了窗口标题，回放时验证并等待。
+        返回 True 表示窗口已就绪（或无窗口信息），False 表示窗口未找到。"""
+        target_window = step.get("window", "")
+        if not target_window:
+            return True
+        target_hwnd = _find_window_by_title(target_window)
+        if target_hwnd:
+            fg = win32gui.GetForegroundWindow()
+            if fg != target_hwnd:
+                _force_foreground(target_hwnd)
+            return True
+        # 窗口未找到，短暂等待（可能是上一个操作触发的新窗口尚未出现）
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if self._stopped:
+                return False
+            target_hwnd = _find_window_by_title(target_window)
+            if target_hwnd:
+                _force_foreground(target_hwnd)
+                return True
+            time.sleep(0.5)
+        log.warning("  目标窗口未找到: %r", target_window)
+        return False
+
     def _do_click(self, step):
+        self._ensure_window(step)
         x, y = self._resolve_coords(step)
         if x is None or y is None:
             return
@@ -382,6 +633,7 @@ class Player:
         _mouse_click(x, y)
 
     def _do_right_click(self, step):
+        self._ensure_window(step)
         x, y = self._resolve_coords(step)
         if x is None or y is None:
             return
@@ -397,6 +649,17 @@ class Player:
         if not text:
             return
         hwnd = win32gui.GetForegroundWindow()
+        # 录制时记录了目标窗口，回放时先尝试激活该窗口再输入
+        target_window = step.get("window", "")
+        if target_window:
+            target_hwnd = _find_window_by_title(target_window)
+            if target_hwnd and target_hwnd != hwnd:
+                log.info("  激活目标窗口: %r", target_window)
+                _force_foreground(target_hwnd)
+                hwnd = target_hwnd
+                time.sleep(0.3)
+            elif not target_hwnd:
+                log.warning("  目标窗口未找到: %r，文本可能输入到错误位置", target_window)
         edit_hwnd = _find_focused_edit(hwnd) or _find_focused_edit_uia()
         if edit_hwnd:
             log.info("  WM_CHAR -> edit hwnd=%s", edit_hwnd)
@@ -642,7 +905,10 @@ def _window_exists(title):
 
 
 def _find_window_by_title(title):
-    """精确匹配优先，无精确匹配则做包含匹配"""
+    """查找窗口：精确匹配 > 包含匹配 > 后缀匹配（应对动态标题如 Notepad 内容变化）"""
+    if not title:
+        return None
+    # 1. 精确匹配
     h = win32gui.FindWindow(None, title)
     if h:
         return h
@@ -650,8 +916,20 @@ def _find_window_by_title(title):
 
     def cb(w, l):
         try:
-            if title in win32gui.GetWindowText(w):
+            wtext = win32gui.GetWindowText(w)
+            if not wtext:
+                return True
+            # 2. 包含匹配（录制标题是实际标题的子串，或反过来）
+            if title in wtext or wtext in title:
                 l.append(w)
+                return True
+            # 3. 后缀匹配：提取应用名（如 "- Notepad"），匹配同应用窗口
+            #    应对 Notepad 标题随内容变化："*xxx - Notepad" / "yyy.txt - Notepad"
+            if " - " in title:
+                suffix = title[title.rfind(" - "):]
+                if len(suffix) >= 5 and wtext.endswith(suffix):
+                    l.append(w)
+                    return True
         except Exception:
             pass
         return True

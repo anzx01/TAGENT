@@ -1,10 +1,12 @@
-"""统一日志配置：所有模块输出到 logs/tagent.log + 控制台。"""
+﻿"""统一日志配置：所有模块输出到 logs/tagent.log + 控制台。"""
 
 import logging
 import sys
 from pathlib import Path
 
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+from paths import BASE_DIR
+
+LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = "tagent.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 

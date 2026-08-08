@@ -94,6 +94,21 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
             return {"ok": True, "vars": store.variables(rec_id)}
         return {"ok": False, "msg": "步骤无效或非输入步骤"}
 
+    # ---------- 阶段2.1 变量来源绑定 ----------
+
+    @router.get("/{rec_id}/var_sources")
+    def get_var_sources(rec_id: str):
+        if _resolve(rec_id) is None:
+            return {"ok": False, "msg": "找不到任务"}
+        return {"ok": True, "sources": store.get_var_sources(rec_id)}
+
+    @router.put("/{rec_id}/var_sources/{var_name}")
+    def set_var_source(rec_id: str, var_name: str, body: dict = None):
+        if _resolve(rec_id) is None:
+            return {"ok": False, "msg": "找不到任务"}
+        store.set_var_source(rec_id, var_name, body)
+        return {"ok": True, "sources": store.get_var_sources(rec_id)}
+
     # ---------- 阶段2.4 会话步骤 ----------
 
     @router.put("/{rec_id}/session/{step_index}")
