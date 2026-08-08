@@ -6,8 +6,9 @@
   "build": {
     "frontendDist": "../src"
   },
-  "app": {
-    "windows": [
+"app": {
+      "withGlobalTauri": true,
+      "windows": [
       {
         "title": "智能操作助手",
         "width": 360,
@@ -28,13 +29,21 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "msi"],
+    "publisher": "tagent",
+    "shortDescription": "智能操作助手",
+    "longDescription": "演示一次，自动学会并替你完成电脑操作",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

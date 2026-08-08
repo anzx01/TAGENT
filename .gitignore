@@ -1,0 +1,39 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Rust/Tauri
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# Node
+node_modules/
+
+# Recordings (用户数据)
+recordings/
+
+# Runs (执行日志产物)
+runs/
+
+# 本地密钥 (运行时生成)
+data/
+
+# 日志
+logs/
+*.log
+@AutomationLog.txt
+
+# Rust 编译产物（散落根目录的增量对象）
+*.rcgu.o
+*.o
+*.exp
+*.lib
+*.pdb
+
+# 后端 pid 文件
+.backend.pid
+
+# OS
+Thumbs.db
+desktop.ini

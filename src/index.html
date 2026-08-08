@@ -7,7 +7,7 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      background: rgba(30, 30, 40, 0.95);
+      background: rgba(30, 30, 40, 0.97);
       border-radius: 12px;
       font-family: "Microsoft YaHei", sans-serif;
       overflow: hidden;
@@ -21,7 +21,7 @@
       height: 60px;
     }
     .btn {
-      padding: 8px 16px;
+      padding: 8px 14px;
       border: none;
       border-radius: 8px;
       font-size: 13px;
@@ -29,96 +29,465 @@
       cursor: pointer;
       color: #fff;
       transition: opacity 0.2s;
-      min-width: 64px;
+      min-width: 56px;
     }
     .btn:hover { opacity: 0.85; }
     .btn:disabled { opacity: 0.35; cursor: default; }
     .btn-record { background: #e74c3c; }
     .btn-stop { background: #f39c12; }
     .btn-play { background: #27ae60; }
+    .btn-replay-stop { background: #95a5a6; }
+    .btn-list { background: #3498db; }
+    .btn-close {
+      background: transparent; color: #aaa;
+      font-size: 14px; min-width: 28px; padding: 6px 8px;
+      margin-left: auto;
+    }
+    .btn-close:hover { color: #fff; background: #e74c3c; opacity: 1; }
+    .btn-pause { background: #e67e22; }
     .status {
-      font-size: 12px;
+      font-size: 11px;
       color: #aaa;
-      margin-left: 6px;
+      margin-left: 4px;
       white-space: nowrap;
     }
     .status.recording { color: #e74c3c; }
     .status.replaying { color: #27ae60; }
+    .status.paused { color: #f39c12; }
+    .panel {
+      position: absolute;
+      top: 65px;
+      right: 10px;
+      width: 340px;
+      max-height: 420px;
+      background: rgba(40, 40, 55, 0.98);
+      border-radius: 10px;
+      padding: 12px;
+      overflow-y: auto;
+      display: none;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+      z-index: 10;
+    }
+    .panel.show { display: block; }
+    .panel h3 {
+      font-size: 13px;
+      color: #ccc;
+      margin-bottom: 8px;
+    }
+    .task-card {
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      background: rgba(255,255,255,0.06);
+      border-radius: 6px;
+      font-size: 12px;
+      color: #ddd;
+      border-left: 3px solid #3498db;
+    }
+    .task-card .row1 {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+    }
+    .task-card .name { font-weight: 600; }
+    .task-card .meta { color: #888; font-size: 11px; margin-top: 2px; }
+    .task-card .btns { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+    .task-card .mini {
+      border: none; border-radius: 4px; color: #fff;
+      padding: 3px 8px; font-size: 11px; cursor: pointer;
+    }
+    .mini.play { background: #27ae60; }
+    .mini.var { background: #8e44ad; }
+    .mini.sched { background: #16a085; }
+    .mini.del { background: #c0392b; }
+    .mini.steps { background: #7f8c8d; }
+    .timer-tag {
+      display: inline-block; background: rgba(22,160,133,0.25);
+      padding: 1px 6px; border-radius: 4px; font-size: 10px; color: #1abc9c;
+    }
+    .step-list { margin-top: 8px; max-height: 200px; overflow-y: auto; }
+    .step-item {
+      padding: 4px 8px; margin-bottom: 3px;
+      font-size: 11px; color: #aaa;
+      background: rgba(255,255,255,0.04);
+      border-radius: 4px;
+      border-left: 3px solid #3498db;
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    }
+    .step-item .action { color: #fff; font-weight: 600; }
+    .step-item .var-btn {
+      background: #8e44ad; color: #fff; border: none;
+      border-radius: 3px; padding: 1px 6px; font-size: 10px; cursor: pointer;
+    }
+    .modal-mask {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+      display: none; align-items: center; justify-content: center; z-index: 20;
+    }
+    .modal-mask.show { display: flex; }
+    .modal {
+      background: rgba(45,45,60,0.99); border-radius: 10px;
+      padding: 16px; width: 300px; color: #ddd;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+    }
+    .modal h4 { margin-bottom: 10px; font-size: 14px; }
+    .modal input, .modal select {
+      width: 100%; padding: 6px; margin-bottom: 8px;
+      background: rgba(255,255,255,0.1); border: 1px solid #555;
+      color: #fff; border-radius: 5px; font-size: 12px;
+    }
+    .modal .row { display: flex; gap: 8px; margin-bottom: 8px; }
+    .modal .row input { margin-bottom: 0; }
+    .modal .ok, .modal .cancel {
+      border: none; border-radius: 6px; padding: 7px 14px;
+      font-size: 12px; cursor: pointer; color: #fff; margin-right: 6px;
+    }
+    .modal .ok { background: #27ae60; }
+    .modal .cancel { background: #7f8c8d; }
+    .modal .primary {
+      border: none; border-radius: 6px; padding: 7px 14px;
+      font-size: 12px; cursor: pointer; color: #fff; margin-right: 6px;
+      background: #27ae60;
+    }
+    .hint { font-size: 11px; color: #888; margin-top: 6px; line-height: 1.5; }
   </style>
 </head>
 <body>
-  <div class="bar">
+  <div class="bar" data-tauri-drag-region>
     <button class="btn btn-record" id="btnRecord">录制</button>
     <button class="btn btn-stop" id="btnStop" disabled>停止</button>
     <button class="btn btn-play" id="btnPlay">回放</button>
+    <button class="btn btn-pause" id="btnPause" disabled>暂停</button>
+    <button class="btn btn-replay-stop" id="btnReplayStop" disabled>停回放</button>
+    <button class="btn btn-list" id="btnList">任务库</button>
     <span class="status" id="status">就绪</span>
+    <button class="btn btn-close" id="btnClose" title="退出应用">✕</button>
+  </div>
+  <div class="panel" id="panel">
+    <h3>任务库 <span id="confBadge" style="font-size:11px;color:#888;"></span></h3>
+    <div id="taskList"></div>
+    <div class="step-list" id="stepList"></div>
+  </div>
+
+  <div class="modal-mask" id="modalMask">
+    <div class="modal" id="modalBox"></div>
   </div>
 
   <script>
     const API = "http://127.0.0.1:18899";
-    const btnRecord = document.getElementById("btnRecord");
-    const btnStop = document.getElementById("btnStop");
-    const btnPlay = document.getElementById("btnPlay");
-    const statusEl = document.getElementById("status");
+    const $ = (id) => document.getElementById(id);
+    const btnRecord = $("btnRecord"), btnStop = $("btnStop"), btnPlay = $("btnPlay");
+    const btnPause = $("btnPause"), btnReplayStop = $("btnReplayStop"), btnList = $("btnList");
+    const btnClose = $("btnClose");
+    const statusEl = $("status"), panel = $("panel"), taskList = $("taskList");
+    const stepList = $("stepList"), mask = $("modalMask"), modalBox = $("modalBox");
+    let currentTask = null;
+    let pollTimer = null;   // 回放状态轮询
+    let playback = { playing: false, paused: false };
 
     function setStatus(text, cls) {
       statusEl.textContent = text;
       statusEl.className = "status" + (cls ? " " + cls : "");
     }
-
-    function setRecording(on) {
-      btnRecord.disabled = on;
-      btnStop.disabled = !on;
-      btnPlay.disabled = on;
+    function el(tag, cls, text) {
+      const node = document.createElement(tag);
+      if (cls) node.className = cls;
+      if (text !== undefined) node.textContent = text;
+      return node;
     }
+    function setRecording(on) {
+      btnRecord.disabled = on; btnStop.disabled = !on; btnPlay.disabled = on;
+      btnPause.disabled = on; btnReplayStop.disabled = on;
+    }
+    function setReplaying(on) {
+      btnPlay.disabled = on || btnRecord.disabled;
+      btnReplayStop.disabled = !on;
+      btnPause.disabled = !on;
+    }
+    function showModal(html) {
+      modalBox.innerHTML = html;
+      mask.classList.add("show");
+    }
+    function hideModal() { mask.classList.remove("show"); }
+    mask.addEventListener("click", (e) => { if (e.target === mask) hideModal(); });
 
     btnRecord.addEventListener("click", async () => {
       try {
         const res = await fetch(API + "/record/start", { method: "POST" });
         const data = await res.json();
-        if (data.ok) {
-          setStatus("录制中…", "recording");
-          setRecording(true);
-        } else {
-          setStatus(data.msg || "失败");
-        }
-      } catch (e) {
-        setStatus("服务未连接");
-      }
+        if (data.ok) { setStatus("录制中…", "recording"); setRecording(true); }
+        else setStatus(data.msg || "失败");
+      } catch { setStatus("服务未连接"); }
     });
-
     btnStop.addEventListener("click", async () => {
       try {
         const res = await fetch(API + "/record/stop", { method: "POST" });
         const data = await res.json();
-        if (data.ok) {
-          setStatus(`已保存 ${data.event_count} 步`);
-          setRecording(false);
-        } else {
-          setStatus(data.msg || "失败");
-        }
-      } catch (e) {
-        setStatus("服务未连接");
-      }
+        if (data.ok) { setStatus(`已保存 ${data.event_count} 步`); setRecording(false); refreshTasks(); }
+        else setStatus(data.msg || "失败");
+      } catch (_) { setStatus("服务未连接"); }
+    });
+    btnPlay.addEventListener("click", async () => {
+      const ok = await callReplay(null);
+      if (ok) startPoll();
+    });
+    btnPause.addEventListener("click", async () => {
+      try {
+        const res = await fetch(API + "/replay/pause", { method: "POST" });
+        const data = await res.json();
+        setStatus(data.msg || data.msg || "", "paused");
+        if (data.ok) openTakeover();
+      } catch (_) { setStatus("服务未连接"); }
+    });
+    btnReplayStop.addEventListener("click", async () => {
+      try {
+        await fetch(API + "/replay/stop", { method: "POST" });
+        setStatus("已停止回放"); setReplaying(false); stopPoll();
+      } catch (_) { setStatus("服务未连接"); }
+    });
+    btnList.addEventListener("click", () => {
+      panel.classList.toggle("show");
+      if (panel.classList.contains("show")) refreshTasks();
     });
 
-    btnPlay.addEventListener("click", async () => {
+    // ---------- 退出应用（右上角 ✕）----------
+    async function shutdown() {
+      try { await fetch(API + "/shutdown", { method: "POST" }); } catch (_) { /* 后端可能已退出 */ }
+    }
+    btnClose.addEventListener("click", async () => {
+      try {
+        const t = window.__TAURI__;
+        if (t && t.window && t.window.getCurrentWindow) {
+          await shutdown();
+          await t.window.getCurrentWindow().close();
+          return;
+        }
+      } catch (_) { /* fallthrough */ }
+      // 非 Tauri（纯浏览器）环境：直接关后端
+      await shutdown();
+      setStatus("已退出，请关闭窗口");
+    });
+
+    // ---------- 回放状态轮询（状态小窗 + 暂停接管） ----------
+    function startPoll() {
+      stopPoll();
+      setReplaying(true);
+      pollTimer = setInterval(async () => {
+        try {
+          const res = await fetch(API + "/replay/status");
+          const d = await res.json();
+          if (!d.playing) { setStatus("回放结束"); setReplaying(false); stopPoll(); refreshTasks(); return; }
+          if (d.paused) {
+            setStatus("等待接管", "paused");
+            setReplaying(false);
+            stopPoll();
+          } else setStatus("回放中…", "replaying");
+        } catch (_) { stopPoll(); }
+      }, 800);
+    }
+    function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+    async function callReplay(id) {
       try {
         const res = await fetch(API + "/replay/start", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ recording_id: null }),
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(id ? { recording_id: id } : {}),
         });
+        return (await res.json()).ok || false;
+      } catch (_) { setStatus("服务未连接"); return false; }
+    }
+
+    // ---------- 接管对话框（阶段3 人在回路） ----------
+    function setTakeover() {
+      showModal(`
+        <h4>请接管操作</h4>
+        <p style="font-size:12px;color:#ccc;margin-bottom:10px;">
+          回放遇到不确定情况已暂停。请像平时一样手动完成这一步的剩余操作，完成后点击下方按钮：
+        </p>
+        <button class="primary" onclick="hideModal();resumeReplay()">已接管完成，继续</button>
+        <button class="cancel" onclick="hideModal();stopReplay()">停止回放</button>
+        <div class="hint">助手会把你的操作记录为纠错（阶段3.2），下次遇到同样情况会自动使用。</div>
+      `);
+    }
+    async function resumeReplay() {
+      try {
+        const res = await fetch(API + "/replay/resume", { method: "POST" });
         const data = await res.json();
-        if (data.ok) {
-          setStatus("回放中…", "replaying");
-        } else {
-          setStatus(data.msg || "失败");
+        setStatus(data.msg || "已继续");
+        if (data.ok) startPoll();
+      } catch (_) { setStatus("服务未连接"); }
+    }
+    async function stopReplay() {
+      await fetch(API + "/replay/stop", { method: "POST" });
+      setStatus("已停止"); setReplaying(false); refreshTasks();
+    }
+
+    // ---------- 任务库渲染 ----------
+    async function refreshTasks() {
+      try {
+        const res = await fetch(API + "/tasks");
+        const data = await res.json();
+        taskList.innerHTML = "";
+        const conf = await fetch(API + "/tasks/security/summary").then(r => r.json()).catch(() => null);
+        $("confBadge").textContent = conf && conf.password_edit ? "⚠ 前台含密码框" : "";
+        for (const task of data.tasks || []) {
+          taskList.appendChild(taskCard(task));
         }
-      } catch (e) {
-        setStatus("服务未连接");
+      } catch (_) { taskList.innerHTML = "<p>加载失败</p>"; }
+    }
+
+    function taskCard(task) {
+      const card = el("div", "task-card");
+      const row1 = el("div", "row1", null);
+      row1.appendChild(el("span", "name", task.name));
+      if (task.schedule) {
+        const s = task.schedule;
+        const label = s.kind === "daily"
+          ? `每日 ${String(s.hour).padStart(2,"0")}:${String(s.minute).padStart(2,"0")}`
+          : `每 ${s.minutes} 分钟`;
+        row1.appendChild(el("span", "timer-tag", label + " ⏱"));
       }
-    });
+      card.appendChild(row1);
+      card.appendChild(el("div", "meta",
+        `${task.steps} 步 · 变量 ${task.vars} · 纠错 ${task.corrections}`));
+      const btns = el("div", "btns");
+      const run = aBtn("运行", "mini play", () => runTask(task));
+      const sch = aBtn("定时", "mini sched", () => schedModal(task));
+      const vars = aBtn("步骤/变量", "mini var", async () => {
+        const res = await fetch(API + "/recordings/" + task.id + "/steps");
+        const d = await res.json();
+        showSteps(task.id, d.steps || []);
+      });
+      const del = aBtn("删除", "mini del", async () => {
+        if (confirm("删除该任务？")) {
+          await fetch(API + "/recordings/" + task.id, { method: "DELETE" });
+          refreshTasks();
+        }
+      });
+      btns.appendChild(run); btns.appendChild(sch); btns.appendChild(vars); btns.appendChild(del);
+      card.appendChild(btns);
+      return card;
+    }
+    function aBtn(text, cls, fn) {
+      const b = el("button", cls, text);
+      b.onclick = fn;
+      return b;
+    }
+    async function runTask(id) {
+      if (await callReplay(id)) { setStatus("回放中…", "replaying"); startPoll(); }
+    }
+    async function runTaskWithVars(id, vars) {
+      const res = await fetch(API + "/replay/start", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recording_id: id, variables: vars }),
+      });
+      hideModal();
+      const d = await res.json();
+      if (d.ok) { setStatus("回放中…", "replaying"); startPoll(); }
+      else setStatus(d.msg || "失败");
+    }
+    function runTask(task) {
+      if (task.vars > 0) {
+        fetch(API + "/tasks/" + task.id + "/vars").then(r => r.json()).then(d => {
+          const names = d.vars || ["value"];
+          showModal(`
+            <h4>运行「${task.name}」</h4>
+            <div class="hint">填写本次运行的变量值：</div>
+            ${names.map((n, i) =>
+              `<input id="varInput${i}" data-name="${n}" placeholder="${n}" />`).join("")}
+            <button class="primary" onclick="runWithVars('${task.id}',${names.length})">运行</button>
+            <button class="cancel" onclick="hideModal()">取消</button>
+          `);
+        });
+      } else {
+        runTaskWithVars(task.id, {});
+      }
+    }
+    async function runWithVars(id, count) {
+      const vars = {};
+      for (let i = 0; i < count; i++) {
+        const inp = $("varInput" + i);
+        const name = inp.dataset.name;
+        const value = inp.value.trim();
+        if (value && name) vars[name] = value;
+      }
+      runTaskWithVars(id, vars);
+    }
+
+    function schedModal(task) {
+      showModal(`
+        <h4>定时执行 - ${task.name}</h4>
+        <select id="schedKind" onchange="toggleSchedForm()">
+          <option value="interval" ${task.schedule && task.schedule.kind === "interval" ? "selected" : ""}>每隔 N 分钟</option>
+          <option value="daily" ${task.schedule && task.schedule.kind === "daily" ? "selected" : ""}>每天固定时间</option>
+        </select>
+        <div id="schedWhat"></div>
+        <button class="primary" onclick="saveSched('${task.id}')">保存</button>
+        <button class="cancel" onclick="deleteSched('${task.id}')">关闭定时</button>
+        <button class="cancel" onclick="hideModal()">取消</button>
+      `);
+      toggleSchedForm();
+    }
+    function toggleSchedForm() {
+      const kind = $("schedKind") ? $("schedKind").value : "interval";
+      $("schedWhat").innerHTML = kind === "interval"
+        ? `<input id="schedMinutes" type="number" min="1" placeholder="间隔分钟数，默认60" />`
+        : `<div class="row">
+             <input id="schedHour" type="number" min="0" max="23" placeholder="时" />
+             <input id="schedMin" type="number" min="0" max="59" placeholder="分" />
+           </div>`;
+    }
+    async function saveSched(id) {
+      const kind = $("schedKind").value;
+      const sched = kind === "interval"
+        ? { kind, minutes: parseInt($("schedMinutes").value || 60, 10) }
+        : { kind, hour: parseInt($("schedHour").value || 9, 10), minute: parseInt($("schedMin").value || 0, 10) };
+      await fetch(API + "/tasks/" + id + "/schedule", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(sched),
+      });
+      hideModal(); refreshTasks();
+    }
+    async function deleteSched(id) {
+      await fetch(API + "/tasks/" + id + "/schedule", { method: "DELETE" });
+      hideModal(); refreshTasks();
+    }
+
+    async function showSteps(taskId, steps) {
+      currentTask = taskId;
+      stepList.innerHTML = "";
+      for (const s of steps) {
+        const row = el("div", "step-item");
+        const left = el("span");
+        left.appendChild(el("span", "action", s.action || "?"));
+        if (s.text) left.appendChild(document.createTextNode(" " + s.text + " "));
+        if (s.key) left.appendChild(document.createTextNode(" [" + s.key + "] "));
+        if (s.window) left.appendChild(document.createTextNode(s.window.slice(0, 18)));
+        row.appendChild(left);
+        if (s.action === "input_text") {
+          const b = aBtn("设为变量", "var-btn", () => markVar(taskId, s.index));
+          row.appendChild(b);
+        }
+        stepList.appendChild(row);
+      }
+    }
+    async function markVar(recId, idx) {
+      showModal(`
+        <h4>变量标注</h4>
+        <p class="hint">将这一步的输入替换为运行时可填写的变量。</p>
+        <input id="varName" placeholder="变量名，如 订单号" />
+        <button class="primary" onclick="confirmVar('${recId}',${idx})">标注为变量</button>
+        <button class="cancel" onclick="hideModal()">取消</button>
+      `);
+    }
+    async function confirmVar(recId, idx) {
+      const name = $("varName").value.trim() || "value";
+      await fetch(`${API}/tasks/${recId}/vars/${idx}?var=${encodeURIComponent(name)}`, { method: "PUT" });
+      hideModal();
+      const res = await fetch(`${API}/recordings/${recId}/steps`);
+      const d = await res.json();
+      showSteps(recId, d.steps || []);
+      refreshTasks();
+    }
   </script>
 </body>
 </html>
