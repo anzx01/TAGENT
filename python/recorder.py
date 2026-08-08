@@ -192,6 +192,8 @@ class Recorder:
     def stop(self):
         self.recording = False
         self._stop_event.set()
+        # UWP 等应用的输入管线会延迟处理注入事件，先排空队列再收尾
+        self._drain_quiet(1.5)
         self.hook.stop()
         if self._proc_thread:
             self._proc_thread.join(timeout=3.0)
@@ -207,6 +209,18 @@ class Recorder:
                       f, ensure_ascii=False, indent=2)
         log.info("录制完成: %s, %d 步", path, len(self.steps))
         return str(path)
+
+    def _drain_quiet(self, max_wait):
+        """停止前排空钩子队列：处理剩余事件，直到连续 0.5s 无新事件"""
+        deadline = time.time() + max_wait
+        last_seen = time.time()
+        while time.time() < deadline:
+            evt = self.hook.get_event(timeout=0.1)
+            if evt is not None:
+                self._process(evt)
+                last_seen = time.time()
+            elif time.time() - last_seen > 0.5:
+                break
 
     def _loop(self):
         # 子线程中使用 win32com 需要先 CoInitialize

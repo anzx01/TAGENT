@@ -236,7 +236,8 @@ def stop_recording():
         except Exception as e:
             task_path = None
             log.exception("编译失败: %s", e)
-        return {"ok": True, "events_path": path, "event_count": step_count,
+        return {"ok": True, "recording_id": _recorder.output_dir.name,
+                "events_path": path, "event_count": step_count,
                 "task_path": task_path}
 
 
@@ -367,6 +368,106 @@ def delete_recording(rec_id: str):
         return {"ok": False, "msg": "找不到录制"}
     shutil.rmtree(rec_dir)
     return {"ok": True}
+
+
+def _same_step(a: dict, b: dict) -> bool:
+    """阶段3.4：判定两步操作是否等价（用于追加录制去重）"""
+    if a.get("action") != b.get("action"):
+        return False
+    act = a.get("action")
+    if act == "input_text":
+        return a.get("text") == b.get("text")
+    if act == "key_press":
+        return a.get("key") == b.get("key")
+    ax, ay = a.get("pct_x"), a.get("pct_y")
+    bx, by = b.get("pct_x"), b.get("pct_y")
+    if ax is None or bx is None:
+        return False
+    return abs(ax - bx) < 2.0 and abs(ay - by) < 2.0
+
+
+def _merge_steps(base: list[dict], extra: list[dict]) -> tuple[list[dict], int]:
+    """把 extra 追加到 base 尾部：extra 头部若与 base 尾部重叠（同一段操作重复录制），
+    重叠部分只保留一份。返回 (合并后步骤, 去重步数)。"""
+    max_m = min(len(base), len(extra))
+    m = max_m
+    while m > 0:
+        overlap = True
+        for j in range(m):
+            if not _same_step(base[len(base) - m + j], extra[j]):
+                overlap = False
+                break
+        if overlap:
+            break
+        m -= 1
+    merged = list(base) + extra[m:]
+    # 时间戳重排为连续序列（步骤间 1s，等待步骤保持间隔）
+    t = 0.0
+    for s in merged:
+        if s.get("action") == "wait" and s.get("duration"):
+            t += s["duration"]
+        else:
+            t += 1.0
+        s["t"] = round(t, 1)
+    return merged, m
+
+
+@app.post("/recordings/{rec_id}/merge/{sub_rec_id}")
+def merge_recording(rec_id: str, sub_rec_id: str):
+    """阶段3.4：把第二次追加录制的步骤合并进目标任务（重复前缀去重），并删除追加录制目录"""
+    target = _resolve_rec_dir(rec_id)
+    sub = _resolve_rec_dir(sub_rec_id)
+    if target is None or sub is None:
+        return {"ok": False, "msg": "找不到录制"}
+    if target == sub:
+        return {"ok": False, "msg": "不能与自己合并"}
+
+    def _load_steps(d: Path) -> list[dict]:
+        p = d / "events.json"
+        if not p.exists():
+            return []
+        try:
+            return json.loads(p.read_text(encoding="utf-8")).get("steps", [])
+        except Exception:
+            return []
+
+    base = _load_steps(target)
+    extra = _load_steps(sub)
+    if not extra:
+        return {"ok": False, "msg": "追加录制没有内容"}
+    if not base:
+        return {"ok": False, "msg": "目标任务为空，请先完成首次录制"}
+
+    merged, removed = _merge_steps(base, extra)
+
+    # 复制追加录制的截图，重命名避免冲突
+    shot_dir = target / "screenshots"
+    next_idx = len(list(shot_dir.glob("shot_*.png"))) if shot_dir.exists() else 0
+    for s in extra[removed:]:
+        name = s.get("screenshot")
+        if not name:
+            continue
+        src = sub / "screenshots" / name
+        if not src.exists():
+            continue
+        new_name = f"shot_{next_idx:04d}.png"
+        next_idx += 1
+        shutil.copy2(src, shot_dir / new_name)
+        s["screenshot"] = new_name
+
+    (target / "events.json").write_text(
+        json.dumps({"steps": merged, "count": len(merged)}, ensure_ascii=False, indent=2),
+        encoding="utf-8")
+    shutil.rmtree(sub)
+
+    task_path = None
+    try:
+        task_path = Compiler(str(target)).compile()
+    except Exception as e:
+        log.exception("合并后重编译失败: %s", e)
+
+    return {"ok": True, "steps": len(merged), "removed": removed,
+            "task_path": task_path}
 
 
 def _resolve_rec_dir(rec_id: str) -> Path | None:

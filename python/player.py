@@ -399,6 +399,7 @@ class Player:
         hwnd = win32gui.GetForegroundWindow()
         edit_hwnd = _find_focused_edit(hwnd) or _find_focused_edit_uia()
         if edit_hwnd:
+            log.info("  WM_CHAR -> edit hwnd=%s", edit_hwnd)
             for char in text:
                 if self._stopped:
                     break
@@ -460,11 +461,19 @@ class Player:
         vks = _parse_key_combo(key, VK_MAP)
         if not vks:
             return
-        # 用 SendInput 发送组合键（比 keybd_event 更可靠，Chromium 兼容）
-        _send_input_keys(vks, key_up=True)
-        time.sleep(0.02)
+        # keybd_event 逐个按下/抬起（带延时）：SendInput 注入在 UWP 上不被处理
+        u32 = ctypes.windll.user32
+        for vk in vks:
+            scan = u32.MapVirtualKeyW(vk, 0)
+            u32.keybd_event(vk, scan, 0, 0)
+            time.sleep(0.06)
+        for vk in reversed(vks):
+            u32.keybd_event(vk, 0, 2, 0)
+            time.sleep(0.06)
         # 释放扩展修饰键
         _release_keys([0xA2, 0xA3, 0xA0, 0xA1, 0xA4, 0xA5])
+        # UWP 等应用的输入管线延迟处理注入事件，等待消化再继续下一步
+        time.sleep(1.0)
 
     def _try_uia_enter(self):
         """用 UIA 对焦点控件发送 Enter"""

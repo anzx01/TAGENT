@@ -222,7 +222,12 @@
       try {
         const res = await fetch(API + "/record/stop", { method: "POST" });
         const data = await res.json();
-        if (data.ok) { setStatus(`已保存 ${data.event_count} 步`); setRecording(false); refreshTasks(); }
+        if (data.ok) {
+          setStatus(`已保存 ${data.event_count} 步`);
+          setRecording(false);
+          if (pendingAppendTarget && data.recording_id) await finishAppend(data.recording_id);
+          else refreshTasks();
+        }
         else setStatus(data.msg || "失败");
       } catch (_) { setStatus("服务未连接"); }
     });
@@ -357,15 +362,41 @@
         const d = await res.json();
         showSteps(task.id, d.steps || []);
       });
+      const appd = aBtn("追加", "mini sched", () => appendTask(task));
       const del = aBtn("删除", "mini del", async () => {
         if (confirm("删除该任务？")) {
           await fetch(API + "/recordings/" + task.id, { method: "DELETE" });
           refreshTasks();
         }
       });
-      btns.appendChild(run); btns.appendChild(sch); btns.appendChild(vars); btns.appendChild(del);
+      btns.appendChild(run); btns.appendChild(sch); btns.appendChild(vars);
+      btns.appendChild(appd); btns.appendChild(del);
       card.appendChild(btns);
       return card;
+    }
+    let pendingAppendTarget = null;
+    async function appendTask(task) {
+      if (pendingAppendTarget) return;
+      try {
+        const res = await fetch(API + "/record/start", { method: "POST" });
+        const data = await res.json();
+        if (data.ok) {
+          pendingAppendTarget = task.id;
+          setStatus(`追加录制中…（将并入「${task.name}」）`, "recording");
+          setRecording(true);
+        } else setStatus(data.msg || "失败");
+      } catch (_) { setStatus("服务未连接"); }
+    }
+    async function finishAppend(recId) {
+      const target = pendingAppendTarget;
+      pendingAppendTarget = null;
+      try {
+        const res = await fetch(`${API}/recordings/${target}/merge/${recId}`, { method: "POST" });
+        const data = await res.json();
+        if (data.ok) setStatus(`已合并：任务现有 ${data.steps} 步，去重 ${data.removed} 步`);
+        else setStatus(data.msg || "合并失败");
+      } catch (_) { setStatus("服务未连接"); }
+      refreshTasks();
     }
     function aBtn(text, cls, fn) {
       const b = el("button", cls, text);

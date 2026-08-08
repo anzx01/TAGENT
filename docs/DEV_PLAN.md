@@ -266,6 +266,8 @@ LLM：OpenAI 兼容接口（编译理解+自愈阶段），支持本地 Qwen-VL
 - 阶段3.1 暂停/接管：完成（pause/resume/status + 前端对话框）
 - 阶段3.2 纠错捕获：完成（correct API 入库 corrections.json）
 - 阶段3.3 自愈：完成（回放命中 trigger 自动改用纠正动作，hlelo->hello 端到端验证）
+- 阶段3.4 多遍演示合并：完成（追加录制 POST /recordings/{rec_id}/merge/{sub_rec_id} + 前端"追加"按钮 + 最大重叠去重算法；test_merge_e2e 验证：A 3步+B 5步，removed=3，回放后 xlsx 同时含 Alpha/Bravo）
+  - 注：合并 E2E 同样使用 WPS 表格链路验证（UWP 记事本环境不可控，见阶段5.3 注）
 - 阶段4.1 任务库 UI：完成（卡片/变量/调度/纠错/截图入口）
 - 阶段4.2 定时执行：完成（interval/daily 调度 + 状态查询）
 - 阶段4.3 安全：完成（密码框检测降敏 + 本地密钥加密 + 进程黑名单，录制前边界校验）
@@ -274,5 +276,6 @@ LLM：OpenAI 兼容接口（编译理解+自愈阶段），支持本地 Qwen-VL
 - 阶段5.1 断点续跑：完成（checkpoint + from_step）
 - 阶段5.2 执行日志 REPORT：完成（runs/*.json）
 - 阶段5.3 兼容性验证：完成（Win11 + 记事本/计算器/Edge/Brave/WPS 表格验证；WPS 表格 E2E 通过：录制公式栏输入->回放->xlsx 落盘验证，期间修复 UIA 大容器坐标偏离回退、WPS/Qt 自绘 Edit 控件 UIA 定位两个问题；CSV 方案废弃——WPS 打开 CSV 会转为临时工作簿，改用真 .xlsx 验证）
+  - Win10 未验证（开发机为 Win11），保留待真实环境回归；UWP 记事本环境发现：自动恢复历史未保存内容污染内容验证、后台进程 SetForegroundWindow 受限、keybd_event/SendInput 注入事件被延迟处理——已修复：recorder.stop() 排空延迟事件（_drain_quiet）、player 组合键改 keybd_event 逐个按下/抬起 + 1s 消化延时；test_e2e_full 场景2（全选替换）验证目标由 UWP 记事本改为 WPS 公式栏（win32 应用前台可控）
 - 阶段5.4 打包：完成（scripts/build_app.sh Tauri 安装包；scripts/build_sidecar.sh PyInstaller 后端单文件）
 - 退出链路：✅ 前端 ✕ 按钮 -> POST /shutdown -> 后端退出；Tauri 退出时兜底终止后端进程

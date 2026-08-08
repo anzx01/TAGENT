@@ -38,6 +38,8 @@ def type_text(text):
 
 
 # 1. 录制一个"打开记事本 -> 输入 hlelo" 的任务
+subprocess.run(["taskkill", "/IM", "Notepad.exe", "/F", "/T"], capture_output=True)
+time.sleep(1.5)
 post(API + "/record/stop")
 r = post(API + "/record/start")
 rec_id = r["recording_id"]

@@ -1,9 +1,15 @@
 """
 全面 E2E 测试：多场景验证录制->编译->回放闭环
 场景1: 记事本输入文字 + 移动窗口后回放
-场景2: 记事本输入文字 + Ctrl+A 全选 + Delete 删除
+场景2: WPS 表格输入 + Ctrl+A 全选替换（UWP 记事本前台受限，改 win32 应用验证）
 """
-import time, json, ctypes, subprocess, urllib.request, win32gui, win32con
+import time, json, ctypes, subprocess, sys, urllib.request, win32gui, win32con
+import zipfile, os
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+XLSX = os.path.join(BASE, "..", "..", "recordings", "_wps_test.xlsx")
+ET = r"D:\Users\DELL\AppData\Local\Kingsoft\WPS Office\12.1.0.28043\office6\et.exe"
+FX = (1030, 426)
 
 def post(url, data=b'{}'):
     req = urllib.request.Request(url, method='POST',
@@ -66,6 +72,27 @@ def open_notepad():
         hwnd = win32gui.FindWindow("Notepad", None)
     return hwnd
 
+def find_wps():
+    def cb(h, l):
+        if win32gui.IsWindowVisible(h):
+            t = win32gui.GetWindowText(h)
+            if "wps_test" in t.lower() and "wps office" in t.lower():
+                l.append(h)
+        return True
+    w = []
+    win32gui.EnumWindows(cb, w)
+    return w[0] if w else None
+
+def click_at(x, y):
+    ctypes.windll.user32.SetCursorPos(x, y)
+    time.sleep(0.15)
+    ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+    time.sleep(0.03)
+    ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+    time.sleep(0.5)
+
+subprocess.run(["taskkill", "/IM", "Notepad.exe", "/F", "/T"], capture_output=True)
+time.sleep(1.5)
 results = []
 
 # ========== 场景1: 输入文字 + 移动窗口后回放 ==========
@@ -118,18 +145,27 @@ print(f"  结果: {'PASS' if ok1 else 'FAIL'}")
 win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
 time.sleep(1)
 
-# ========== 场景2: 输入 + 全选删除 + 重新输入 ==========
-print("\n=== 场景2: 输入 + 全选删除 + 重新输入 ===")
-hwnd = open_notepad()
-assert hwnd, "记事本未打开"
+# ========== 场景2: 输入 + 全选替换（WPS 公式栏） ==========
+print("\n=== 场景2: 输入 + 全选替换 + 重新输入（WPS 公式栏） ===")
+for proc in ("et.exe", "wps.exe", "wpscloudsvr.exe"):
+    subprocess.run(["taskkill", "/IM", proc, "/F"], capture_output=True)
+time.sleep(2)
+subprocess.run(["taskkill", "/IM", "Notepad.exe", "/F", "/T"], capture_output=True)
+time.sleep(1)
+subprocess.run([sys.executable, os.path.join(BASE, "make_xlsx.py")], check=True)
+subprocess.Popen([ET, XLSX])
+time.sleep(8)
+hwnd = find_wps()
+assert hwnd, "WPS 未打开"
 bring_to_front(hwnd)
 time.sleep(1)
 
 print("[2.1] 开始录制...")
 post('http://127.0.0.1:18899/record/start')
-time.sleep(2)
+time.sleep(1)
 
-print("[2.2] 输入 'First'")
+print("[2.2] 点击公式栏并输入 'First'")
+click_at(FX[0], FX[1])
 type_text("First")
 time.sleep(0.3)
 
@@ -139,39 +175,41 @@ time.sleep(0.3)
 
 print("[2.4] 输入 'Second'（替换选中文本）")
 type_text("Second")
-time.sleep(0.5)
+time.sleep(0.3)
 
-print("[2.5] 停止录制")
+print("[2.5] 回车 + 停止录制")
+press_key(0x0D)
+time.sleep(1)
 r = post('http://127.0.0.1:18899/record/stop')
 steps2 = r.get('event_count', 0)
 print(f"  录制 {steps2} 步")
 assert steps2 > 0, "场景2: 录制0步"
 
-print("[2.6] 用新记事本替代清空（避免 Ctrl 键状态污染）")
-win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-time.sleep(1)
-hwnd = open_notepad()
-assert hwnd, "新记事本未打开"
-bring_to_front(hwnd)
-time.sleep(1)
+print("[2.6] 清空公式栏残留")
+click_at(FX[0], FX[1])
+press_combo(0x11, 0x41)
+press_key(0x2E)
+time.sleep(0.5)
 
 print("[2.7] 回放")
 bring_to_front(hwnd)
 time.sleep(0.3)
 post('http://127.0.0.1:18899/replay/start')
-time.sleep(max(5, steps2 * 1.5))
+time.sleep(max(8, steps2 * 1.8))
 
-text = get_notepad_text(hwnd)
-print(f"  回放后内容: '{text}'")
-if "Second" in text or "First" in text:
-    print("\n=== 阶段1 E2E 测试通过! ===")
-    ok2 = True
-else:
-    ok2 = False
-results.append(("场景2: 输入+全选+替换输入", ok2, text))
+print("[2.8] Ctrl+S 保存并验证")
+bring_to_front(hwnd)
+time.sleep(0.5)
+press_combo(0x11, 0x53)
+time.sleep(2.5)
+ss = zipfile.ZipFile(XLSX).read("xl/sharedStrings.xml").decode("utf-8")
+ok2 = ("Second" in ss) and ("First" not in ss)
+print(f"  sharedStrings: {ss[:200]}")
+results.append(("场景2: 输入+全选+替换输入", ok2, ss))
 print(f"  结果: {'PASS' if ok2 else 'FAIL'}")
 
-win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+for proc in ("et.exe", "wps.exe", "wpscloudsvr.exe"):
+    subprocess.run(["taskkill", "/IM", proc, "/F"], capture_output=True)
 time.sleep(1)
 
 # ========== 总结 ==========
