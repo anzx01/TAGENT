@@ -599,50 +599,50 @@ class Player:
 
     # ============ 动作执行 ============
 
-    def _ensure_window(self, step):
-        """确保目标窗口存在并处于前台：录制时记录了窗口标题，回放时验证并等待。
-        返回 True 表示窗口已就绪（或无窗口信息），False 表示窗口未找到。"""
-        target_window = step.get("window", "")
-        if not target_window:
-            return True
-        target_hwnd = _find_window_by_title(target_window)
-        if target_hwnd:
-            fg = win32gui.GetForegroundWindow()
-            if fg != target_hwnd:
-                _force_foreground(target_hwnd)
-            return True
-        # 窗口未找到，短暂等待（可能是上一个操作触发的新窗口尚未出现）
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            if self._stopped:
-                return False
-            target_hwnd = _find_window_by_title(target_window)
-            if target_hwnd:
-                _force_foreground(target_hwnd)
-                return True
-            time.sleep(0.5)
-        log.warning("  目标窗口未找到: %r", target_window)
-        return False
+    # 桌面级窗口标题/类名：这些窗口用前台物理点击（mouse_event），不能用 PostMessage
+    _DESKTOP_WINDOWS = {"Program Manager", "主机弹出窗口", ""}
+
+    def _is_desktop_action(self, step):
+        """判断是否为桌面级操作（右键菜单、桌面点击等），需用前台物理点击"""
+        window = step.get("window", "")
+        return window in self._DESKTOP_WINDOWS or not window
 
     def _do_click(self, step):
-        self._ensure_window(step)
         x, y = self._resolve_coords(step)
         if x is None or y is None:
             return
-        log.info("  -> 点击 (%d,%d)", x, y)
-        _mouse_click(x, y)
+        window_title = step.get("window", "")
+        if self._is_desktop_action(step):
+            # 桌面/右键菜单：前台物理点击
+            log.info("  -> 前台点击 (%d,%d)", x, y)
+            _mouse_click(x, y)
+        else:
+            # 应用窗口：优先 PostMessage 后台点击（ScreenClaw 方式），失败回退前台
+            hwnd = _find_window_by_title(window_title) if window_title else None
+            if hwnd and _post_message_click(hwnd, x, y):
+                log.info("  -> 后台点击 (%d,%d) -> %r", x, y, window_title)
+            else:
+                log.info("  -> 前台点击 (%d,%d) [回退]", x, y)
+                _mouse_click(x, y)
 
     def _do_right_click(self, step):
-        self._ensure_window(step)
         x, y = self._resolve_coords(step)
         if x is None or y is None:
             return
-        ctypes.windll.user32.SetCursorPos(x, y)
-        time.sleep(0.1)
-        ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)
-        time.sleep(0.02)
-        ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)
-        time.sleep(0.3)
+        window_title = step.get("window", "")
+        if self._is_desktop_action(step):
+            # 桌面右键菜单：前台物理点击，右键后等待菜单出现
+            log.info("  -> 前台右键 (%d,%d)", x, y)
+            _mouse_right_click(x, y)
+            time.sleep(0.5)  # 等待右键菜单弹出
+        else:
+            hwnd = _find_window_by_title(window_title) if window_title else None
+            if hwnd and _post_message_right_click(hwnd, x, y):
+                log.info("  -> 后台右键 (%d,%d) -> %r", x, y, window_title)
+                time.sleep(0.5)
+            else:
+                _mouse_right_click(x, y)
+                time.sleep(0.5)
 
     def _do_input_text(self, step):
         text = self._render_text(step.get("text", ""))
@@ -653,32 +653,138 @@ class Player:
         target_window = step.get("window", "")
         if target_window:
             target_hwnd = _find_window_by_title(target_window)
-            if target_hwnd and target_hwnd != hwnd:
-                log.info("  激活目标窗口: %r", target_window)
-                _force_foreground(target_hwnd)
-                hwnd = target_hwnd
-                time.sleep(0.3)
-            elif not target_hwnd:
-                log.warning("  目标窗口未找到: %r，文本可能输入到错误位置", target_window)
+            if target_hwnd:
+                if target_hwnd != hwnd:
+                    log.info("  激活目标窗口: %r (hwnd=%s)", target_window, target_hwnd)
+                    if _force_foreground(target_hwnd):
+                        hwnd = target_hwnd
+                    else:
+                        log.warning("  激活失败，尝试用当前前台窗口")
+                        hwnd = win32gui.GetForegroundWindow()
+                    time.sleep(0.5)
+                else:
+                    hwnd = target_hwnd
+            else:
+                log.warning("  目标窗口未找到: %r，使用当前前台窗口", target_window)
+                hwnd = win32gui.GetForegroundWindow()
+
+        # 优先尝试 UIA 输入（Win11 记事本 RichEditD2DPT / Chromium 等）
+        if self._try_uia_input_text(hwnd, text):
+            return
+
+        # WM_CHAR 方式（仅对传统 Edit 控件有效，RichEdit 无效）
         edit_hwnd = _find_focused_edit(hwnd) or _find_focused_edit_uia()
         if edit_hwnd:
-            log.info("  WM_CHAR -> edit hwnd=%s", edit_hwnd)
-            for char in text:
-                if self._stopped:
-                    break
-                win32gui.PostMessage(edit_hwnd, 0x0102, ord(char), 0)  # WM_CHAR
-                time.sleep(MAX_TEXT_CHAR_INTERVAL)
-            return
-        # 尝试 UIA ValuePattern（Chromium 等无 Edit 控件的应用）
-        if self._try_uia_value_pattern(hwnd, text):
-            return
-        log.info("  未找到编辑控件，回退 SendInput")
-        # 兜底：SendInput 逐字符发送
+            # 检测控件类名：RichEdit 控件不支持 WM_CHAR，跳过直接用 SendInput
+            cls_name = win32gui.GetClassName(edit_hwnd)
+            if "rich" in cls_name.lower():
+                log.info("  RichEdit 控件(%s)，跳过 WM_CHAR 用 SendInput", cls_name)
+            else:
+                log.info("  WM_CHAR -> edit hwnd=%s cls=%s", edit_hwnd, cls_name)
+                for char in text:
+                    if self._stopped:
+                        break
+                    win32gui.PostMessage(edit_hwnd, 0x0102, ord(char), 0)  # WM_CHAR
+                    time.sleep(MAX_TEXT_CHAR_INTERVAL)
+                return
+
+        log.info("  回退 SendInput 逐字符输入")
+        # 兜底：SendInput 逐字符发送（前台物理输入，最兼容）
         for char in text:
             if self._stopped:
                 break
             _send_input_char(char)
             time.sleep(MAX_TEXT_CHAR_INTERVAL)
+
+    def _try_uia_input_text(self, hwnd, text):
+        """用 UIA 输入文本，适用于 Win11 记事本 RichEditD2DPT 等 PostMessage WM_CHAR 无效的控件。
+        策略：ValuePattern 追加（获取已有值+新文本，SetValue 回去）> SendKeys 逐字符。"""
+        try:
+            import uiautomation as ua
+            root = ua.ControlFromHandle(hwnd)
+            if not root:
+                log.info("  UIA: ControlFromHandle 失败 hwnd=%s", hwnd)
+                return False
+            # 找到焦点控件或 Edit 控件
+            focused = ua.GetFocusedControl()
+            edit_ctrl = None
+            if focused:
+                log.info("  UIA: 焦点控件=%s name=%s", focused.ControlTypeName, focused.Name[:50] if focused.Name else "")
+            # 如果焦点在菜单/按钮上，先按 Escape 关闭菜单，再重新获取焦点
+            if focused and focused.ControlTypeName in ("MenuItemControl", "MenuBarControl", "ButtonControl"):
+                log.info("  UIA: 焦点在菜单/按钮上，按 Escape 关闭")
+                for _ in range(3):
+                    ctypes.windll.user32.keybd_event(0x1B, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0x1B, 0, 2, 0)
+                    time.sleep(0.1)
+                time.sleep(0.3)
+                focused = ua.GetFocusedControl()
+                if focused:
+                    log.info("  UIA: Escape后焦点=%s name=%s", focused.ControlTypeName, focused.Name[:50] if focused.Name else "")
+            if focused and focused.ControlTypeName in ("EditControl", "DocumentControl", "TextControl"):
+                edit_ctrl = focused
+            if not edit_ctrl:
+                edit_ctrl = root.EditControl(searchDepth=32)
+                if not edit_ctrl.Exists(1.0):
+                    log.info("  UIA: 未找到 EditControl")
+                    edit_ctrl = None
+                else:
+                    log.info("  UIA: 找到 EditControl")
+                    # 点击编辑控件确保焦点
+                    try:
+                        edit_ctrl.SetFocus()
+                        edit_ctrl.Click()
+                        time.sleep(0.2)
+                    except:
+                        pass
+            if not edit_ctrl:
+                return False
+
+            # 方式1: ValuePattern 追加模式（最可靠，无特殊字符问题）
+            try:
+                vp = edit_ctrl.GetValuePattern()
+                if vp:
+                    try:
+                        existing = vp.Value or ""
+                    except:
+                        existing = ""
+                    # 追加新文本到末尾
+                    vp.SetValue(existing + text)
+                    log.info("  UIA ValuePattern 追加成功 (已有%d字符)", len(existing))
+                    return True
+            except Exception as e:
+                log.debug("  UIA ValuePattern 失败: %s", e)
+
+            # 方式2: SendKeys 逐字符输入（ValuePattern 不可用时兜底）
+            try:
+                edit_ctrl.SetFocus()
+                time.sleep(0.1)
+                # 用 keybd_event 发 Ctrl+End 定位到末尾（不依赖 SendKeys 语法）
+                u32 = ctypes.windll.user32
+                u32.keybd_event(0x11, 0, 0, 0)  # Ctrl down
+                u32.keybd_event(0x23, 0, 0, 0)  # End down
+                u32.keybd_event(0x23, 0, 2, 0)  # End up
+                u32.keybd_event(0x11, 0, 2, 0)  # Ctrl up
+                time.sleep(0.05)
+                # 逐字符输入
+                for char in text:
+                    if self._stopped:
+                        break
+                    if char == '\n':
+                        edit_ctrl.SendKeys("{Enter}")
+                    elif char == '\t':
+                        edit_ctrl.SendKeys("{Tab}")
+                    elif char in '{}[]()^%~+':
+                        edit_ctrl.SendKeys("{%s}" % char)
+                    else:
+                        edit_ctrl.SendKeys(char, interval=0.02)
+                log.info("  UIA SendKeys 输入成功")
+                return True
+            except Exception as e:
+                log.debug("  UIA SendKeys 失败: %s", e)
+        except Exception as e:
+            log.debug("  UIA 输入失败: %s", e)
+        return False
 
     def _try_uia_value_pattern(self, hwnd, text):
         """用 UIA ValuePattern 设置文本（适用于 Chromium 等应用）"""
@@ -801,22 +907,37 @@ def _check_foreground():
 
 
 def _force_foreground(hwnd):
-    """用 AttachThreadInput 强制目标窗口到前台"""
+    """强制目标窗口到前台（AttachThreadInput + ALT trick + 验证）"""
     try:
         fg = win32gui.GetForegroundWindow()
         if fg == hwnd:
-            return
+            return True
         _, fg_tid = win32gui.GetWindowThreadProcessId(fg)
         _, target_tid = win32gui.GetWindowThreadProcessId(hwnd)
+        # ALT trick：让系统认为用户在操作，绕过 SetForegroundWindow 限制
+        u32 = ctypes.windll.user32
+        u32.keybd_event(0x12, 0, 0, 0)  # ALT down
+        u32.keybd_event(0x12, 0, 0x0002, 0)  # ALT up
         if fg_tid != target_tid:
             win32gui.AttachThreadInput(fg_tid, target_tid, True)
         win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+        win32gui.BringWindowToTop(hwnd)
         win32gui.SetForegroundWindow(hwnd)
         if fg_tid != target_tid:
             win32gui.AttachThreadInput(fg_tid, target_tid, False)
+        time.sleep(0.5)
+        # 确保 ALT 键已释放（防止 ALT 卡住导致后续空格打开系统菜单）
+        u32.keybd_event(0x12, 0, 0x0002, 0)
+        # 验证是否成功
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+        # 再试一次
+        win32gui.SetForegroundWindow(hwnd)
         time.sleep(0.3)
+        return win32gui.GetForegroundWindow() == hwnd
     except Exception as e:
         log.info("强制前台失败: %s", e)
+        return False
 
 
 def _release_keys(vks):
@@ -905,7 +1026,8 @@ def _window_exists(title):
 
 
 def _find_window_by_title(title):
-    """查找窗口：精确匹配 > 包含匹配 > 后缀匹配（应对动态标题如 Notepad 内容变化）"""
+    """查找窗口：精确匹配 > 包含匹配 > 后缀匹配 > 类名匹配
+    应对动态标题（如 Notepad "*xxx - Notepad" / "yyy.txt - Notepad" / "记事本"）"""
     if not title:
         return None
     # 1. 精确匹配
@@ -914,20 +1036,37 @@ def _find_window_by_title(title):
         return h
     found = []
 
+    # 从标题提取应用名，用于类名匹配兜底
+    # "xxx - Notepad" -> class "Notepad"; "xxx - 计算器" -> class "CalcFrame"
+    _app_class_hints = {
+        "Notepad": "Notepad",
+        "Calculator": "CalcFrame",
+        "计算器": "CalcFrame",
+    }
+    app_class = None
+    for app_name, cls_name in _app_class_hints.items():
+        if app_name in title:
+            app_class = cls_name
+            break
+
     def cb(w, l):
         try:
             wtext = win32gui.GetWindowText(w)
-            if not wtext:
-                return True
-            # 2. 包含匹配（录制标题是实际标题的子串，或反过来）
-            if title in wtext or wtext in title:
-                l.append(w)
-                return True
-            # 3. 后缀匹配：提取应用名（如 "- Notepad"），匹配同应用窗口
-            #    应对 Notepad 标题随内容变化："*xxx - Notepad" / "yyy.txt - Notepad"
-            if " - " in title:
-                suffix = title[title.rfind(" - "):]
-                if len(suffix) >= 5 and wtext.endswith(suffix):
+            if wtext:
+                # 2. 包含匹配（录制标题是实际标题的子串，或反过来）
+                if title in wtext or wtext in title:
+                    l.append(w)
+                    return True
+                # 3. 后缀匹配：提取应用名（如 "- Notepad"），匹配同应用窗口
+                if " - " in title:
+                    suffix = title[title.rfind(" - "):]
+                    if len(suffix) >= 5 and wtext.endswith(suffix):
+                        l.append(w)
+                        return True
+            # 4. 类名匹配兜底：Win11 记事本标题可能是 "记事本"（无文件名后缀）
+            if app_class:
+                cls = win32gui.GetClassName(w)
+                if cls == app_class and win32gui.IsWindowVisible(w):
                     l.append(w)
                     return True
         except Exception:
@@ -945,6 +1084,64 @@ def _mouse_click(x, y):
     time.sleep(0.02)
     ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
     time.sleep(0.1)
+
+
+def _mouse_right_click(x, y):
+    ctypes.windll.user32.SetCursorPos(x, y)
+    time.sleep(0.1)
+    ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)
+    time.sleep(0.02)
+    ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)
+    time.sleep(0.3)
+
+
+# ============ PostMessage 后台注入（借鉴 ScreenClaw） ============
+# 向目标窗口直接发送鼠标消息，不抢物理鼠标，不依赖窗口在前台
+# 坐标需转换为客户区坐标（virtual coords），DPI 缩放由系统处理
+
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONDOWN = 0x0204
+WM_RBUTTONUP = 0x0205
+MK_LBUTTON = 0x0001
+MK_RBUTTON = 0x0002
+
+
+def _make_lparam(x, y):
+    """构造 PostMessage lParam：低 16 位 X，高 16 位 Y"""
+    return (y << 16) | (x & 0xFFFF)
+
+
+def _post_message_click(hwnd, screen_x, screen_y):
+    """PostMessage 后台左键点击（ScreenClaw 方式）。
+    屏幕坐标转客户区坐标后发送 WM_LBUTTONDOWN/UP。
+    返回 True 成功，False 失败（调用方应回退前台点击）。"""
+    try:
+        cx, cy = win32gui.ScreenToClient(hwnd, (screen_x, screen_y))
+        lparam = _make_lparam(cx, cy)
+        u32 = ctypes.windll.user32
+        u32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+        time.sleep(0.05)
+        u32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
+        return True
+    except Exception as e:
+        log.debug("PostMessage 点击失败: %s", e)
+        return False
+
+
+def _post_message_right_click(hwnd, screen_x, screen_y):
+    """PostMessage 后台右键点击"""
+    try:
+        cx, cy = win32gui.ScreenToClient(hwnd, (screen_x, screen_y))
+        lparam = _make_lparam(cx, cy)
+        u32 = ctypes.windll.user32
+        u32.PostMessageW(hwnd, WM_RBUTTONDOWN, MK_RBUTTON, lparam)
+        time.sleep(0.05)
+        u32.PostMessageW(hwnd, WM_RBUTTONUP, 0, lparam)
+        return True
+    except Exception as e:
+        log.debug("PostMessage 右键失败: %s", e)
+        return False
 
 
 def _find_focused_edit(hwnd):
