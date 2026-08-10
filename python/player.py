@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import win32gui
+import win32process
 from logger import get_logger
 
 log = get_logger("player")
@@ -500,44 +501,74 @@ class Player:
         sw = ctypes.windll.user32.GetSystemMetrics(0)
         sh = ctypes.windll.user32.GetSystemMetrics(1)
         return int(sw * pct_x / 100), int(sh * pct_y / 100)
-
     def _do_switch_window(self, step):
-        """切换窗口：按标题/类名找窗口并激活（阶段2.2 跨应用流转）。
-        等待目标窗口出现（最多 5 秒），避免窗口尚未打开就尝试切换。"""
+        """切换窗口：win32 _force_foreground 优先（快），pywinauto 兜底（慢但灵活）。
+        等待目标窗口出现（最多 3 秒），避免窗口尚未打开就尝试切换。"""
         title = step.get("window", "")
         hwnd = step.get("hwnd")
         if not title and not hwnd:
             return
-        # 等待目标窗口出现（hwnd 在录制时有效，回放时需按标题重新查找）
+
+        # 策略1: win32 _find_window_by_title + _force_foreground（快，最可靠）
         h = None
         if title:
-            deadline = time.time() + 5.0
+            deadline = time.time() + 3.0
             while time.time() < deadline:
+                if self._stopped:
+                    return
                 h = _find_window_by_title(title)
                 if h:
                     break
-                if self._stopped:
-                    return
-                log.info("  等待窗口出现: %r ...", title)
-                time.sleep(0.5)
+                time.sleep(0.3)
         else:
             h = hwnd
-        if not h:
-            log.warning("  切换窗口失败：未找到 %r", title)
-            return
-        try:
-            # 最小化当前前台，再激活目标窗口（绕过前台锁定）
-            fg = win32gui.GetForegroundWindow()
-            if fg and fg != h:
-                win32gui.ShowWindow(fg, 6)
+
+        if h and win32gui.IsWindow(h):
+            if _force_foreground(h):
+                log.info("  已切换窗口: %r (hwnd=%s)", title, h)
                 time.sleep(0.3)
-            win32gui.BringWindowToTop(h)
-            win32gui.ShowWindow(h, 9)
-            win32gui.SetForegroundWindow(h)
-            log.info("  已切换窗口: %r", title)
-            time.sleep(0.8)
+                return
+            # _force_foreground 失败，尝试简单的 SetForegroundWindow
+            try:
+                win32gui.ShowWindow(h, 9)  # SW_RESTORE
+                win32gui.SetForegroundWindow(h)
+                log.info("  已切换窗口(SFW): %r (hwnd=%s)", title, h)
+                time.sleep(0.3)
+                return
+            except Exception:
+                pass
+
+        # 策略2: pywinauto 兜底（对 win32 找不到的窗口类型）
+        try:
+            from pywinauto import Desktop
+            desktop = Desktop(backend="uia")
+            dlg = None
+            if title:
+                # 先精确匹配，再模糊匹配
+                try:
+                    dlg = desktop.window(title=title)
+                    dlg.wait('exists', timeout=1)
+                except Exception:
+                    dlg = None
+                if not dlg:
+                    # 用 contains 匹配（比 title_re 更宽松）
+                    try:
+                        dlg = desktop.window(title_re=".*" + title.replace("[", "\\[").replace("]", "\\]") + ".*")
+                        dlg.wait('exists', timeout=1)
+                    except Exception:
+                        dlg = None
+            else:
+                dlg = desktop.window(handle=hwnd)
+
+            if dlg:
+                dlg.set_focus()
+                log.info("  pywinauto 已切换窗口: %r", title)
+                time.sleep(0.3)
+                return
         except Exception:
-            log.warning("  切换窗口异常: %r", title)
+            pass
+
+        log.warning("  切换窗口失败：未找到 %r", title)
 
     def _render_text(self, text):
         """阶段2.1 数据泛化：替换 {{var}} 占位符为运行时的变量值。
@@ -617,13 +648,17 @@ class Player:
             log.info("  -> 前台点击 (%d,%d)", x, y)
             _mouse_click(x, y)
         else:
-            # 应用窗口：优先 PostMessage 后台点击（ScreenClaw 方式），失败回退前台
-            hwnd = _find_window_by_title(window_title) if window_title else None
-            if hwnd and _post_message_click(hwnd, x, y):
-                log.info("  -> 后台点击 (%d,%d) -> %r", x, y, window_title)
-            else:
-                log.info("  -> 前台点击 (%d,%d) [回退]", x, y)
-                _mouse_click(x, y)
+            # 应用窗口：先切换到目标窗口，再用前台物理点击
+            # PostMessage 后台点击对浏览器/IDE 等现代应用不生效，统一用物理点击
+            if window_title:
+                hwnd = _find_window_by_title(window_title)
+                if hwnd and win32gui.IsWindow(hwnd):
+                    fg = win32gui.GetForegroundWindow()
+                    if fg != hwnd:
+                        _force_foreground(hwnd)
+                        time.sleep(0.2)
+            log.info("  -> 前台点击 (%d,%d) -> %r", x, y, window_title)
+            _mouse_click(x, y)
 
     def _do_right_click(self, step):
         x, y = self._resolve_coords(step)
@@ -636,111 +671,327 @@ class Player:
             _mouse_right_click(x, y)
             time.sleep(0.5)  # 等待右键菜单弹出
         else:
-            hwnd = _find_window_by_title(window_title) if window_title else None
-            if hwnd and _post_message_right_click(hwnd, x, y):
-                log.info("  -> 后台右键 (%d,%d) -> %r", x, y, window_title)
-                time.sleep(0.5)
-            else:
-                _mouse_right_click(x, y)
-                time.sleep(0.5)
+            # 应用窗口：先切换到目标窗口，再用前台物理右键
+            if window_title:
+                hwnd = _find_window_by_title(window_title)
+                if hwnd and win32gui.IsWindow(hwnd):
+                    fg = win32gui.GetForegroundWindow()
+                    if fg != hwnd:
+                        _force_foreground(hwnd)
+                        time.sleep(0.2)
+            log.info("  -> 前台右键 (%d,%d) -> %r", x, y, window_title)
+            _mouse_right_click(x, y)
+            time.sleep(0.5)
 
     def _do_input_text(self, step):
+        """文本输入：先切换窗口，再根据应用类型选择输入方式。
+        - 记事本(RichEdit): pywinauto type_keys(with_spaces=True) -- 解决空格丢失
+        - 其他应用(IDE/浏览器): SendInput -- 最快最可靠"""
         text = self._render_text(step.get("text", ""))
         if not text:
             return
-        hwnd = win32gui.GetForegroundWindow()
-        # 录制时记录了目标窗口，回放时先尝试激活该窗口再输入
         target_window = step.get("window", "")
-        if target_window:
-            target_hwnd = _find_window_by_title(target_window)
-            if target_hwnd:
-                if target_hwnd != hwnd:
-                    log.info("  激活目标窗口: %r (hwnd=%s)", target_window, target_hwnd)
-                    if _force_foreground(target_hwnd):
-                        hwnd = target_hwnd
-                    else:
-                        log.warning("  激活失败，尝试用当前前台窗口")
-                        hwnd = win32gui.GetForegroundWindow()
-                    time.sleep(0.5)
-                else:
-                    hwnd = target_hwnd
-            else:
-                log.warning("  目标窗口未找到: %r，使用当前前台窗口", target_window)
-                hwnd = win32gui.GetForegroundWindow()
 
-        # 优先尝试 UIA 输入（Win11 记事本 RichEditD2DPT / Chromium 等）
-        if self._try_uia_input_text(hwnd, text):
+        # 步骤1: 确保目标窗口在前台
+        hwnd = None
+        if target_window:
+            hwnd = _find_window_by_title(target_window)
+            if hwnd and win32gui.IsWindow(hwnd):
+                fg = win32gui.GetForegroundWindow()
+                if fg != hwnd:
+                    _force_foreground(hwnd)
+                    time.sleep(0.2)
+
+        # 步骤2: 检测是否是记事本（Win11 RichEdit 丢空格，需要特殊处理）
+        is_notepad = False
+        if target_window and "notepad" in target_window.lower():
+            is_notepad = True
+        elif hwnd:
+            try:
+                cls = win32gui.GetClassName(hwnd)
+                if cls == "Notepad":
+                    is_notepad = True
+            except:
+                pass
+
+        if is_notepad:
+            # 记事本: 用 pywinauto type_keys(with_spaces=True)
+            log.info("  [记事本] pywinauto type_keys 输入: %r", text[:50])
+            if self._pywinauto_type_keys(target_window, text):
+                return
+            # pywinauto 失败，用 keybd_event 逐字符（比 SendInput 对空格更可靠）
+            log.info("  [记事本] pywinauto 失败，用 keybd_event 逐字符")
+            self._keybd_input_text(text)
             return
 
-        # WM_CHAR 方式（仅对传统 Edit 控件有效，RichEdit 无效）
-        edit_hwnd = _find_focused_edit(hwnd) or _find_focused_edit_uia()
-        if edit_hwnd:
-            # 检测控件类名：RichEdit 控件不支持 WM_CHAR，跳过直接用 SendInput
-            cls_name = win32gui.GetClassName(edit_hwnd)
-            if "rich" in cls_name.lower():
-                log.info("  RichEdit 控件(%s)，跳过 WM_CHAR 用 SendInput", cls_name)
-            else:
-                log.info("  WM_CHAR -> edit hwnd=%s cls=%s", edit_hwnd, cls_name)
-                for char in text:
-                    if self._stopped:
-                        break
-                    win32gui.PostMessage(edit_hwnd, 0x0102, ord(char), 0)  # WM_CHAR
-                    time.sleep(MAX_TEXT_CHAR_INTERVAL)
-                return
-
-        log.info("  回退 SendInput 逐字符输入")
-        # 兜底：SendInput 逐字符发送（前台物理输入，最兼容）
+        # 其他应用: SendInput 直接输入
+        log.info("  SendInput 输入: %r", text[:50])
         for char in text:
             if self._stopped:
                 break
             _send_input_char(char)
             time.sleep(MAX_TEXT_CHAR_INTERVAL)
+        log.info("  SendInput 输入完成")
+        return
+
+    def _keybd_input_text(self, text):
+        """用 keybd_event 逐字符输入（对 RichEdit 空格更可靠）"""
+        u32 = ctypes.windll.user32
+        for char in text:
+            if self._stopped:
+                break
+            if char == '\n':
+                # Enter
+                u32.keybd_event(0x0D, 0, 0, 0)
+                u32.keybd_event(0x0D, 0, 2, 0)
+            elif char == ' ':
+                # 空格用 keybd_event（SendInput 在 RichEdit 上丢空格）
+                vk = 0x20
+                scan = u32.MapVirtualKeyW(vk, 0)
+                u32.keybd_event(vk, scan, 0, 0)
+                u32.keybd_event(vk, scan, 0x0002, 0)
+            else:
+                _send_input_char(char)
+            time.sleep(MAX_TEXT_CHAR_INTERVAL)
+
+    def _pywinauto_type_keys(self, window_title, text):
+        """用 pywinauto 的 type_keys 输入文本。
+        优势：set_focus() 可靠激活窗口，type_keys(with_spaces=True) 正确处理空格。
+        借鉴 pywinauto 最佳实践：backend="uia" + title_re 正则匹配 + set_focus + type_keys。"""
+        try:
+            from pywinauto.application import Application
+            from pywinauto import Desktop
+            import re as _re
+
+            desktop = Desktop(backend="uia")
+            dlg = None
+
+            # 策略1: 用已有的 _find_window_by_title 找到 hwnd（已处理类名匹配等）
+            #        再用 pywinauto Desktop 连接到该 hwnd
+            if window_title:
+                target_hwnd = _find_window_by_title(window_title)
+                if target_hwnd:
+                    dlg = desktop.window(handle=target_hwnd)
+
+            # 策略2: 正则匹配标题
+            if not dlg and window_title:
+                title_re = None
+                if " - " in window_title:
+                    suffix = window_title[window_title.rfind(" - "):]
+                    title_re = _re.escape(suffix) + r"$"
+                else:
+                    title_re = _re.escape(window_title)
+                try:
+                    dlg = desktop.window(title_re=title_re)
+                    dlg.wait('exists', timeout=1)
+                except Exception:
+                    dlg = None
+
+            # 策略3: 用 Application.connect 连接到 Notepad 进程
+            #        （Desktop 有时找不到 ApplicationFrameHost 下的窗口）
+            if not dlg and window_title:
+                try:
+                    from pywinauto.application import Application
+                    # 尝试通过路径连接 Notepad
+                    app = Application(backend="uia").connect(path=r"C:\Windows\System32\notepad.exe")
+                    dlg = app.top_window()
+                    dlg.wait('exists', timeout=2)
+                except Exception:
+                    dlg = None
+
+            # 策略3: 无标题或匹配失败，用当前前台窗口
+            if not dlg:
+                hwnd = win32gui.GetForegroundWindow()
+                dlg = desktop.window(handle=hwnd)
+
+            # 先激活窗口（set_focus 比 wait('ready') 更可靠地确保窗口可用）
+            # 先用 win32 _force_foreground 强制激活窗口（比 pywinauto set_focus 更可靠）
+            target_hwnd = None
+            if window_title:
+                target_hwnd = _find_window_by_title(window_title)
+                if target_hwnd:
+                    _force_foreground(target_hwnd)
+                    time.sleep(0.5)
+            try:
+                dlg.set_focus()
+            except Exception:
+                pass
+            # 等待窗口就绪（不 return False，继续尝试找 Edit 控件）
+            try:
+                dlg.wait('ready', timeout=2)
+            except Exception:
+                log.info("  pywinauto: 窗口未就绪 %r，继续尝试找 Edit", window_title)
+            # 验证窗口确实是前台
+            fg_hwnd = win32gui.GetForegroundWindow()
+            try:
+                dlg_hwnd = dlg.handle
+            except Exception:
+                dlg_hwnd = target_hwnd or 0
+            if dlg_hwnd and fg_hwnd != dlg_hwnd:
+                log.info("  pywinauto: 窗口未在前台 (fg=%s, dlg=%s)，再试一次", fg_hwnd, dlg_hwnd)
+                _force_foreground(dlg_hwnd)
+                time.sleep(0.3)
+                try:
+                    dlg.set_focus()
+                except Exception:
+                    pass
+
+            # 找到 Edit 控件（多种策略）
+            edit = None
+            # 策略1: control_type="Edit" 或 "Document"（Win11 记事本可能是 Document）
+            for ct in ("Edit", "Document", "Text"):
+                try:
+                    edit = dlg.child_window(control_type=ct)
+                    edit.wait('ready', timeout=1)
+                    if edit:
+                        break
+                except Exception:
+                    edit = None
+            # 策略2: 按类名查找（RichEditD2DPT 等）
+            if not edit:
+                for cls in EDIT_CLASSES:
+                    try:
+                        edit = dlg.child_window(class_name=cls)
+                        edit.wait('ready', timeout=1)
+                        break
+                    except Exception:
+                        edit = None
+            # 策略3: 用 UIA 直接从 target_hwnd 查找 EditControl（不依赖 pywinauto 控件树）
+            if not edit:
+                try:
+                    import uiautomation as ua
+                    # 用 target_hwnd（而非 GetForegroundWindow，因为前台可能是 IDE）
+                    uia_hwnd = target_hwnd or dlg_hwnd or win32gui.GetForegroundWindow()
+                    root = ua.ControlFromHandle(uia_hwnd)
+                    if root:
+                        ec = root.EditControl(searchDepth=10)
+                        if ec.Exists(1.0):
+                            log.info("  pywinauto: 用 UIA 找到 EditControl")
+                            # 用 UIA 直接操作（跳过 pywinauto type_keys）
+                            ec.SetFocus()
+                            ec.Click()
+                            time.sleep(0.2)
+                            # 关闭可能的菜单
+                            focused = ua.GetFocusedControl()
+                            if focused and focused.ControlTypeName in ("MenuItemControl", "MenuBarControl"):
+                                for _ in range(3):
+                                    ctypes.windll.user32.keybd_event(0x1B, 0, 0, 0)
+                                    ctypes.windll.user32.keybd_event(0x1B, 0, 0x0002, 0)
+                                    time.sleep(0.1)
+                                time.sleep(0.2)
+                                ec.SetFocus()
+                                time.sleep(0.1)
+                            # Ctrl+End 定位到末尾
+                            from pywinauto.keyboard import send_keys
+                            send_keys("^({END})")
+                            time.sleep(0.05)
+                            # 逐字符输入（避免 SendKeys 特殊字符问题）
+                            for char in text:
+                                if self._stopped:
+                                    break
+                                if char == '\n':
+                                    ec.SendKeys("{Enter}")
+                                elif char == '\t':
+                                    ec.SendKeys("{Tab}")
+                                elif char in '{}[]()^%~+':
+                                    ec.SendKeys("{%s}" % char)
+                                else:
+                                    ec.SendKeys(char, interval=0.02)
+                            log.info("  UIA SendKeys 输入成功（pywinauto 回退）")
+                            return True
+                except Exception:
+                    pass
+            if not edit:
+                log.info("  pywinauto: 未找到 Edit 控件")
+                return False
+
+            # 激活窗口 + 聚焦编辑控件
+            try:
+                dlg.set_focus()
+                edit.set_focus()
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+            # 如果焦点在菜单上，先按 Escape 关闭
+            import uiautomation as ua
+            focused = ua.GetFocusedControl()
+            if focused and focused.ControlTypeName in ("MenuItemControl", "MenuBarControl"):
+                log.info("  pywinauto: 焦点在菜单上，按 Escape 关闭")
+                for _ in range(3):
+                    ctypes.windll.user32.keybd_event(0x1B, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0x1B, 0, 0x0002, 0)
+                    time.sleep(0.1)
+                time.sleep(0.2)
+                try:
+                    edit.set_focus()
+                except Exception:
+                    pass
+                time.sleep(0.1)
+
+            # 定位到文本末尾（Ctrl+End）
+            from pywinauto.keyboard import send_keys
+            send_keys("^({END})")
+            time.sleep(0.05)
+
+            # type_keys 输入文本（with_spaces=True 确保空格不被忽略）
+            try:
+                edit.type_keys(text, with_spaces=True, pause=0.02)
+                log.info("  pywinauto type_keys 成功: %r", text[:30])
+                return True
+            except Exception as e:
+                log.debug("  pywinauto type_keys 失败: %s，尝试 set_text", e)
+                # set_text 回退：获取已有文本 + 追加新文本，不需要前台焦点
+                try:
+                    existing = edit.window_text() or ""
+                    edit.set_text(existing + text)
+                    log.info("  pywinauto set_text 追加成功 (已有%d字符)", len(existing))
+                    return True
+                except Exception as e2:
+                    log.debug("  pywinauto set_text 也失败: %s", e2)
+                    return False
+        except Exception as e:
+            log.debug("  pywinauto type_keys 失败: %s", e)
+            return False
 
     def _try_uia_input_text(self, hwnd, text):
         """用 UIA 输入文本，适用于 Win11 记事本 RichEditD2DPT 等 PostMessage WM_CHAR 无效的控件。
-        策略：ValuePattern 追加（获取已有值+新文本，SetValue 回去）> SendKeys 逐字符。"""
+        策略：ValuePattern 追加（获取已有值+新文本，SetValue 回去）> SendKeys 逐字符。
+        UIA 可操作后台窗口，不依赖前台焦点。"""
         try:
             import uiautomation as ua
             root = ua.ControlFromHandle(hwnd)
             if not root:
                 log.info("  UIA: ControlFromHandle 失败 hwnd=%s", hwnd)
                 return False
-            # 找到焦点控件或 Edit 控件
-            focused = ua.GetFocusedControl()
+            # 直接从目标窗口找 Edit 控件（不依赖 GetFocusedControl，因为前台可能是 IDE）
             edit_ctrl = None
-            if focused:
-                log.info("  UIA: 焦点控件=%s name=%s", focused.ControlTypeName, focused.Name[:50] if focused.Name else "")
-            # 如果焦点在菜单/按钮上，先按 Escape 关闭菜单，再重新获取焦点
-            if focused and focused.ControlTypeName in ("MenuItemControl", "MenuBarControl", "ButtonControl"):
-                log.info("  UIA: 焦点在菜单/按钮上，按 Escape 关闭")
-                for _ in range(3):
-                    ctypes.windll.user32.keybd_event(0x1B, 0, 0, 0)
-                    ctypes.windll.user32.keybd_event(0x1B, 0, 2, 0)
-                    time.sleep(0.1)
-                time.sleep(0.3)
-                focused = ua.GetFocusedControl()
-                if focused:
-                    log.info("  UIA: Escape后焦点=%s name=%s", focused.ControlTypeName, focused.Name[:50] if focused.Name else "")
-            if focused and focused.ControlTypeName in ("EditControl", "DocumentControl", "TextControl"):
-                edit_ctrl = focused
+            # 策略1: 从目标窗口的控件树找 Edit/Document（无深度限制）
+            for ct in ("EditControl", "DocumentControl", "TextControl"):
+                try:
+                    ec = getattr(root, ct)()  # 无 searchDepth 限制
+                    if ec.Exists(1.5):
+                        edit_ctrl = ec
+                        log.info("  UIA: 找到 %s name=%s", ct, ec.Name[:50] if ec.Name else "")
+                        break
+                except Exception:
+                    pass
+            # 策略2: 如果只找到 DocumentControl，尝试在其子控件中找 EditControl
+            if not edit_ctrl or edit_ctrl.ControlTypeName == "DocumentControl":
+                try:
+                    doc = edit_ctrl or root.DocumentControl()
+                    if doc.Exists(0.5):
+                        child_edit = doc.EditControl()
+                        if child_edit.Exists(1.0):
+                            edit_ctrl = child_edit
+                            log.info("  UIA: 在 DocumentControl 中找到 EditControl")
+                except Exception:
+                    pass
             if not edit_ctrl:
-                edit_ctrl = root.EditControl(searchDepth=32)
-                if not edit_ctrl.Exists(1.0):
-                    log.info("  UIA: 未找到 EditControl")
-                    edit_ctrl = None
-                else:
-                    log.info("  UIA: 找到 EditControl")
-                    # 点击编辑控件确保焦点
-                    try:
-                        edit_ctrl.SetFocus()
-                        edit_ctrl.Click()
-                        time.sleep(0.2)
-                    except:
-                        pass
-            if not edit_ctrl:
+                log.info("  UIA: 未找到 EditControl")
                 return False
 
-            # 方式1: ValuePattern 追加模式（最可靠，无特殊字符问题）
+            # 方式1: ValuePattern 追加模式（最可靠，可操作后台窗口，无特殊字符问题）
             try:
                 vp = edit_ctrl.GetValuePattern()
                 if vp:
@@ -752,21 +1003,34 @@ class Player:
                     vp.SetValue(existing + text)
                     log.info("  UIA ValuePattern 追加成功 (已有%d字符)", len(existing))
                     return True
+                else:
+                    log.info("  UIA: ValuePattern 不可用")
             except Exception as e:
-                log.debug("  UIA ValuePattern 失败: %s", e)
+                log.info("  UIA ValuePattern 失败: %s", e)
 
-            # 方式2: SendKeys 逐字符输入（ValuePattern 不可用时兜底）
+            # 方式2: SendKeys 逐字符输入（需要窗口在前台，否则发送到错误窗口）
+            # 检查目标窗口是否在前台
+            fg_hwnd = win32gui.GetForegroundWindow()
+            try:
+                dlg_hwnd = win32gui.GetParent(hwnd) or hwnd
+            except:
+                dlg_hwnd = hwnd
+            if fg_hwnd != hwnd and fg_hwnd != dlg_hwnd:
+                log.info("  UIA: 窗口不在前台(fg=%s, target=%s)，跳过 SendKeys", fg_hwnd, hwnd)
+                return False
+
             try:
                 edit_ctrl.SetFocus()
                 time.sleep(0.1)
-                # 用 keybd_event 发 Ctrl+End 定位到末尾（不依赖 SendKeys 语法）
+                # 用 keybd_event 发 Ctrl+End 定位到末尾
                 u32 = ctypes.windll.user32
                 u32.keybd_event(0x11, 0, 0, 0)  # Ctrl down
                 u32.keybd_event(0x23, 0, 0, 0)  # End down
                 u32.keybd_event(0x23, 0, 2, 0)  # End up
                 u32.keybd_event(0x11, 0, 2, 0)  # Ctrl up
                 time.sleep(0.05)
-                # 逐字符输入
+                # 逐字符输入（用 keybd_event 处理空格，避免 SendKeys 空格丢失）
+                u32 = ctypes.windll.user32
                 for char in text:
                     if self._stopped:
                         break
@@ -774,6 +1038,13 @@ class Player:
                         edit_ctrl.SendKeys("{Enter}")
                     elif char == '\t':
                         edit_ctrl.SendKeys("{Tab}")
+                    elif char == ' ':
+                        # 空格用 keybd_event（SendKeys 在某些控件上丢空格）
+                        vk = 0x20
+                        scan = u32.MapVirtualKeyW(vk, 0)
+                        u32.keybd_event(vk, scan, 0, 0)
+                        u32.keybd_event(vk, scan, 0x0002, 0)
+                        time.sleep(0.02)
                     elif char in '{}[]()^%~+':
                         edit_ctrl.SendKeys("{%s}" % char)
                     else:
@@ -909,22 +1180,26 @@ def _check_foreground():
 def _force_foreground(hwnd):
     """强制目标窗口到前台（AttachThreadInput + ALT trick + 验证）"""
     try:
+        # 验证窗口句柄有效
+        if not win32gui.IsWindow(hwnd):
+            log.info("强制前台失败: 窗口句柄无效 %s", hwnd)
+            return False
         fg = win32gui.GetForegroundWindow()
         if fg == hwnd:
             return True
-        _, fg_tid = win32gui.GetWindowThreadProcessId(fg)
-        _, target_tid = win32gui.GetWindowThreadProcessId(hwnd)
+        _, fg_tid = win32process.GetWindowThreadProcessId(fg)
+        _, target_tid = win32process.GetWindowThreadProcessId(hwnd)
         # ALT trick：让系统认为用户在操作，绕过 SetForegroundWindow 限制
         u32 = ctypes.windll.user32
         u32.keybd_event(0x12, 0, 0, 0)  # ALT down
         u32.keybd_event(0x12, 0, 0x0002, 0)  # ALT up
         if fg_tid != target_tid:
-            win32gui.AttachThreadInput(fg_tid, target_tid, True)
+            u32.AttachThreadInput(fg_tid, target_tid, True)
         win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
         win32gui.BringWindowToTop(hwnd)
         win32gui.SetForegroundWindow(hwnd)
         if fg_tid != target_tid:
-            win32gui.AttachThreadInput(fg_tid, target_tid, False)
+            u32.AttachThreadInput(fg_tid, target_tid, False)
         time.sleep(0.5)
         # 确保 ALT 键已释放（防止 ALT 卡住导致后续空格打开系统菜单）
         u32.keybd_event(0x12, 0, 0x0002, 0)
@@ -1074,7 +1349,26 @@ def _find_window_by_title(title):
         return True
 
     win32gui.EnumWindows(cb, found)
-    return found[0] if found else None
+    if not found:
+        return None
+    if len(found) == 1:
+        return found[0]
+    # 多个匹配窗口时，优先选择最近激活的（Z 序最前的）
+    # 按窗口在 Z 序中的位置排序（最靠前的优先）
+    def z_order(hwnd):
+        try:
+            # GetWindow with GW_HWNDPREV 返回 Z 序中前面的窗口
+            # 简单方法：用 IsWindowVisible + GetForegroundWindow 优先
+            if hwnd == win32gui.GetForegroundWindow():
+                return 0  # 前台窗口最优先
+            # 检查窗口是否最小化
+            if win32gui.IsIconic(hwnd):
+                return 2  # 最小化的排最后
+            return 1
+        except:
+            return 3
+    found.sort(key=z_order)
+    return found[0]
 
 
 def _mouse_click(x, y):
@@ -1144,10 +1438,25 @@ def _post_message_right_click(hwnd, screen_x, screen_y):
         return False
 
 
+def _find_edit_child(hwnd):
+    """在窗口的子控件中查找 Edit/RichEdit 控件（用于 EM_REPLACESEL 后台输入）"""
+    found = []
+    def cb(h, l):
+        try:
+            cls = win32gui.GetClassName(h)
+            if "edit" in cls.lower() or "rich" in cls.lower():
+                l.append(h)
+        except Exception:
+            pass
+        return True
+    win32gui.EnumChildWindows(hwnd, cb, found)
+    return found[0] if found else None
+
+
 def _find_focused_edit(hwnd):
     """找到前台线程的焦点控件，向上追溯 Edit；失败回退第一个 Edit 子控件"""
     try:
-        _, tid = win32gui.GetWindowThreadProcessId(hwnd)
+        _, tid = win32process.GetWindowThreadProcessId(hwnd)
         info = win32gui.GetGUIThreadInfo(tid)
         focus = info.get("hwndFocus") or info.get("hWndFocus")
         h = focus
