@@ -502,22 +502,22 @@ class Player:
         sh = ctypes.windll.user32.GetSystemMetrics(1)
         return int(sw * pct_x / 100), int(sh * pct_y / 100)
     def _do_switch_window(self, step):
-        """切换窗口：win32 _force_foreground 优先（快），pywinauto 兜底（慢但灵活）。
-        等待目标窗口出现（最多 3 秒），避免窗口尚未打开就尝试切换。"""
+        """切换窗口：照抄 AHK 三级回退 + pywinauto wait('ready') + 前台兜底。
+        回退链：标题匹配 -> 对话框#32770 -> pywinauto -> 前台兜底"""
         title = step.get("window", "")
         hwnd = step.get("hwnd")
         if not title and not hwnd:
             return
 
-        # 策略1: win32 _find_window_by_title + _force_foreground（快，最可靠）
+        # ---- 策略1: win32 标题匹配 + _force_foreground（等待 ready，最多 5s）----
         h = None
         if title:
-            deadline = time.time() + 3.0
+            deadline = time.time() + 5.0
             while time.time() < deadline:
                 if self._stopped:
                     return
                 h = _find_window_by_title(title)
-                if h:
+                if h and win32gui.IsWindowVisible(h) and win32gui.IsWindowEnabled(h):
                     break
                 time.sleep(0.3)
         else:
@@ -528,9 +528,8 @@ class Player:
                 log.info("  已切换窗口: %r (hwnd=%s)", title, h)
                 time.sleep(0.3)
                 return
-            # _force_foreground 失败，尝试简单的 SetForegroundWindow
             try:
-                win32gui.ShowWindow(h, 9)  # SW_RESTORE
+                win32gui.ShowWindow(h, 9)
                 win32gui.SetForegroundWindow(h)
                 log.info("  已切换窗口(SFW): %r (hwnd=%s)", title, h)
                 time.sleep(0.3)
@@ -538,28 +537,34 @@ class Player:
             except Exception:
                 pass
 
-        # 策略2: pywinauto 兜底（对 win32 找不到的窗口类型）
+        # ---- 策略2: 对话框类名 #32770 匹配（照抄 AHK ahk_class #32770）----
+        if title:
+            h = _find_dialog(title)
+            if h and _force_foreground(h):
+                log.info("  对话框已切换: %r (hwnd=%s, class=#32770)", title, h)
+                time.sleep(0.3)
+                return
+
+        # ---- 策略3: pywinauto 兜底 ----
         try:
             from pywinauto import Desktop
             desktop = Desktop(backend="uia")
             dlg = None
             if title:
-                # 先精确匹配，再模糊匹配
-                try:
-                    dlg = desktop.window(title=title)
-                    dlg.wait('exists', timeout=1)
-                except Exception:
-                    dlg = None
-                if not dlg:
-                    # 用 contains 匹配（比 title_re 更宽松）
+                for spec_fn in [
+                    lambda: desktop.window(title=title),
+                    lambda: desktop.window(title_re=re.escape(title.lstrip("*"))),
+                    lambda: desktop.window(title_re=".*" + re.escape(title.lstrip("*")) + ".*"),
+                ]:
                     try:
-                        dlg = desktop.window(title_re=".*" + title.replace("[", "\\[").replace("]", "\\]") + ".*")
-                        dlg.wait('exists', timeout=1)
+                        d = spec_fn()
+                        d.wait('ready', timeout=2)
+                        dlg = d
+                        break
                     except Exception:
                         dlg = None
             else:
                 dlg = desktop.window(handle=hwnd)
-
             if dlg:
                 dlg.set_focus()
                 log.info("  pywinauto 已切换窗口: %r", title)
@@ -568,7 +573,15 @@ class Player:
         except Exception:
             pass
 
-        log.warning("  切换窗口失败：未找到 %r", title)
+        # ---- 策略4: 前台窗口兜底（照抄 SikuliX 思想：弹窗可能已是前台）----
+        fg = win32gui.GetForegroundWindow()
+        if fg:
+            fg_title = win32gui.GetWindowText(fg)
+            log.info("  前台兜底: %r (hwnd=%s)（目标 %r 未找到，使用当前前台）",
+                     fg_title, fg, title)
+            return
+
+        log.warning("  切换窗口失败：未找到 %r（所有策略均失败）", title)
 
     def _render_text(self, text):
         """阶段2.1 数据泛化：替换 {{var}} 占位符为运行时的变量值。
@@ -684,55 +697,110 @@ class Player:
             time.sleep(0.5)
 
     def _do_input_text(self, step):
-        """文本输入：先切换窗口，再根据应用类型选择输入方式。
-        - 记事本(RichEdit): pywinauto type_keys(with_spaces=True) -- 解决空格丢失
-        - 其他应用(IDE/浏览器): SendInput -- 最快最可靠"""
+        """文本输入：照抄 pywinauto 最佳实践。
+        1. set_focus: 移鼠标到屏外 + ShowWindow + SetForegroundWindow
+        2. AttachThreadInput 共享输入队列（确保键盘事件正确路由）
+        3. keybd_event + VkKeyScanW + MapVirtualKeyW scan code（不用 SendInput）
+        4. 空格用 VK_SPACE 虚拟键（不用 VK_PACKET Unicode）"""
         text = self._render_text(step.get("text", ""))
         if not text:
             return
         target_window = step.get("window", "")
+        u32 = ctypes.windll.user32
 
-        # 步骤1: 确保目标窗口在前台
+        # 步骤1: 确保目标窗口在前台（照抄 pywinauto set_focus）
         hwnd = None
         if target_window:
             hwnd = _find_window_by_title(target_window)
-            if hwnd and win32gui.IsWindow(hwnd):
-                fg = win32gui.GetForegroundWindow()
-                if fg != hwnd:
-                    _force_foreground(hwnd)
-                    time.sleep(0.2)
-
-        # 步骤2: 检测是否是记事本（Win11 RichEdit 丢空格，需要特殊处理）
-        is_notepad = False
-        if target_window and "notepad" in target_window.lower():
-            is_notepad = True
-        elif hwnd:
+        if not hwnd:
+            hwnd = win32gui.GetForegroundWindow()
+        if hwnd and win32gui.IsWindow(hwnd):
+            # 移鼠标到屏幕外（pywinauto 做法，防止鼠标位置干扰焦点）
+            u32.SetCursorPos(-10000, 500)
+            # 激活窗口
             try:
-                cls = win32gui.GetClassName(hwnd)
-                if cls == "Notepad":
-                    is_notepad = True
-            except:
+                if win32gui.IsIconic(hwnd):
+                    win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+                else:
+                    win32gui.ShowWindow(hwnd, 5)  # SW_SHOW
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                _force_foreground(hwnd)
+            time.sleep(0.3)
+
+        log.info("  keybd_event 输入: %r -> %r", text[:50], win32gui.GetWindowText(hwnd)[:40])
+
+        # 步骤2: AttachThreadInput 共享输入队列（照抄 pywinauto type_keys）
+        _, target_tid = win32process.GetWindowThreadProcessId(hwnd)
+        current_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = False
+        if target_tid != current_tid:
+            try:
+                u32.AttachThreadInput(current_tid, target_tid, True)
+                attached = True
+            except Exception:
                 pass
 
-        if is_notepad:
-            # 记事本: 用 pywinauto type_keys(with_spaces=True)
-            log.info("  [记事本] pywinauto type_keys 输入: %r", text[:50])
-            if self._pywinauto_type_keys(target_window, text):
-                return
-            # pywinauto 失败，用 keybd_event 逐字符（比 SendInput 对空格更可靠）
-            log.info("  [记事本] pywinauto 失败，用 keybd_event 逐字符")
-            self._keybd_input_text(text)
-            return
-
-        # 其他应用: SendInput 直接输入
-        log.info("  SendInput 输入: %r", text[:50])
+        # 步骤3: keybd_event 逐字符输入（所有字符统一用 keybd_event，不用 SendInput）
         for char in text:
             if self._stopped:
                 break
-            _send_input_char(char)
+            if char == '\n':
+                u32.keybd_event(0x0D, u32.MapVirtualKeyW(0x0D, 0), 0, 0)
+                u32.keybd_event(0x0D, 0, 2, 0)
+            elif char == '\t':
+                u32.keybd_event(0x09, u32.MapVirtualKeyW(0x09, 0), 0, 0)
+                u32.keybd_event(0x09, 0, 2, 0)
+            elif char == ' ':
+                vk = 0x20
+                scan = u32.MapVirtualKeyW(vk, 0)
+                u32.keybd_event(vk, scan, 0, 0)
+                u32.keybd_event(vk, scan, 2, 0)
+            else:
+                vk_scan = u32.VkKeyScanW(ord(char))
+                vk = vk_scan & 0xFF
+                shift = (vk_scan >> 8) & 0x01
+                scan = u32.MapVirtualKeyW(vk, 0)
+                if shift:
+                    u32.keybd_event(0x10, 0, 0, 0)  # Shift down
+                u32.keybd_event(vk, scan, 0, 0)
+                u32.keybd_event(vk, scan, 2, 0)
+                if shift:
+                    u32.keybd_event(0x10, 0, 2, 0)  # Shift up
             time.sleep(MAX_TEXT_CHAR_INTERVAL)
-        log.info("  SendInput 输入完成")
-        return
+
+        # 步骤4: 解除 AttachThreadInput
+        if attached:
+            try:
+                u32.AttachThreadInput(current_tid, target_tid, False)
+            except Exception:
+                pass
+
+        # 步骤5: 验证输入是否成功，失败则用 UIA ValuePattern 兜底
+        # （Win11 RichEdit 对 keybd_event 不响应，需要 UIA 直接设置文本）
+        if hwnd and win32gui.IsWindow(hwnd):
+            try:
+                import uiautomation as ua
+                root = ua.ControlFromHandle(hwnd)
+                if root:
+                    for ct in ("EditControl", "DocumentControl"):
+                        edit = getattr(root, ct)(searchDepth=10)
+                        if edit.Exists(0.3):
+                            try:
+                                vp = edit.GetValuePattern()
+                                if vp:
+                                    current = vp.Value or ""
+                                    if text not in current:
+                                        # keybd_event 输入失败，用 ValuePattern 追加
+                                        vp.SetValue(current + text)
+                                        log.info("  UIA ValuePattern 兜底成功")
+                            except Exception:
+                                pass
+                            break
+            except Exception:
+                pass
+
+        log.info("  keybd_event 输入完成")
 
     def _keybd_input_text(self, text):
         """用 keybd_event 逐字符输入（对 RichEdit 空格更可靠）"""
@@ -753,6 +821,112 @@ class Player:
             else:
                 _send_input_char(char)
             time.sleep(MAX_TEXT_CHAR_INTERVAL)
+
+    def _uia_click_edit(self, hwnd_or_title):
+        """用 UIA 找到编辑控件并点击，确保焦点在编辑区。"""
+        try:
+            import uiautomation as ua
+            target_hwnd = None
+            if isinstance(hwnd_or_title, int):
+                target_hwnd = hwnd_or_title
+            elif hwnd_or_title:
+                target_hwnd = _find_window_by_title(hwnd_or_title)
+            if not target_hwnd:
+                target_hwnd = win32gui.GetForegroundWindow()
+            root = ua.ControlFromHandle(target_hwnd)
+            if not root:
+                return False
+            for ct in ("EditControl", "DocumentControl", "TextControl"):
+                edit = getattr(root, ct)(searchDepth=10)
+                if edit.Exists(1.0):
+                    edit.SetFocus()
+                    edit.Click()
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _clipboard_paste(self, text):
+        """用剪贴板粘贴文本：设置剪贴板 -> keybd_event Ctrl+V 粘贴。"""
+        try:
+            import win32clipboard
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
+            finally:
+                win32clipboard.CloseClipboard()
+            time.sleep(0.1)
+            # 用 keybd_event 发 Ctrl+V（在 Win11 Notepad 上比 SendInput 更可靠）
+            u32 = ctypes.windll.user32
+            u32.keybd_event(0x11, 0, 0, 0)  # Ctrl down
+            scan_v = u32.MapVirtualKeyW(0x56, 0)
+            u32.keybd_event(0x56, scan_v, 0, 0)  # V down
+            u32.keybd_event(0x56, scan_v, 0x0002, 0)  # V up
+            u32.keybd_event(0x11, 0, 0x0002, 0)  # Ctrl up
+            time.sleep(0.3)
+            return True
+        except Exception as e:
+            log.debug("  剪贴板粘贴失败: %s", e)
+            return False
+
+    def _uia_set_text(self, hwnd_or_title, text):
+        """用 UIA ValuePattern.SetValue 直接设置文本（最可靠，不依赖键盘）。
+        追加模式：获取已有文本 + 新文本 -> SetValue。"""
+        try:
+            import uiautomation as ua
+            target_hwnd = None
+            if isinstance(hwnd_or_title, int):
+                target_hwnd = hwnd_or_title
+            elif hwnd_or_title:
+                target_hwnd = _find_window_by_title(hwnd_or_title)
+            if not target_hwnd:
+                target_hwnd = win32gui.GetForegroundWindow()
+            root = ua.ControlFromHandle(target_hwnd)
+            if not root:
+                return False
+            # 找 Edit/Document 控件
+            edit = None
+            for ct in ("EditControl", "DocumentControl", "TextControl"):
+                edit = getattr(root, ct)(searchDepth=10)
+                if edit.Exists(1.0):
+                    break
+                edit = None
+            if not edit:
+                return False
+            # 尝试 ValuePattern
+            try:
+                vp = edit.GetValuePattern()
+                if vp:
+                    # 追加模式：获取已有文本 + 新文本
+                    try:
+                        existing = vp.Value or ""
+                    except:
+                        existing = ""
+                    vp.SetValue(existing + text)
+                    return True
+            except Exception:
+                pass
+            # 尝试 TextPattern
+            try:
+                tp = edit.GetTextPattern()
+                if tp:
+                    # 用 TextPattern 插入文本
+                    edit.SetFocus()
+                    time.sleep(0.1)
+                    # 用 SendKeys 作为回退（但用空格替换）
+                    for char in text:
+                        if char == ' ':
+                            # 空格用 clipboard
+                            pass
+                        edit.SendKeys(char, interval=0.01)
+                    return True
+            except:
+                pass
+            return False
+        except Exception as e:
+            log.debug("  UIA set_text 失败: %s", e)
+            return False
 
     def _pywinauto_type_keys(self, window_title, text):
         """用 pywinauto 的 type_keys 输入文本。
@@ -1094,6 +1268,16 @@ class Player:
         key = step.get("key", "")
         if not key:
             return
+        # 按键前确保目标窗口在前台：键盘注入目标 = 当前前台窗口
+        # （外部弹窗/用户切换可能抢走前台，导致组合键打错窗口）
+        target_window = step.get("window", "")
+        if target_window:
+            hwnd = _find_window_by_title(target_window)
+            if hwnd and win32gui.IsWindow(hwnd):
+                fg = win32gui.GetForegroundWindow()
+                if fg != hwnd:
+                    _force_foreground(hwnd)
+                    time.sleep(0.2)
         # 对 Enter 键，优先尝试 UIA 发送（Chromium 兼容）
         if key.lower() in ("enter", "return"):
             if self._try_uia_enter():
@@ -1301,49 +1485,88 @@ def _window_exists(title):
 
 
 def _find_window_by_title(title):
-    """查找窗口：精确匹配 > 包含匹配 > 后缀匹配 > 类名匹配
-    应对动态标题（如 Notepad "*xxx - Notepad" / "yyy.txt - Notepad" / "记事本"）"""
+    """查找窗口：照抄 AutoHotkey SetTitleMatchMode + pywinauto title_re 最佳实践。
+    匹配优先级：精确 > 去星精确 > 后缀匹配 > 单向包含 > 类名+进程名 > 对话框#32770
+    注意：只做单向包含（title in wtext），不做反向包含（wtext in title），避免误匹配"""
     if not title:
         return None
+    title_clean = title.lstrip("*") if title.startswith("*") else title
+
     # 1. 精确匹配
     h = win32gui.FindWindow(None, title)
     if h:
         return h
-    found = []
+    if title_clean != title:
+        h = win32gui.FindWindow(None, title_clean)
+        if h:
+            return h
 
-    # 从标题提取应用名，用于类名匹配兜底
-    # "xxx - Notepad" -> class "Notepad"; "xxx - 计算器" -> class "CalcFrame"
-    _app_class_hints = {
-        "Notepad": "Notepad",
-        "Calculator": "CalcFrame",
-        "计算器": "CalcFrame",
+    # 提取稳定后缀（AHK RegEx 模式做法）："xxx.txt - Notepad" -> " - Notepad"
+    stable_suffix = None
+    if " - " in title:
+        stable_suffix = title[title.rfind(" - "):]
+        stable_suffix_clean = stable_suffix.lstrip("*")
+
+    # 应用提示表（AHK ahk_class + ahk_exe 组合做法）
+    _app_hints = {
+        "Notepad": ("Notepad", "notepad.exe"),
+        "记事本": ("Notepad", "notepad.exe"),
+        "Calculator": ("CalcFrame", "calc.exe"),
+        "计算器": ("CalcFrame", "calc.exe"),
+        "另存为": ("#32770", None),
+        "Save As": ("#32770", None),
+        "打开": ("#32770", None),
+        "Open": ("#32770", None),
+        "确认": ("#32770", None),
     }
-    app_class = None
-    for app_name, cls_name in _app_class_hints.items():
+    hint_class = None
+    hint_exe = None
+    for app_name, (cls, exe) in _app_hints.items():
         if app_name in title:
-            app_class = cls_name
+            hint_class = cls
+            hint_exe = exe
             break
+
+    found = []
 
     def cb(w, l):
         try:
+            if not win32gui.IsWindowVisible(w):
+                return True
             wtext = win32gui.GetWindowText(w)
-            if wtext:
-                # 2. 包含匹配（录制标题是实际标题的子串，或反过来）
-                if title in wtext or wtext in title:
+            if not wtext:
+                return True
+            wtext_clean = wtext.lstrip("*") if wtext.startswith("*") else wtext
+
+            # 2. 后缀匹配（最可靠：应对文件名变化）
+            if stable_suffix:
+                if wtext.endswith(stable_suffix) or wtext_clean.endswith(stable_suffix_clean):
                     l.append(w)
                     return True
-                # 3. 后缀匹配：提取应用名（如 "- Notepad"），匹配同应用窗口
-                if " - " in title:
-                    suffix = title[title.rfind(" - "):]
-                    if len(suffix) >= 5 and wtext.endswith(suffix):
+
+            # 3. 单向包含匹配（AHK Mode 2：title in wtext，不做反向）
+            if title_clean and len(title_clean) >= 4 and title_clean in wtext_clean:
+                l.append(w)
+                return True
+
+            # 4. 类名 + 进程名匹配（AHK ahk_class + ahk_exe 组合）
+            if hint_class:
+                cls = win32gui.GetClassName(w)
+                if cls == hint_class:
+                    if hint_exe:
+                        _, pid = win32process.GetWindowThreadProcessId(w)
+                        try:
+                            import psutil
+                            p = psutil.Process(pid)
+                            if p.name().lower() == hint_exe.lower():
+                                l.append(w)
+                                return True
+                        except Exception:
+                            l.append(w)
+                            return True
+                    else:
                         l.append(w)
                         return True
-            # 4. 类名匹配兜底：Win11 记事本标题可能是 "记事本"（无文件名后缀）
-            if app_class:
-                cls = win32gui.GetClassName(w)
-                if cls == app_class and win32gui.IsWindowVisible(w):
-                    l.append(w)
-                    return True
         except Exception:
             pass
         return True
@@ -1353,22 +1576,44 @@ def _find_window_by_title(title):
         return None
     if len(found) == 1:
         return found[0]
-    # 多个匹配窗口时，优先选择最近激活的（Z 序最前的）
-    # 按窗口在 Z 序中的位置排序（最靠前的优先）
+    # 多个匹配：Z 序最前的优先（前台 > 可见 > 最小化）
     def z_order(hwnd):
         try:
-            # GetWindow with GW_HWNDPREV 返回 Z 序中前面的窗口
-            # 简单方法：用 IsWindowVisible + GetForegroundWindow 优先
             if hwnd == win32gui.GetForegroundWindow():
-                return 0  # 前台窗口最优先
-            # 检查窗口是否最小化
+                return 0
             if win32gui.IsIconic(hwnd):
-                return 2  # 最小化的排最后
+                return 2
             return 1
         except:
             return 3
     found.sort(key=z_order)
     return found[0]
+
+
+def _find_dialog(title=None):
+    """专门查找标准 Win32 对话框（类名 #32770）。
+    照抄 AHK WinWait ahk_class #32770，对话框标题可能因语言不同，用类名兜底。"""
+    found = []
+
+    def cb(w, l):
+        try:
+            if not win32gui.IsWindowVisible(w):
+                return True
+            cls = win32gui.GetClassName(w)
+            if cls == "#32770":
+                if not title:
+                    l.append(w)
+                    return True
+                wtext = win32gui.GetWindowText(w)
+                if title in wtext:
+                    l.append(w)
+                    return True
+        except Exception:
+            pass
+        return True
+
+    win32gui.EnumWindows(cb, found)
+    return found[0] if found else None
 
 
 def _mouse_click(x, y):

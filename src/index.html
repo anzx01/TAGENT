@@ -253,18 +253,13 @@
     btnList.addEventListener("click", async () => {
       panel.classList.toggle("show");
       if (panel.classList.contains("show")) refreshTasks();
-      // 悬浮条窗口固定 60px 高，任务库展开时需撑高窗口，否则面板在窗口外不可见
+      // 悬浮条窗口默认 60px 高，任务库展开时需撑高窗口，否则面板在窗口外不可见
       try {
         const t = window.__TAURI__;
-        if (t && t.window && t.window.getCurrentWindow) {
-          const w = t.window.getCurrentWindow();
-          const h = panel.classList.contains("show") ? 500 : 60;
-          await w.setSize(new t.window.LogicalSize(360, h));
-          alert("resize ok: " + h);
-        } else {
-          alert("无 tauri window API: " + typeof window.__TAURI__);
+        if (t && t.core && t.core.invoke) {
+          await t.core.invoke("set_panel_height", { open: panel.classList.contains("show") });
         }
-      } catch (e) { alert("面板窗口调整失败: " + e.message); }
+      } catch (_) { /* 纯浏览器环境无窗口控制 */ }
     });
 
     // ---------- 退出应用（右上角 ✕）----------

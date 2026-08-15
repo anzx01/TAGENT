@@ -202,7 +202,14 @@ bring_to_front(hwnd)
 time.sleep(0.5)
 press_combo(0x11, 0x53)
 time.sleep(2.5)
-ss = zipfile.ZipFile(XLSX).read("xl/sharedStrings.xml").decode("utf-8")
+import os
+z = zipfile.ZipFile(XLSX)
+names = z.namelist()
+print(f"  xlsx 成员({os.path.getsize(XLSX)}B): ", "sharedStrings" in "".join(names), "sheet1" in "".join(names))
+if "xl/sharedStrings.xml" in names:
+    ss = z.read("xl/sharedStrings.xml").decode("utf-8")
+else:
+    ss = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
 ok2 = ("Second" in ss) and ("First" not in ss)
 print(f"  sharedStrings: {ss[:200]}")
 results.append(("场景2: 输入+全选+替换输入", ok2, ss))

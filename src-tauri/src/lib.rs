@@ -31,9 +31,20 @@ fn spawn_backend() -> Option<Child> {
     cmd.spawn().ok()
 }
 
+#[tauri::command]
+fn set_panel_height(window: tauri::Window, open: bool) -> Result<(), String> {
+    let size = if open {
+        tauri::LogicalSize::new(500.0, 500.0)
+    } else {
+        tauri::LogicalSize::new(500.0, 60.0)
+    };
+    window.set_size(size).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![set_panel_height])
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
