@@ -24,14 +24,37 @@ def bring_to_front(hwnd):
     ctypes.windll.user32.ShowWindow(hwnd, 9)
     ctypes.windll.user32.SetForegroundWindow(hwnd)
 
+def find_notepad():
+    """按窗口标题后缀查找记事本（兼容 Win11 文件名标题）"""
+    found = []
+    def cb(h, l):
+        try:
+            t = win32gui.GetWindowText(h)
+            if t and (t.endswith(" - Notepad") or t.endswith(" - 记事本")):
+                l.append(h)
+        except:
+            pass
+        return True
+    win32gui.EnumWindows(cb, found)
+    return found[0] if found else None
+
 def get_notepad_text(hwnd):
+    try:
+        import uiautomation as ua
+        root = ua.ControlFromHandle(hwnd)
+        edit = root.EditControl(searchDepth=10)
+        if edit.Exists(1.0):
+            return edit.GetValuePattern().Value or ""
+    except:
+        pass
     children = []
     def cb(h, l):
         children.append(h)
         return True
     win32gui.EnumChildWindows(hwnd, cb, None)
     for ch in children:
-        if win32gui.GetClassName(ch) == "RichEditD2DPT":
+        cls = win32gui.GetClassName(ch)
+        if "edit" in cls.lower() or "rich" in cls.lower():
             buf = ctypes.create_unicode_buffer(4096)
             ctypes.windll.user32.SendMessageW(ch, win32con.WM_GETTEXT, 4096, buf)
             return buf.value
@@ -40,7 +63,7 @@ def get_notepad_text(hwnd):
 print("=== 单独测试场景2 ===")
 subprocess.Popen(["notepad.exe"])
 time.sleep(2)
-hwnd = win32gui.FindWindow(None, "无标题 - Notepad")
+hwnd = find_notepad()
 if not hwnd:
     hwnd = win32gui.FindWindow("Notepad", None)
 assert hwnd, "记事本未打开"
@@ -66,7 +89,7 @@ win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
 time.sleep(1)
 subprocess.Popen(["notepad.exe"])
 time.sleep(2)
-hwnd = win32gui.FindWindow(None, "无标题 - Notepad")
+hwnd = find_notepad()
 if not hwnd:
     hwnd = win32gui.FindWindow("Notepad", None)
 assert hwnd, "新记事本未打开"
