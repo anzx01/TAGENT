@@ -154,8 +154,19 @@ else:
 print("[7] 回放...")
 bring_to_front(hwnd)
 time.sleep(0.5)
-post('http://127.0.0.1:18899/replay/start')
-time.sleep(max(8, steps * 2))
+r = post('http://127.0.0.1:18899/replay/start')
+assert r.get('ok'), f"回放启动失败: {r}"
+# 轮询等待回放完成（最多 30s）
+deadline = time.time() + 30
+while time.time() < deadline:
+    time.sleep(0.5)
+    try:
+        s = json.loads(urllib.request.urlopen(
+            'http://127.0.0.1:18899/replay/status', timeout=5).read())
+        if not s.get("playing"):
+            break
+    except Exception:
+        pass
 
 # 8. 验证结果
 print("[8] 验证结果...")

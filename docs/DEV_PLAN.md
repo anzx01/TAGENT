@@ -287,3 +287,9 @@ LLM：OpenAI 兼容接口（编译理解+自愈阶段），支持本地 Qwen-VL�
   - 定位策略链完整：UIA 锚点 > DOM(Playwright) > 坐标百分比 > OCR(Tesseract) > 屏幕坐标
 - 阶段5.4 打包：完成（scripts/build_app.sh Tauri 安装包；scripts/build_sidecar.sh PyInstaller 后端单文件）
 - 退出链路：✅ 前端 ✕ 按钮 -> POST /shutdown -> 后端退出；Tauri 退出时兜底终止后端进程
+- PRD 量化成功标准验收（2026-08-15，见 docs/ACCEPTANCE.md）：
+  - 首次试运行（0 纠错）自主成功率 > 50%：通过（6/6 = 100%，含变量动态取值 + 窗口移动）
+  - 最多 3 次纠错后成功率 > 90%：通过（纠错 1 次后 6/6 = 100%，hlelo->hello）
+  - 完整用户流程总耗时 < 15 分钟：通过（42.2s，含录制2遍+合并+试运行+纠错+再次运行）
+  - 无需文档独立完成首次任务：待人工评审（无法自动化，见 ACCEPTANCE.md）
+  - 验收脚本：python/tests/acceptance/（test_a_first_run / test_b_corrections / test_c_time + common）

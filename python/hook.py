@@ -66,6 +66,9 @@ _user32.CallNextHookEx.argtypes = [
     ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
 ]
 _user32.CallNextHookEx.restype = ctypes.wintypes.LPARAM
+_user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+_user32.GetWindowTextW.argtypes = [ctypes.wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int]
+_user32.GetWindowTextW.restype = ctypes.c_int
 
 HOOKPROC = ctypes.CFUNCTYPE(
     ctypes.wintypes.LPARAM, ctypes.c_int,
@@ -78,9 +81,9 @@ LBDOWN, LBUP, RBDOWN, RBUP, WHEEL, KDOWN, KUP = range(7)
 
 class RawEvent:
     """原始钩子事件"""
-    __slots__ = ("event_type", "x", "y", "vk", "scan", "delta", "t_us")
+    __slots__ = ("event_type", "x", "y", "vk", "scan", "delta", "t_us", "fg_hwnd", "fg_title")
 
-    def __init__(self, event_type, x=0, y=0, vk=0, scan=0, delta=0, t_us=0):
+    def __init__(self, event_type, x=0, y=0, vk=0, scan=0, delta=0, t_us=0, fg_hwnd=0, fg_title=""):
         self.event_type = event_type
         self.x = x
         self.y = y
@@ -88,6 +91,8 @@ class RawEvent:
         self.scan = scan
         self.delta = delta
         self.t_us = t_us
+        self.fg_hwnd = fg_hwnd
+        self.fg_title = fg_title
 
 
 class HookManager:
@@ -102,6 +107,8 @@ class HookManager:
         self._thread = None
         self._mouse_cb = None
         self._kb_cb = None
+        self._last_fg_hwnd = 0
+        self._last_fg_title = ""
 
     def start(self):
         if self._running:
@@ -144,6 +151,19 @@ class HookManager:
         if kb_hook:
             u32.UnhookWindowsHookEx(kb_hook)
 
+    def _fg_snapshot(self):
+        """抓取前台窗口句柄+标题（标题仅在窗口变化时抓取，避免钩子回调阻塞）"""
+        try:
+            fg = _user32.GetForegroundWindow()
+            if fg != self._last_fg_hwnd:
+                buf = ctypes.create_unicode_buffer(256)
+                n = _user32.GetWindowTextW(fg, buf, 256)
+                self._last_fg_hwnd = fg
+                self._last_fg_title = buf.value if n > 0 else ""
+            return fg, self._last_fg_title
+        except Exception:
+            return 0, ""
+
     def _is_my_window(self, sx, sy):
         """过滤自身窗口上的事件"""
         try:
@@ -178,7 +198,9 @@ class HookManager:
                     delta = ctypes.c_short(mhs.mouseData >> 16).value
                 if et is not None:
                     now = int(time.time() * 1_000_000) - self._start_us
-                    self._queue.put(RawEvent(et, x=sx, y=sy, delta=delta, t_us=now), block=False)
+                    fg, fg_title = self._fg_snapshot()
+                    self._queue.put(RawEvent(et, x=sx, y=sy, delta=delta, t_us=now,
+                                             fg_hwnd=fg, fg_title=fg_title), block=False)
         except Exception:
             pass
         return _user32.CallNextHookEx(None, nCode, wParam, lParam)
@@ -194,7 +216,9 @@ class HookManager:
                     et = KUP
                 if et is not None:
                     now = int(time.time() * 1_000_000) - self._start_us
-                    self._queue.put(RawEvent(et, vk=khs.vkCode, scan=khs.scanCode, t_us=now), block=False)
+                    fg, fg_title = self._fg_snapshot()
+                    self._queue.put(RawEvent(et, vk=khs.vkCode, scan=khs.scanCode, t_us=now,
+                                             fg_hwnd=fg, fg_title=fg_title), block=False)
         except Exception:
             pass
         return _user32.CallNextHookEx(None, nCode, wParam, lParam)

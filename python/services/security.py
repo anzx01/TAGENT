@@ -5,8 +5,10 @@
 - 录制数据本地加密：AES 加密存储（密钥本地文件）
 """
 import base64
+import ctypes
 import json
 import os
+import time
 from pathlib import Path
 
 import paths
@@ -25,6 +27,7 @@ class Security:
     def __init__(self):
         self._fernet = None
         self._legacy_key = None  # 旧 XOR 密钥（向后兼容）
+        self._pw_cache: dict[int, tuple[float, bool]] = {}  # hwnd -> (时间戳, 是否密码框)
         self._init_crypto()
 
     # ---------- 4.3 录制数据加密 ----------
@@ -80,19 +83,37 @@ class Security:
     # ---------- 4.5 密码框检测 ----------
 
     def is_password_edit(self, hwnd) -> bool:
-        """检查窗口是否含密码编辑框（UIA IsPassword 模式）"""
+        """检查窗口是否含密码编辑框。
+        快路径：Win32 ES_PASSWORD 样式（毫秒级）；
+        慢路径：UIA IsPassword（结果按 hwnd 缓存，避免阻塞录制主循环）
+        """
+        if not hwnd:
+            return False
+        try:
+            style = ctypes.windll.user32.GetWindowLongPtrW(hwnd, -16)  # GWL_STYLE
+            if style & 0x0020:  # ES_PASSWORD
+                return True
+        except Exception:
+            pass
+        cached = self._pw_cache.get(hwnd)
+        if cached and cached[0] > time.time() - 30:
+            return cached[1]
         try:
             import uiautomation as ua
             ctrl = ua.ControlFromHandle(hwnd)
             if ctrl is None:
+                self._pw_cache[hwnd] = (time.time(), False)
                 return False
             edit = ctrl.EditControl(searchDepth=8)
             if not edit.Exists(1.0):
+                self._pw_cache[hwnd] = (time.time(), False)
                 return False
             try:
-                return bool(edit.IsPassword())
+                result = bool(edit.IsPassword())
             except Exception:
-                return False
+                result = False
+            self._pw_cache[hwnd] = (time.time(), result)
+            return result
         except Exception:
             return False
 

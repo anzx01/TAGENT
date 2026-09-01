@@ -13,6 +13,7 @@ import win32gui
 from hook import HookManager, LBDOWN, LBUP, RBDOWN, RBUP, WHEEL, KDOWN, KUP
 from capture import capture_window, capture_screen, GridRenderer
 from logger import get_logger
+from services.pii_guard import mask_pii
 
 log = get_logger("recorder")
 
@@ -175,13 +176,20 @@ class Recorder:
         self._pending_scroll = None
         self._pending_text = None
         self._held_mods = set()
+        self._last_fg_hwnd = 0
+        self._last_kdown_fg_hwnd = 0
+        self._last_fg_title = ""
 
     def start(self):
         self.steps = []
         self._shot_idx = 0
         self._shot_threads = []
         self._stop_event.clear()
+        self._last_fg_hwnd = 0
+        self._last_kdown_fg_hwnd = 0
+        self._last_fg_title = ""
         self.recording = True
+        self._write_meta("recording", {"started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
         if self._uia_worker is None:
             self._uia_worker = UiaWorker()
         self.hook.start()
@@ -193,10 +201,14 @@ class Recorder:
         self.recording = False
         self._stop_event.set()
         # UWP 等应用的输入管线会延迟处理注入事件，先排空队列再收尾
-        self._drain_quiet(1.5)
+        self._drain_quiet(2.0)
         self.hook.stop()
+        # 钩子线程退出后，处理队列中延迟到达的剩余事件
+        self._drain_quiet(1.0)
         if self._proc_thread:
             self._proc_thread.join(timeout=3.0)
+        log.info("stop: pending_text=%r pending_scroll=%r 队列剩余=%d",
+                 self._pending_text, self._pending_scroll, self.hook._queue.qsize())
         # 冲刷未完成状态
         self._flush_pending()
         # 等后台截图线程收尾
@@ -207,8 +219,28 @@ class Recorder:
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"steps": self.steps, "count": len(self.steps)},
                       f, ensure_ascii=False, indent=2)
+        self._write_meta("ready", {
+            "stopped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "step_count": len(self.steps),
+            "screenshot_count": self._shot_idx,
+            "privacy": {"text_masking": "enabled", "screenshot_ocr": "pending"},
+        })
         log.info("录制完成: %s, %d 步", path, len(self.steps))
         return str(path)
+
+    def _write_meta(self, state: str, extra: dict | None = None):
+        """持久化可恢复的会话状态；写临时文件后替换，避免崩溃留下半个 JSON。"""
+        meta_path = self.output_dir / "meta.json"
+        try:
+            current = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        except Exception:
+            current = {}
+        current.update({"state": state, "heartbeat": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+        if extra:
+            current.update(extra)
+        tmp = meta_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(meta_path)
 
     def _drain_quiet(self, max_wait):
         """停止前排空钩子队列：处理剩余事件，直到连续 0.5s 无新事件"""
@@ -217,7 +249,10 @@ class Recorder:
         while time.time() < deadline:
             evt = self.hook.get_event(timeout=0.1)
             if evt is not None:
-                self._process(evt)
+                try:
+                    self._process(evt)
+                except Exception:
+                    log.exception("drain 处理事件异常")
                 last_seen = time.time()
             elif time.time() - last_seen > 0.5:
                 break
@@ -233,29 +268,45 @@ class Recorder:
             evt = self.hook.get_event(timeout=0.02)
             if evt is None:
                 now = int(time.time() * 1_000_000) - self.hook._start_us
-                self._check_timeouts(now)
+                try:
+                    self._check_timeouts(now)
+                except Exception:
+                    log.exception("check_timeouts 异常")
                 continue
-            self._process(evt)
+            try:
+                self._process(evt)
+            except Exception:
+                log.exception("_process 处理事件异常")
 
     def _process(self, evt):
         et = evt.event_type
+        if evt.fg_hwnd:
+            self._last_fg_hwnd = evt.fg_hwnd
+        if evt.fg_title:
+            self._last_fg_title = evt.fg_title
         # 更新修饰键
         if et == KDOWN:
             if evt.vk in MODIFIER_VKS:
                 self._held_mods.add(evt.vk)
+            elif evt.fg_hwnd:
+                # 非修饰键首按：记录组合键/功能键按下时刻的前台窗口
+                # （KUP 时窗口可能已因该键生效而关闭，如 Enter 提交保存对话框）
+                self._last_kdown_fg_hwnd = evt.fg_hwnd
         elif et == KUP:
             self._held_mods.discard(evt.vk)
 
         if et == LBDOWN:
             # 鼠标点击时先冲刷未完成的文本输入
             if self._pending_text:
-                self._finalize_text(self._pending_text)
-                self._pending_text = None
-            self._pending_click = (evt.x, evt.y, evt.t_us)
+                try:
+                    self._finalize_text(self._pending_text)
+                finally:
+                    self._pending_text = None
+            self._pending_click = (evt.x, evt.y, evt.t_us, evt.fg_hwnd)
         elif et == LBUP:
             self._on_left_up(evt)
         elif et == RBDOWN:
-            self._pending_click = (evt.x, evt.y, evt.t_us, "right")
+            self._pending_click = (evt.x, evt.y, evt.t_us, evt.fg_hwnd)
         elif et == RBUP:
             self._on_right_up(evt)
         elif et == WHEEL:
@@ -270,7 +321,7 @@ class Recorder:
         self._pending_click = None
         if not pc:
             return
-        sx, sy, st = pc
+        sx, sy, st, fg = pc
         dist = ((evt.x - sx) ** 2 + (evt.y - sy) ** 2) ** 0.5
         dur = evt.t_us - st
         if dist < CLICK_DIST:
@@ -279,15 +330,15 @@ class Recorder:
             action = "swipe"
         else:
             action = "drag"
-        self._add_step(action, sx, sy, end_x=evt.x, end_y=evt.y, duration_us=dur)
+        self._add_step(action, sx, sy, end_x=evt.x, end_y=evt.y, duration_us=dur, fg_hwnd=fg)
 
     def _on_right_up(self, evt):
         pc = self._pending_click
         self._pending_click = None
         if not pc:
             return
-        sx, sy, st = pc[:3]
-        self._add_step("right_click", sx, sy)
+        sx, sy, st, fg = pc[:4]
+        self._add_step("right_click", sx, sy, fg_hwnd=fg)
 
     def _on_scroll(self, evt):
         now_us = evt.t_us
@@ -310,6 +361,7 @@ class Recorder:
             return
         # 可打印字符 -> 文本输入
         char = vk_to_char(vk, bool(self._held_mods))
+        log.debug("key down vk=%#x char=%r pending=%r", vk, char, self._pending_text)
         if char:
             if self._pending_text:
                 gap = evt.t_us - self._pending_text["t_us"]
@@ -318,12 +370,13 @@ class Recorder:
                     self._pending_text["t_us"] = evt.t_us
                 else:
                     self._finalize_text(self._pending_text)
-                    self._pending_text = {"text": char, "t_us": evt.t_us}
+                    self._pending_text = {"text": char, "t_us": evt.t_us, "fg_hwnd": self._last_fg_hwnd}
             else:
-                self._pending_text = {"text": char, "t_us": evt.t_us}
+                self._pending_text = {"text": char, "t_us": evt.t_us, "fg_hwnd": self._last_fg_hwnd}
 
     def _on_key_up(self, evt):
         vk = evt.vk
+        log.info("keyup vk=%#x held=%r fg=%s", vk, sorted(self._held_mods), hex(evt.fg_hwnd))
         # 仅 Shift 释放时直接返回
         if vk in {0x10, 0xA0, 0xA1}:
             return
@@ -332,45 +385,72 @@ class Recorder:
         # 功能键或组合键记录前，先冲刷 pending text（保持时间顺序）
         if (real_mods and vk not in MODIFIER_VKS) or vk in FUNC_VKS:
             if self._pending_text:
-                self._finalize_text(self._pending_text)
-                self._pending_text = None
+                try:
+                    self._finalize_text(self._pending_text)
+                finally:
+                    self._pending_text = None
         if real_mods and vk not in MODIFIER_VKS:
             mod_names = list(dict.fromkeys(vk_to_name(m) for m in sorted(real_mods)))
             key_name = vk_to_name(vk)
             combo = " ".join(mod_names + [key_name])
-            self._add_step("key_press", key=combo)
+            self._add_step("key_press", key=combo, fg_hwnd=self._last_kdown_fg_hwnd)
         elif vk in FUNC_VKS:
-            self._add_step("key_press", key=vk_to_name(vk))
+            self._add_step("key_press", key=vk_to_name(vk), fg_hwnd=self._last_kdown_fg_hwnd)
 
     def _check_timeouts(self, now_us):
         if self._pending_scroll and (now_us - self._pending_scroll["t_us"] > SCROLL_MERGE):
             self._finalize_scroll(self._pending_scroll)
             self._pending_scroll = None
         if self._pending_text and (now_us - self._pending_text["t_us"] > TEXT_TIMEOUT):
-            self._finalize_text(self._pending_text)
-            self._pending_text = None
+            try:
+                self._finalize_text(self._pending_text)
+            finally:
+                self._pending_text = None
 
     def _finalize_scroll(self, s):
         self._add_step("scroll", s["x"], s["y"], delta=s["delta"])
 
     def _finalize_text(self, t):
-        step = self._add_step("input_text", text=t["text"])
-        # 阶段4.3 安全：若输入目标是密码框，明文不落盘，替换为占位
-        if step is not None:
-            sec = _get_security()
-            hwnd = step.get("hwnd") or win32gui.GetForegroundWindow()
-            if hwnd and sec.is_password_edit(hwnd):
-                step["text"] = "{{PASSWORD}}"
-                step["sensitive"] = True
-                log.info("检测到密码框，本次输入不落明文")
+        log.info("finalize_text %r (recording=%s)", t["text"], self.recording)
+        try:
+            step = self._add_step("input_text", text=t["text"], fg_hwnd=t.get("fg_hwnd", 0))
+            # 阶段4.3 安全：若输入目标是密码框，明文不落盘，替换为占位
+            if step is not None:
+                sec = _get_security()
+                hwnd = step.get("hwnd") or win32gui.GetForegroundWindow()
+                if hwnd and sec and sec.is_password_edit(hwnd):
+                    step["text"] = "{{PASSWORD}}"
+                    step["sensitive"] = True
+                    log.info("检测到密码框，本次输入不落明文")
+                else:
+                    masked = mask_pii(step.get("text", ""))
+                    if masked.hit:
+                        step["text"] = masked.text
+                        step["sensitive"] = True
+                        step["pii_kinds"] = sorted({m.kind for m in masked.matches})
+                        log.info("检测到 PII(%s)，已掩码", step["pii_kinds"])
+        except Exception:
+            log.exception("finalize_text 异常")
 
     def _flush_pending(self):
         if self._pending_scroll:
             self._finalize_scroll(self._pending_scroll)
             self._pending_scroll = None
         if self._pending_text:
+            log.info("flush_pending text %r", self._pending_text["text"])
             self._finalize_text(self._pending_text)
             self._pending_text = None
+
+    def _get_window_info(self, hwnd, x=None, y=None):
+        """容错取窗口信息：句柄可能失效（钩子回调抓取的前台窗口瞬间销毁）"""
+        try:
+            hwnd = win32gui.GetAncestor(hwnd, 2)  # GA_ROOT
+            window_title = win32gui.GetWindowText(hwnd)
+            rect = win32gui.GetWindowRect(hwnd)
+            win_size = (rect[2] - rect[0], rect[3] - rect[1])
+            return hwnd, window_title, win_size
+        except Exception:
+            return None, "", None
 
     def _add_step(self, action, x=None, y=None, **extra):
         """记录一步操作 + 截图 + 窗口信息"""
@@ -395,16 +475,14 @@ class Recorder:
         window_title = ""
         win_size = None
         if x is not None and y is not None:
-            hwnd = win32gui.WindowFromPoint((x, y))
+            # 优先用按下时刻前台窗口（点击后窗口可能已关闭，WindowFromPoint 会落空/落错）
+            fg_hwnd = extra.get("fg_hwnd") or 0
+            hwnd = fg_hwnd or win32gui.WindowFromPoint((x, y))
             if hwnd:
-                # 子控件(如记事本 Edit)无标题，取顶层窗口标题用于 switch_window 检测与回放定位
-                hwnd = win32gui.GetAncestor(hwnd, 2)  # GA_ROOT
-                window_title = win32gui.GetWindowText(hwnd)
-                try:
-                    rect = win32gui.GetWindowRect(hwnd)
-                    win_size = (rect[2] - rect[0], rect[3] - rect[1])
-                except Exception:
-                    pass
+                hwnd, window_title, win_size = self._get_window_info(hwnd)
+            if not hwnd and fg_hwnd:
+                # 按下时刻窗口已销毁，用事件时刻缓存的前台标题
+                window_title = self._last_fg_title
             # 屏幕坐标转百分比
             sw, sh = _screen_size()
             step["pct_x"] = round(x / sw * 100, 1) if sw else 0
@@ -422,15 +500,13 @@ class Recorder:
                     pass
         else:
             # 键盘动作（input_text/key_press）：捕获前台窗口，回放时用于定位焦点
-            hwnd = win32gui.GetForegroundWindow()
+            # 优先用事件发生时（钩子回调时刻）抓取的前台窗口，避免队列延迟导致归属错乱
+            hwnd = extra.get("fg_hwnd") or self._last_fg_hwnd or win32gui.GetForegroundWindow()
             if hwnd:
-                hwnd = win32gui.GetAncestor(hwnd, 2)  # GA_ROOT
-                window_title = win32gui.GetWindowText(hwnd)
-                try:
-                    rect = win32gui.GetWindowRect(hwnd)
-                    win_size = (rect[2] - rect[0], rect[3] - rect[1])
-                except Exception:
-                    pass
+                hwnd, window_title, win_size = self._get_window_info(hwnd)
+            if not hwnd and self._last_fg_title:
+                # 句柄已失效（如回车提交后对话框关闭），用事件时刻缓存的前台标题
+                window_title = self._last_fg_title
 
         step["hwnd"] = hwnd
         step["window"] = window_title
@@ -463,7 +539,7 @@ class Recorder:
 
         # 合并额外字段
         for k, v in extra.items():
-            if k not in step:
+            if k not in step and k != "fg_hwnd":
                 step[k] = v
 
         # 截图（仅鼠标动作截图；渲染较重，放后台线程避免阻塞事件分类）

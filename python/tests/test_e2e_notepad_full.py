@@ -11,7 +11,7 @@ E2E 测试：完整流程验证（录制 -> 编译 -> 回放）
 
 依赖：后端服务必须在 http://127.0.0.1:18899 运行
 """
-import time, json, ctypes, subprocess, sys, os, urllib.request, win32gui, win32con
+import time, json, ctypes, subprocess, sys, os, shutil, urllib.request, win32gui, win32con
 import tempfile
 from pathlib import Path
 
@@ -68,6 +68,15 @@ def bring_to_front(hwnd):
     time.sleep(0.3)
     # 确保 ALT 键已释放（防止 ALT 卡住导致空格打开系统菜单）
     u32.keybd_event(0x12, 0, 0x0002, 0)
+
+def ensure_foreground(hwnd, retries=6, gap=0.5):
+    """bring_to_front + 验证前台（对抗 Win11 恢复标签的延迟抢前台）"""
+    for _ in range(retries):
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+        bring_to_front(hwnd)
+        time.sleep(gap)
+    return win32gui.GetForegroundWindow() == hwnd
 
 def find_notepad():
     """查找记事本窗口（兼容中英文标题、动态标题）"""
@@ -145,10 +154,25 @@ def wait_for_replay(timeout=30):
     return False
 
 def cleanup_notepad():
-    """关闭所有记事本实例"""
+    """关闭所有记事本实例，并清除 Win11 记事本的标签恢复状态
+    （否则 taskkill 强杀后重启会自动恢复旧标签抢占前台）"""
     subprocess.run(["taskkill", "/IM", "Notepad.exe", "/F", "/T"],
                    capture_output=True)
     time.sleep(1)
+    pkg_root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Packages",
+                            "Microsoft.WindowsNotepad_8wekyb3d8bbwe", "LocalState")
+    for sub in ("TabState", "WindowState"):
+        d = os.path.join(pkg_root, sub)
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                try:
+                    p = os.path.join(d, f)
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+                except Exception:
+                    pass
 
 # 禁用 Win11 记事本会话恢复（避免重启后弹出"是否恢复"对话框抢占焦点）
 try:
@@ -175,20 +199,24 @@ def find_notepad_by_filename(filename):
     return found[0] if found else None
 
 def open_fresh_notepad():
-    """打开一个干净的记事本。不传文件参数，避免 Win11 标签页恢复干扰。"""
+    """打开一个干净的记事本。使用唯一临时文件：标题稳定可精确匹配，
+    且不受 Win11 记事本会话恢复（恢复旧标签）干扰。"""
     global _open_counter
     _open_counter += 1
-    subprocess.Popen(["notepad.exe"])
-    time.sleep(2)
-    hwnd = find_notepad()
+    fname = f"tagent_e2e_{os.getpid()}_{_open_counter}.txt"
+    fpath = os.path.join(tempfile.gettempdir(), fname)
+    with open(fpath, "w", encoding="utf-8"):
+        pass
+    subprocess.Popen(["notepad.exe", fpath])
+    time.sleep(2.5)
+    hwnd = find_notepad_by_filename(fname)
+    if not hwnd:
+        hwnd = find_notepad()
     if hwnd:
-        bring_to_front(hwnd)
-        time.sleep(0.5)
         # 关闭可能的会话恢复对话框
         press_key(0x1B)
         time.sleep(0.3)
-        bring_to_front(hwnd)
-        time.sleep(0.5)
+        ensure_foreground(hwnd)
     return hwnd
 
 
@@ -282,7 +310,7 @@ time.sleep(1)
 
 # 7. 回放
 print("[1.7] 开始回放...")
-bring_to_front(hwnd)
+ensure_foreground(hwnd)
 time.sleep(0.5)
 r = post(f'{BASE_URL}/replay/start', json.dumps({"recording_id": rec_id_1}).encode())
 assert r['ok'], f"回放启动失败: {r}"
@@ -365,7 +393,7 @@ time.sleep(1)
 print("[2.8] 重新打开记事本...")
 hwnd = open_fresh_notepad()
 assert hwnd, "记事本重新打开失败"
-bring_to_front(hwnd)
+ensure_foreground(hwnd)
 time.sleep(2)  # 等更久确保 Win11 标签页恢复完成
 
 # 清除旧内容（Ctrl+A, Delete）
@@ -388,6 +416,7 @@ time.sleep(1)
 
 # 回放
 print("[2.9] 回放...")
+ensure_foreground(hwnd)
 r = post(f'{BASE_URL}/replay/start', json.dumps({"recording_id": rec_id_2}).encode())
 assert r['ok'], f"回放启动失败: {r}"
 wait_sec = max(10, steps2 * 2)

@@ -165,6 +165,7 @@
   </div>
   <div class="panel" id="panel">
     <h3>任务库 <span id="confBadge" style="font-size:11px;color:#888;"></span></h3>
+    <div id="scoutSummary" style="padding:8px;background:rgba(22,160,133,.12);border-radius:6px;margin-bottom:8px;font-size:11px;color:#b8e8dc"></div>
     <div id="taskList"></div>
     <div class="step-list" id="stepList"></div>
   </div>
@@ -241,7 +242,7 @@
         const res = await fetch(API + "/replay/pause", { method: "POST" });
         const data = await res.json();
         setStatus(data.msg || data.msg || "", "paused");
-        if (data.ok) openTakeover();
+        if (data.ok) setTakeover();
       } catch (_) { setStatus("服务未连接"); }
     });
     btnReplayStop.addEventListener("click", async () => {
@@ -293,6 +294,7 @@
             setStatus("等待接管", "paused");
             setReplaying(false);
             stopPoll();
+            setTakeover();
           } else if (d.error) {
             setStatus(`步骤出错: ${d.step_desc || ''}`, "error");
           } else {
@@ -310,7 +312,9 @@
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify(id ? { recording_id: id } : {}),
         });
-        return (await res.json()).ok || false;
+        const data = await res.json();
+        if (!data.ok) setStatus(data.msg || "启动回放失败");
+        return data.ok || false;
       } catch (_) { setStatus("服务未连接"); return false; }
     }
 
@@ -360,7 +364,10 @@
         taskList.innerHTML = "";
         const conf = await fetch(API + "/tasks/security/summary").then(r => r.json()).catch(() => null);
         $("confBadge").textContent = conf && conf.password_edit ? "⚠ 前台含密码框" : "";
-        for (const task of data.tasks || []) {
+        const tasks = data.tasks || [];
+        const scout = $("scoutSummary");
+        if (scout) scout.textContent = `Scout · ${tasks.length} workflows · ${tasks.reduce((n,t)=>n+t.steps,0)} steps · repetitive work discovered`;
+        for (const task of tasks) {
           taskList.appendChild(taskCard(task));
         }
       } catch (_) { taskList.innerHTML = "<p>加载失败</p>"; }

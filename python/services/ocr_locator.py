@@ -42,6 +42,11 @@ def is_available() -> bool:
     return _find_tesseract() is not None
 
 
+def _normalize(s):
+    """去空白+小写，用于文本比较（OCR 词间空格与目标文本空格不对应）"""
+    return "".join(s.split()).lower()
+
+
 def find_text_on_screen(image, target_text):
     """在截图上查找文本，返回匹配位置的中心坐标 (x, y) 或 None。
     image: PIL.Image 对象（截图）
@@ -58,19 +63,12 @@ def find_text_on_screen(image, target_text):
         # OCR 识别，返回带位置的数据
         data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT,
                                          lang="chi_sim+eng")
-        target_lower = target_text.lower().strip()
+        target_norm = _normalize(target_text)
+        if not target_norm:
+            return None
         n = len(data["text"])
-        for i in range(n):
-            word = data["text"][i].strip()
-            if not word:
-                continue
-            # 精确匹配或包含匹配
-            if target_lower in word.lower() or word.lower() in target_lower:
-                x = data["left"][i] + data["width"][i] // 2
-                y = data["top"][i] + data["height"][i] // 2
-                log.info("OCR 命中 '%s' -> (%d, %d)", word, x, y)
-                return (x, y)
-        # 尝试按行匹配（多个词组合）
+
+        # ---- 1. 行匹配优先（按 par/block/line 聚合，图标文字常被拆成多词）----
         lines = {}
         for i in range(n):
             word = data["text"][i].strip()
@@ -88,11 +86,41 @@ def find_text_on_screen(image, target_text):
             entry["width"] = max(entry["width"], data["left"][i] + data["width"][i] - entry["left"])
             entry["height"] = max(entry["height"], data["height"][i])
         for key, entry in lines.items():
-            line_text = " ".join(entry["words"])
-            if target_lower in line_text.lower():
+            line_norm = _normalize(" ".join(entry["words"]))
+            if not line_norm:
+                continue
+            # 完整行匹配（最高优先）
+            if line_norm == target_norm:
                 x = entry["left"] + entry["width"] // 2
                 y = entry["top"] + entry["height"] // 2
-                log.info("OCR 行匹配 '%s' -> (%d, %d)", line_text, x, y)
+                log.info("OCR 行精确匹配 '%s' -> (%d, %d)", line_norm, x, y)
+                return (x, y)
+            # 长目标包含匹配（target >= 4 字符才允许子串，避免单字误命中）
+            if len(target_norm) >= 4 and target_norm in line_norm:
+                x = entry["left"] + entry["width"] // 2
+                y = entry["top"] + entry["height"] // 2
+                log.info("OCR 行匹配 '%s' -> (%d, %d)", line_norm, x, y)
+                return (x, y)
+
+        # ---- 2. 词匹配（完整词优先，长词包含兜底）----
+        for i in range(n):
+            word = data["text"][i].strip()
+            if not word:
+                continue
+            word_norm = _normalize(word)
+            if not word_norm:
+                continue
+            # 完整词匹配
+            if word_norm == target_norm:
+                x = data["left"][i] + data["width"][i] // 2
+                y = data["top"][i] + data["height"][i] // 2
+                log.info("OCR 词精确匹配 '%s' -> (%d, %d)", word, x, y)
+                return (x, y)
+            # 目标被 OCR 拆成词内片段时包含匹配（仅限长目标，避免 'x'->'.txt' 误命中）
+            if len(target_norm) >= 4 and len(word_norm) >= 2 and target_norm in word_norm:
+                x = data["left"][i] + data["width"][i] // 2
+                y = data["top"][i] + data["height"][i] // 2
+                log.info("OCR 词匹配 '%s' -> (%d, %d)", word, x, y)
                 return (x, y)
         log.debug("OCR 未找到 '%s'", target_text)
         return None

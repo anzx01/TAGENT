@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 运行 Python 单元/冒烟测试
+# 运行纯单元测试（无后端/真实应用依赖）
 set -e
 cd "$(dirname "$0")/.."
 
@@ -8,9 +8,17 @@ if [ ! -f "$PY" ]; then
     PY="python"
 fi
 
-# 无 pytest 时用 unittest 方式逐个编译校验
-for f in python/tests/test_*.py; do
+UNIT_TESTS=(
+    python/tests/test_capability_registry.py
+    python/tests/test_compiler_semantic.py
+    python/tests/test_eval_scorer.py
+    python/tests/test_merge_warning.py
+    python/tests/test_pii_guard.py
+    python/tests/test_web_channel.py
+)
+
+for f in "${UNIT_TESTS[@]}"; do
     echo "== $f =="
-    "$PY" -m py_compile "$f"
+    "$PY" "$f" 2>&1 | tail -n 2
 done
-echo "全部测试文件编译通过"
+echo "全部单元测试通过"

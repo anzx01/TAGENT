@@ -13,6 +13,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from logger import get_logger
+from services.capability_registry import CapabilityRegistry
 from services.corrections import CorrectionStore
 from services.scheduler import Scheduler
 from services.task_store import TaskStore
@@ -33,10 +34,18 @@ class CorrectBody(BaseModel):
     correct: list[dict] = []
 
 
+class CapRegisterBody(BaseModel):
+    name: str
+    source_task: str
+    step_range: list[int] = [0, 0]
+    description: str = ""
+
+
 def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
     """路由工厂：注入录制目录与调度器，避免全局状态循环依赖。"""
     router = APIRouter(prefix="/tasks", tags=["tasks"])
     store = TaskStore(data_dir)
+    cap_registry = CapabilityRegistry(data_dir / "capabilities.json")
 
     def _resolve(rec_id: str) -> Path | None:
         import re
@@ -163,6 +172,42 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
         store_c = CorrectionStore(d)
         corr = store_c.add_correction(body.trigger, body.correct)
         return {"ok": True, "correction": corr}
+
+    # ---------- 阶段8 能力注册表（flows） ----------
+
+    @router.get("/capabilities")
+    def list_capabilities():
+        return {"ok": True, "capabilities": cap_registry.list()}
+
+    @router.post("/capabilities")
+    def register_capability(body: CapRegisterBody):
+        d = _resolve(body.source_task)
+        if d is None:
+            return {"ok": False, "msg": "找不到源任务"}
+        tf = d / "task.json"
+        if tf.exists():
+            try:
+                total = len(json.loads(tf.read_text(encoding="utf-8")))
+            except Exception:
+                total = 0
+        else:
+            total = 0
+        start, end = body.step_range
+        if not (0 <= start < end <= max(total, 1)):
+            return {"ok": False, "msg": f"步骤区间越界（共 {total} 步）"}
+        try:
+            entry = cap_registry.register(body.name, body.source_task, [start, end], body.description)
+        except ValueError as ex:
+            return {"ok": False, "msg": str(ex)}
+        return {"ok": True, "capability": entry.__dict__}
+
+    @router.delete("/capabilities/{cap_id}")
+    def delete_capability(cap_id: str):
+        return {"ok": cap_registry.delete(cap_id)}
+
+    @router.post("/capabilities/{cap_id}/use")
+    def use_capability(cap_id: str):
+        return {"ok": cap_registry.mark_used(cap_id)}
 
     # ---------- 阶段4.3 安全查询 ----------
 

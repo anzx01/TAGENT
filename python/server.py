@@ -87,17 +87,127 @@ def _scheduled_run(rec_id: str):
         log.exception("[定时] 启动失败 %s", rec_id)
 
 
+# 任务库路由 + 定时调度器（模块级初始化，确保 uvicorn 启动时也注册）
+_scheduler = Scheduler(TASKS_DB, _scheduled_run)
+_scheduler.start()
+app.include_router(build_router(DATA_DIR, _scheduler))
+
+# 预热安全单例（密钥初始化/UIA 缓存），避免录制主循环中首次调用阻塞
+from services.security import get_security  # noqa: E402
+get_security()
+
+
+# 对话框/临时窗口关键词：这些窗口大概率在回放过程中才出现（另存为/打开/确认等）
+_DIALOG_KEYWORDS = ("另存为", "保存为", "打开", "确认", "替换", "覆盖",
+                    "属性", "选项", "设置", "主机弹出窗口", "消息", "提示")
+
+
+def _window_created_in_recording(task: dict, window: str) -> bool:
+    """判断窗口是否可能由录制/回放过程自身创建（而非必须预先存在）。
+    判定依据：
+    1. 窗口名含对话框关键词（另存为/打开/确认等）
+    2. 步骤序列中，第一次 switch_window 到它之前，存在指向相似名称的
+       桌面点击（如点击桌面图标"新建 文本文档.txt" -> 记事本"xx.txt - Notepad"）
+    3. 第一次 switch_window 之前存在 wait 步骤（等待窗口自动出现）
+    """
+    w = window.lstrip("*").lower()
+    if any(k in w for k in _DIALOG_KEYWORDS):
+        return True
+    if not window.startswith("*") and "- notepad" in w:
+        return True
+    # 检查第一次 switch 前是否存在创建性步骤
+    created_window_names = []
+    for step in task.get("steps", []):
+        action = step.get("action", "")
+        if action in ("click", "double_click"):
+            for loc in step.get("locator", []):
+                name = loc.get("name", "")
+                if name:
+                    created_window_names.append(name.lower())
+        elif action == "wait":
+            t = step.get("window", "")
+            if t:
+                created_window_names.append(t.lower())
+    for name in created_window_names:
+        if name and (name in w or w in name):
+            return True
+        base = name.rsplit(" - ", 1)[0] if " - " in name else name
+        if base and base in w:
+            return True
+    return False
+
+
+def _check_window_dependencies(rec_dir) -> list[str]:
+    """检查回放所需的窗口是否存在，返回缺失窗口列表。
+    只检查必须预先存在的窗口（排除回放过程中会自行创建的窗口/对话框）。
+    标题匹配与 player 一致：支持部分包含匹配。"""
+    import win32gui
+    task_file = rec_dir / "task.json"
+    if not task_file.exists():
+        return []
+    try:
+        with open(task_file, "r", encoding="utf-8") as f:
+            task = json.load(f)
+    except Exception:
+        return []
+    missing = []
+    required_windows = set()
+    for step in task.get("steps", []):
+        if step.get("action") == "switch_window":
+            window = step.get("window", "")
+            if window:
+                required_windows.add(window)
+
+    def _title_exists(title: str) -> bool:
+        """部分匹配查找窗口：精确 -> 去星 -> 单向包含"""
+        if not title:
+            return False
+        t = title.lstrip("*")
+        if win32gui.FindWindow(None, title):
+            return True
+        if t != title and win32gui.FindWindow(None, t):
+            return True
+        found = []
+        def cb(h, l):
+            try:
+                l.append(win32gui.GetWindowText(h))
+            except Exception:
+                pass
+            return True
+        win32gui.EnumWindows(cb, found)
+        return any(t in w for w in found if w)
+
+    for window in required_windows:
+        if _window_created_in_recording(task, window):
+            continue  # 回放中会自行创建，不要求预先存在
+        if not _title_exists(window):
+            missing.append(window)
+    return missing
+
+
 def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
-    """启动回放线程（复用 /replay/start 逻辑）"""
+    """启动回放线程（复用 /replay/start 逻辑）。返回 rec_id 或 None"""
     global _player
     rec_dir = _resolve_rec_dir(rec_id)
     if rec_dir is None:
         return None
     task_file = rec_dir / "task.json"
     events_file = rec_dir / "events.json"
+    # 统一用最新 compiler 重编译：旧录制自动获得修复（双击合并/定位链升级）
+    if events_file.exists() and not task_file.exists():
+        try:
+            Compiler(str(rec_dir)).compile()
+        except Exception:
+            log.exception("回放前重新编译失败，使用已有 task.json")
     path = task_file if task_file.exists() else events_file
     if not path.exists():
         return None
+
+    # 回放前窗口检测（仅警告，不拦截：player 遇到缺失窗口会自动暂停并弹接管对话框）
+    missing_windows = _check_window_dependencies(rec_dir)
+    if missing_windows:
+        log.warning("回放前检测到可能缺失的窗口（若未打开将在该步暂停）: %s",
+                    missing_windows)
 
     # 阶段2.4：会话步骤（登录/2FA）
     from services.task_store import TaskStore
@@ -115,6 +225,7 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
     ckpt_file = ckpt_dir / f"ckpt_{rec_id}.json"
 
     def _run():
+        global _player
         try:
             _player = Player(str(path), variables=variables or {},
                              session_steps=session_steps,
@@ -156,11 +267,30 @@ def _write_report(rec_id: str, result):
         else:
             report = {"rec_id": rec_id, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
             report.update(result)
+        _attach_eval(rec_id, report)
         (report_dir / fname).write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8")
     except Exception:
         log.exception("REPORT 写入失败")
+
+
+def _attach_eval(rec_id: str, report: dict):
+    """移植：skill-recorder scoring - 回放 REPORT 附评分（期望=录制 events.json）"""
+    try:
+        if not isinstance(report.get("steps"), list):
+            return
+        import services.eval_scorer as eval_scorer
+        rec_dir = BASE_DIR / "recordings" / rec_id
+        events_file = rec_dir / "events.json"
+        if not events_file.exists():
+            return
+        expected = json.loads(events_file.read_text(encoding="utf-8")).get("steps", [])
+        if not expected:
+            return
+        report["eval"] = eval_scorer.score(expected, report["steps"]).to_dict()
+    except Exception:
+        log.exception("eval 评分失败")
 
 # 录制 id 格式：时间戳，防路径穿越
 _REC_ID_RE = re.compile(r"^\d{8}_\d{6}$")
@@ -262,9 +392,15 @@ def start_replay(req: ReplayRequest):
         return {"ok": False, "msg": "正在录制，请先停止"}
 
     with _player_lock:
-        if _player:
+        if _player and not _player.paused:
             return {"ok": False, "msg": "已有回放进行中"}
+        if _player and _player.paused:
+            # 暂停残留（等待人工接管）被新的回放指令替换
+            _player.stop()
+    if _player:
+        time.sleep(1.0)  # 等旧回放线程退出（finally 置 None）
 
+    with _player_lock:
         # 找到要回放的录制
         if req.recording_id:
             rec_dir = _resolve_rec_dir(req.recording_id)
@@ -631,11 +767,6 @@ if __name__ == "__main__":
     frontend_dir = BASE_DIR / "src"
     if frontend_dir.exists():
         app.mount("/ui", StaticFiles(directory=str(frontend_dir), html=True), name="ui")
-
-    # 任务库路由 + 定时调度器
-    _scheduler = Scheduler(TASKS_DB, _scheduled_run)  # noqa: F841 (模块级状态)
-    _scheduler.start()
-    app.include_router(build_router(DATA_DIR, _scheduler))
 
     # LLM 自愈配置 API
     @app.get("/llm/config")
