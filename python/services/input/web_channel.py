@@ -133,11 +133,14 @@ class WebChannel:
                 log.warning("element_not_found: sel=%r page=%r title=%r",
                             locator.get("selector"), page.url, _safe_title(page))
                 self.active = False
-                return StepResult(False, "web_click", "element_not_found")
+                # Let the caller fall back to the recorded desktop locator.
+                # A stale DOM selector must not strand an otherwise replayable
+                # workflow in the human-takeover loop.
+                return None
             box = target.first.bounding_box()
             if not box:
                 self.active = False
-                return StepResult(False, "web_click", "element_hidden")
+                return None
             page.mouse.click(box["x"] + box["width"] / 2,
                              box["y"] + box["height"] / 2)
             self.active = True

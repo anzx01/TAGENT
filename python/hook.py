@@ -48,6 +48,19 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("flags", ctypes.wintypes.DWORD),
+        ("hwndActive", ctypes.wintypes.HWND),
+        ("hwndFocus", ctypes.wintypes.HWND),
+        ("hwndCapture", ctypes.wintypes.HWND),
+        ("hwndMenuOwner", ctypes.wintypes.HWND),
+        ("hwndMoveSize", ctypes.wintypes.HWND),
+        ("hwndCaret", ctypes.wintypes.HWND),
+    ]
+
+
 class MSGSTRUCT(ctypes.Structure):
     _fields_ = [
         ("hwnd", ctypes.wintypes.HWND),
@@ -67,8 +80,14 @@ _user32.CallNextHookEx.argtypes = [
 ]
 _user32.CallNextHookEx.restype = ctypes.wintypes.LPARAM
 _user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+_user32.GetGUIThreadInfo.argtypes = [ctypes.wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
+_user32.GetGUIThreadInfo.restype = ctypes.wintypes.BOOL
 _user32.GetWindowTextW.argtypes = [ctypes.wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int]
 _user32.GetWindowTextW.restype = ctypes.c_int
+_user32.WindowFromPoint.argtypes = [POINT]
+_user32.WindowFromPoint.restype = ctypes.wintypes.HWND
+_user32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.UINT]
+_user32.GetAncestor.restype = ctypes.wintypes.HWND
 
 HOOKPROC = ctypes.CFUNCTYPE(
     ctypes.wintypes.LPARAM, ctypes.c_int,
@@ -155,6 +174,16 @@ class HookManager:
         """抓取前台窗口句柄+标题（标题仅在窗口变化时抓取，避免钩子回调阻塞）"""
         try:
             fg = _user32.GetForegroundWindow()
+            if not fg:
+                info = GUITHREADINFO()
+                info.cbSize = ctypes.sizeof(GUITHREADINFO)
+                if _user32.GetGUIThreadInfo(0, ctypes.byref(info)):
+                    fg = info.hwndActive or info.hwndFocus
+            # A hidden/service-style process can transiently observe no
+            # foreground window. Keep the last known target instead of
+            # erasing it and producing input steps with window="".
+            if not fg:
+                fg = self._last_fg_hwnd
             if fg != self._last_fg_hwnd:
                 buf = ctypes.create_unicode_buffer(256)
                 n = _user32.GetWindowTextW(fg, buf, 256)
@@ -199,6 +228,16 @@ class HookManager:
                 if et is not None:
                     now = int(time.time() * 1_000_000) - self._start_us
                     fg, fg_title = self._fg_snapshot()
+                    if not fg:
+                        candidate = _user32.WindowFromPoint(POINT(sx, sy))
+                        if candidate:
+                            try:
+                                fg = _user32.GetAncestor(candidate, 2)
+                                buf = ctypes.create_unicode_buffer(256)
+                                _user32.GetWindowTextW(fg, buf, 256)
+                                fg_title = buf.value
+                            except Exception:
+                                pass
                     self._queue.put(RawEvent(et, x=sx, y=sy, delta=delta, t_us=now,
                                              fg_hwnd=fg, fg_title=fg_title), block=False)
         except Exception:

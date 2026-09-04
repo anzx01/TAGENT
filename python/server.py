@@ -70,6 +70,17 @@ _recorder_lock = threading.Lock()
 # 当前回放实例
 _player: Player | None = None
 _player_lock = threading.Lock()
+# 回放线程及其生命周期快照。_player 由启动请求同步登记，避免后台线程尚未
+# 初始化时第二次请求/状态轮询看到一个错误的 idle 状态。
+_player_thread: threading.Thread | None = None
+_replay_state: dict = {
+    "state": "idle",  # idle | starting | playing | paused | stopping | finished | failed
+    "recording_id": None,
+    "started_at": None,
+    "finished_at": None,
+    "summary": None,
+    "error": None,
+}
 
 _scheduler: Scheduler | None = None
 
@@ -186,8 +197,15 @@ def _check_window_dependencies(rec_dir) -> list[str]:
 
 
 def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
-    """启动回放线程（复用 /replay/start 逻辑）。返回 rec_id 或 None"""
-    global _player
+    """准备并启动回放。
+
+    Player 必须在返回成功前登记到全局状态。旧实现在线程函数内部才赋值，
+    因此 ``/replay/status`` 的第一次轮询可能看到 ``playing=false``，而第二次
+    点击又会启动一条并行回放。这里先构造并登记实例，再启动线程；线程结束
+    时只清理自己登记的实例，避免旧线程误清掉新任务。
+    """
+    global _player, _player_thread, _replay_state
+
     rec_dir = _resolve_rec_dir(rec_id)
     if rec_dir is None:
         return None
@@ -203,54 +221,149 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
     if not path.exists():
         return None
 
-    # 回放前窗口检测（仅警告，不拦截：player 遇到缺失窗口会自动暂停并弹接管对话框）
-    missing_windows = _check_window_dependencies(rec_dir)
-    if missing_windows:
-        log.warning("回放前检测到可能缺失的窗口（若未打开将在该步暂停）: %s",
-                    missing_windows)
+    # 避免定时任务或直接调用绕过 /replay/start 时启动空任务。
+    try:
+        task_data = json.loads(path.read_text(encoding="utf-8"))
+        step_count = len(task_data.get("steps", []))
+    except Exception:
+        log.exception("读取回放任务失败: %s", path)
+        return None
+    if step_count <= 0:
+        log.warning("拒绝启动空回放: %s", path)
+        return None
+    try:
+        from_step = int(from_step)
+    except (TypeError, ValueError):
+        from_step = 0
+    if from_step < 0 or from_step >= step_count:
+        log.warning("回放起始步骤越界: %s (共 %d 步)", from_step, step_count)
+        return None
+
+    # 回放前窗口检测（仅警告，不拦截：player 会在目标缺失时进入接管态）。
+    try:
+        missing_windows = _check_window_dependencies(rec_dir)
+        if missing_windows:
+            log.warning("回放前检测到可能缺失的窗口（若未打开将在该步暂停）: %s",
+                        missing_windows)
+    except Exception:
+        log.debug("回放前窗口检测失败", exc_info=True)
 
     # 阶段2.4：会话步骤（登录/2FA）
     from services.task_store import TaskStore
     _ts = TaskStore(DATA_DIR)
-    session_steps = _ts.load_meta(rec_id).get("session_steps", [])
-    var_sources = _ts.get_var_sources(rec_id)  # 阶段2.1：变量来源
+    try:
+        session_steps = _ts.load_meta(rec_id).get("session_steps", [])
+    except Exception:
+        session_steps = []
+    try:
+        var_sources = _ts.get_var_sources(rec_id)  # 阶段2.1：变量来源
+    except Exception:
+        var_sources = {}
 
     # 阶段3.3：纠错库（自愈），回放时优先尝试人工纠正动作
     from services.corrections import CorrectionStore
-    corrections = CorrectionStore(rec_dir).load()
+    try:
+        corrections = CorrectionStore(rec_dir).load()
+    except Exception:
+        corrections = []
 
     # 阶段5.1：checkpoint 文件（断点续跑）
     ckpt_dir = BASE_DIR / "data"
     ckpt_dir.mkdir(exist_ok=True)
     ckpt_file = ckpt_dir / f"ckpt_{rec_id}.json"
 
+    # 构造 Player 放在请求线程，保证成功响应与状态可见性一致。
+    try:
+        player = Player(str(path), variables=variables or {},
+                        session_steps=session_steps,
+                        corrections=corrections,
+                        var_sources=var_sources)
+        player.checkpoint_path = ckpt_file
+        player._rec_id = rec_id
+        # 阶段1.2：回放截图目录
+        ss_dir = BASE_DIR / "runs" / "screenshots" / rec_id
+        player.screenshot_dir = str(ss_dir)
+    except Exception:
+        log.exception("回放实例创建失败: %s", path)
+        return None
+
+    with _player_lock:
+        if _player is not None:
+            log.warning("拒绝并行回放: %s", rec_id)
+            return None
+        _player = player
+        _replay_state = {
+            "state": "starting",
+            "recording_id": rec_id,
+            "started_at": time.time(),
+            "finished_at": None,
+            "summary": None,
+            "error": None,
+        }
+
     def _run():
-        global _player
+        global _player, _player_thread, _replay_state
+        result = None
         try:
-            _player = Player(str(path), variables=variables or {},
-                             session_steps=session_steps,
-                             corrections=corrections,
-                             var_sources=var_sources)
-            _player.checkpoint_path = ckpt_file
-            _player._rec_id = rec_id
-            # 阶段1.2：回放截图目录
-            ss_dir = BASE_DIR / "runs" / "screenshots" / rec_id
-            _player.screenshot_dir = str(ss_dir)
-            log.info("开始回放: %s (%d 步)", path, len(_player.steps))
-            result = _player.play(from_step=from_step)
-            log.info("回放完成: %s", path)
-            ckpt_file.unlink(missing_ok=True)  # 成功后清断点
+            # stop 请求可能在 worker 获得执行权前到达；不要让 Player.play 的
+            # 初始化覆盖这个停止信号。
+            if player._stopped:
+                result = {"summary": f"完成 0/{len(player.steps)} 步 (已中断)",
+                          "steps": [], "pause_reasons": []}
+            else:
+                with _player_lock:
+                    if _player is player:
+                        _replay_state["state"] = "playing"
+                log.info("开始回放: %s (%d 步)", path, len(player.steps))
+                result = player.play(from_step=from_step)
+                log.info("回放完成: %s", path)
+                # 只有自然完成才删除断点；中断结果保留断点供用户续跑。
+                if not player._stopped:
+                    ckpt_file.unlink(missing_ok=True)
+            if result is None:
+                result = {"summary": "回放未产生结果", "steps": [],
+                          "pause_reasons": []}
+            with _player_lock:
+                if _player is player:
+                    _replay_state.update({
+                        "state": "stopped" if player._stopped else "finished",
+                        "finished_at": time.time(),
+                        "summary": result.get("summary") if isinstance(result, dict) else str(result),
+                    })
             _write_report(rec_id, result)
-        except Exception:
+        except Exception as exc:
             log.exception("回放出错: %s", path)
-            _write_report(rec_id, {"summary": "回放异常", "steps": [], "pause_reasons": []})
+            result = {"summary": "回放异常", "steps": [], "pause_reasons": []}
+            with _player_lock:
+                if _player is player:
+                    _replay_state.update({"state": "failed", "finished_at": time.time(),
+                                          "summary": "回放异常", "error": str(exc)})
+            _write_report(rec_id, result)
         finally:
             with _player_lock:
-                _player = None
+                # 旧线程绝不能清理已经被替换的实例。
+                if _player is player:
+                    _player = None
+                    _player_thread = None
                 log.info("回放实例已释放")
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+    t = threading.Thread(target=_run, name=f"tagent-replay-{rec_id}", daemon=True)
+    with _player_lock:
+        # _player 仍应是刚登记的实例；若异常被清理则不启动线程。
+        if _player is not player:
+            return None
+        _player_thread = t
+    try:
+        t.start()
+    except Exception:
+        with _player_lock:
+            if _player is player:
+                _player = None
+                _player_thread = None
+                _replay_state.update({"state": "failed", "finished_at": time.time(),
+                                      "summary": "回放线程启动失败"})
+        log.exception("回放线程启动失败: %s", path)
+        return None
     return rec_id
 
 
@@ -283,9 +396,18 @@ def _attach_eval(rec_id: str, report: dict):
         import services.eval_scorer as eval_scorer
         rec_dir = BASE_DIR / "recordings" / rec_id
         events_file = rec_dir / "events.json"
-        if not events_file.exists():
+        task_file = rec_dir / "task.json"
+        # Score against the same canonical steps that Player actually runs.
+        # The compiler intentionally coalesces adjacent input events (for
+        # example ``Hello`` + ``World`` -> ``HelloWorld``); comparing that
+        # one replay step with the two raw events would produce a false eval
+        # failure even though the replay completed correctly.
+        expected_file = task_file if task_file.exists() else events_file
+        if not expected_file.exists():
             return
-        expected = json.loads(events_file.read_text(encoding="utf-8")).get("steps", [])
+        expected = json.loads(expected_file.read_text(encoding="utf-8")).get("steps", [])
+        if not expected and expected_file != events_file and events_file.exists():
+            expected = json.loads(events_file.read_text(encoding="utf-8")).get("steps", [])
         if not expected:
             return
         report["eval"] = eval_scorer.score(expected, report["steps"]).to_dict()
@@ -382,7 +504,9 @@ def stop_recording():
             log.exception("编译失败: %s", e)
         return {"ok": True, "recording_id": _recorder.output_dir.name,
                 "events_path": path, "event_count": step_count,
-                "task_path": task_path}
+                "task_path": task_path,
+                "replayable": step_count > 0,
+                "warning": "未捕获到任何操作，请确认目标窗口处于前台后重新录制" if step_count == 0 else None}
 
 
 @app.post("/replay/start")
@@ -392,35 +516,57 @@ def start_replay(req: ReplayRequest):
         return {"ok": False, "msg": "正在录制，请先停止"}
 
     with _player_lock:
-        if _player and not _player.paused:
+        current = _player
+    if current is not None:
+        if not current.paused:
             return {"ok": False, "msg": "已有回放进行中"}
-        if _player and _player.paused:
-            # 暂停残留（等待人工接管）被新的回放指令替换
-            _player.stop()
-    if _player:
-        time.sleep(1.0)  # 等旧回放线程退出（finally 置 None）
+        # 暂停残留（等待人工接管）被新的回放指令替换。等待旧线程真正释放，
+        # 避免两条线程同时向桌面注入输入。
+        current.stop()
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with _player_lock:
+                if _player is None:
+                    break
+            time.sleep(0.05)
+        with _player_lock:
+            if _player is not None:
+                return {"ok": False, "msg": "上一轮回放仍在停止，请稍后重试"}
 
-    with _player_lock:
-        # 找到要回放的录制
-        if req.recording_id:
-            rec_dir = _resolve_rec_dir(req.recording_id)
-            if rec_dir is None:
-                return {"ok": False, "msg": "找不到该录制"}
-        else:
-            rec_dir = _latest_rec_dir()
-            if rec_dir is None:
-                return {"ok": False, "msg": "没有可回放的录制"}
-        if _launch_replay(rec_dir.name, req.variables or {}, req.from_step):
-            return {"ok": True, "recording_id": rec_dir.name}
-        return {"ok": False, "msg": "没有可回放的内容"}
+    # 找到要回放的录制（不持锁执行磁盘 IO；_launch_replay 会再次原子检查）。
+    if req.recording_id:
+        rec_dir = _resolve_rec_dir(req.recording_id)
+        if rec_dir is None:
+            return {"ok": False, "msg": "找不到该录制"}
+    else:
+        rec_dir = _latest_rec_dir()
+        if rec_dir is None:
+            return {"ok": False, "msg": "没有可回放的录制"}
+    task_file = rec_dir / "task.json"
+    events_file = rec_dir / "events.json"
+    step_count = 0
+    try:
+        source = task_file if task_file.exists() else events_file
+        if source.exists():
+            step_count = len(json.loads(source.read_text(encoding="utf-8")).get("steps", []))
+    except Exception:
+        step_count = 0
+    if step_count == 0:
+        return {"ok": False, "msg": "该录制没有捕获任何步骤，请重新录制后再回放"}
+    if _launch_replay(rec_dir.name, req.variables or {}, req.from_step):
+        return {"ok": True, "recording_id": rec_dir.name}
+    return {"ok": False, "msg": "没有可回放的内容"}
 
 
 @app.post("/replay/stop")
 def stop_replay():
     """停止回放。"""
-    global _player
-    if _player:
-        _player.stop()
+    with _player_lock:
+        player = _player
+        if player is not None:
+            _replay_state["state"] = "stopping"
+    if player is not None:
+        player.stop()
         return {"ok": True, "msg": "已发送停止信号"}
     return {"ok": False, "msg": "没有正在进行的回放"}
 
@@ -428,9 +574,13 @@ def stop_replay():
 @app.post("/replay/pause")
 def pause_replay():
     """阶段3.1：暂停回放，等待人工接管"""
-    global _player
-    if _player and not _player.paused:
-        _player.pause()
+    with _player_lock:
+        player = _player
+    if player and not player.paused:
+        player.pause()
+        with _player_lock:
+            if _player is player:
+                _replay_state["state"] = "paused"
         return {"ok": True, "msg": "已暂停，请接管操作"}
     return {"ok": False, "msg": "没有进行中的回放可暂停"}
 
@@ -438,38 +588,72 @@ def pause_replay():
 @app.post("/replay/resume")
 def resume_replay():
     """阶段3.1：人工接管完成，继续回放"""
-    global _player
-    if _player and _player.paused:
-        _player.resume()
+    with _player_lock:
+        player = _player
+    if player and player.paused:
+        player.resume()
+        with _player_lock:
+            if _player is player:
+                _replay_state["state"] = "playing"
         return {"ok": True, "msg": "已继续回放"}
     return {"ok": False, "msg": "回放不在暂停状态"}
+
+
+@app.post("/replay/retry")
+def retry_replay_step():
+    """Retry the currently blocked step after the user restores its target."""
+    with _player_lock:
+        player = _player
+    if player and player.paused:
+        player.resume(retry=True)
+        with _player_lock:
+            if _player is player:
+                _replay_state["state"] = "playing"
+        return {"ok": True, "msg": "正在重试当前步骤"}
+    return {"ok": False, "msg": "回放当前没有等待接管"}
 
 
 @app.get("/replay/status")
 def replay_status():
     """回放状态（阶段4 状态小窗：步骤简述 + 暂停/错误态）"""
-    if not _player:
-        return {"ok": True, "playing": False}
-    current = len(_player._step_results)
+    with _player_lock:
+        player = _player
+        state = dict(_replay_state)
+    if not player:
+        return {
+            "ok": True,
+            "playing": False,
+            "paused": False,
+            "state": state.get("state", "idle"),
+            "recording_id": state.get("recording_id"),
+            "summary": state.get("summary"),
+            "error": state.get("error"),
+        }
+    current = len(player._step_results)
     step_desc = ""
     step_error = False
-    if current < len(_player.steps):
-        step = _player.steps[current]
+    if current < len(player.steps):
+        step = player.steps[current]
         action = step.get("action", "")
         text = step.get("text", step.get("key", ""))
         step_desc = f"{action} {text}".strip()[:40]
     # 检查最近步骤是否有错误
-    if _player._step_results:
-        last = _player._step_results[-1]
+    if player._step_results:
+        last = player._step_results[-1]
         step_error = last.get("status") == "paused" and "失败" in last.get("detail", "")
+    current_state = "paused" if player.paused else state.get("state", "playing")
     return {
         "ok": True,
         "playing": True,
-        "paused": _player.paused,
-        "total": len(_player.steps),
+        "paused": player.paused,
+        "state": current_state,
+        "recording_id": state.get("recording_id"),
+        "total": len(player.steps),
         "current_step": current,
         "step_desc": step_desc,
         "error": step_error,
+        "waiting_step": getattr(player, "_waiting_step", None),
+        "pause_reason": getattr(player, "_pause_reason", ""),
     }
 
 
@@ -477,25 +661,38 @@ def replay_status():
 def rerecord_step():
     """阶段3.1：'重新演示此步' -- 停止回放，开始录制替代操作"""
     global _player, _recorder
-    if not _player:
+    with _player_lock:
+        player = _player
+    if not player:
         return {"ok": False, "msg": "没有进行中的回放"}
     # 记录当前步骤索引
-    current_step = len(_player._step_results)
-    rec_id = getattr(_player, '_rec_id', '')
+    current_step = len(player._step_results)
+    rec_id = getattr(player, '_rec_id', '')
     # 停止回放
-    _player.stop()
+    player.stop()
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        with _player_lock:
+            if _player is None:
+                break
+        time.sleep(0.05)
     with _player_lock:
-        _player = None
+        if _player is not None:
+            return {"ok": False, "msg": "回放仍在停止，请稍后重新演示"}
     # 开始录制
     with _recorder_lock:
         if _recorder is not None:
             _recorder.stop()
         from recorder import Recorder
-        _recorder = Recorder()
+        new_id = time.strftime("%Y%m%d_%H%M%S")
+        while (DATA_DIR / new_id).exists():
+            time.sleep(1)
+            new_id = time.strftime("%Y%m%d_%H%M%S")
+        _recorder = Recorder(str(DATA_DIR / new_id))
         _recorder.start()
     log.info("重新演示此步：从步骤 %d 开始录制", current_step)
     return {"ok": True, "msg": "已开始录制，请演示正确操作",
-            "from_step": current_step, "rec_id": rec_id}
+            "from_step": current_step, "rec_id": rec_id, "recording_id": new_id}
 
 
 @app.get("/replay/checkpoint/{rec_id}")
@@ -736,7 +933,17 @@ def _latest_rec_dir() -> Path | None:
     dirs = [d for d in DATA_DIR.iterdir() if d.is_dir()]
     if not dirs:
         return None
-    return sorted(dirs)[-1]
+    for d in sorted(dirs, reverse=True):
+        for filename in ("task.json", "events.json"):
+            p = d / filename
+            if p.exists():
+                try:
+                    if json.loads(p.read_text(encoding="utf-8")).get("steps"):
+                        return d
+                except Exception:
+                    pass
+                break
+    return None
 
 
 def _list_recordings() -> list[dict]:
@@ -757,7 +964,7 @@ def _list_recordings() -> list[dict]:
         if meta_file.exists():
             with open(meta_file, "r", encoding="utf-8") as f:
                 name = json.load(f).get("name", "")
-        result.append({"id": d.name, "events": count, "name": name})
+        result.append({"id": d.name, "events": count, "name": name, "replayable": count > 0})
     return result
 
 

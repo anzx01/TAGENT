@@ -149,6 +149,7 @@
       font-size: 12px; cursor: pointer; color: #fff; margin-right: 6px;
       background: #27ae60;
     }
+    .modal button:disabled { opacity: 0.45; cursor: default; }
     .hint { font-size: 11px; color: #888; margin-top: 6px; line-height: 1.5; }
   </style>
 </head>
@@ -184,11 +185,53 @@
     const stepList = $("stepList"), mask = $("modalMask"), modalBox = $("modalBox");
     let currentTask = null;
     let pollTimer = null;   // 回放状态轮询
-    let playback = { playing: false, paused: false };
+    let pollGeneration = 0; // 丢弃旧请求返回，避免停止/继续后的竞态
+    let playback = {
+      playing: false,
+      paused: false,
+      currentStep: 0,
+      total: 0,
+      stepDesc: "",
+      reason: "",
+      recordingId: "",
+    };
+    let takeoverOpen = false;
+    let takeoverBusy = false;
+
+    function escapeHtml(value) {
+      return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+      }[ch]));
+    }
 
     function setStatus(text, cls) {
       statusEl.textContent = text;
       statusEl.className = "status" + (cls ? " " + cls : "");
+    }
+    async function apiJson(path, options = {}, timeoutMs = 8000) {
+      // All control requests share a timeout.  A WebView fetch can otherwise
+      // remain pending forever when the sidecar is being restarted.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(API + path, { ...options, signal: controller.signal });
+        let data = null;
+        try { data = await res.json(); } catch (_) { data = {}; }
+        if (!res.ok) {
+          const err = new Error((data && data.msg) || `HTTP ${res.status}`);
+          err.data = data;
+          err.status = res.status;
+          throw err;
+        }
+        return data;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    function apiErrorMessage(err, fallback = "服务未连接") {
+      if (err && err.data && err.data.msg) return err.data.msg;
+      if (err && err.name === "AbortError") return "后端响应超时，请稍后重试";
+      return fallback;
     }
     function el(tag, cls, text) {
       const node = document.createElement(tag);
@@ -197,59 +240,96 @@
       return node;
     }
     function setRecording(on) {
-      btnRecord.disabled = on; btnStop.disabled = !on; btnPlay.disabled = on;
-      btnPause.disabled = on; btnReplayStop.disabled = on;
+      btnRecord.disabled = on;
+      btnStop.disabled = !on;
+      btnPlay.disabled = on || playback.playing;
+      btnPause.disabled = on || !playback.playing || playback.paused;
+      btnReplayStop.disabled = on || !playback.playing;
     }
     function setReplaying(on) {
+      playback.playing = !!on;
+      // Recording and replaying are mutually exclusive.  The old UI left
+      // the red Record button enabled while a takeover dialog was open,
+      // allowing a second session to corrupt the paused player.
+      if (on) btnRecord.disabled = true;
+      else if (btnStop.disabled) btnRecord.disabled = false;
       btnPlay.disabled = on || btnRecord.disabled;
       btnReplayStop.disabled = !on;
-      btnPause.disabled = !on;
+      btnPause.disabled = !on || playback.paused;
+    }
+    function setReplayPaused(on) {
+      playback.paused = !!on;
+      if (on) playback.playing = true;
+      if (on) {
+        // 暂停期间仍保留“停回放”，避免接管弹窗被关闭后无法脱离。
+        btnRecord.disabled = true;
+        btnPlay.disabled = true;
+        btnPause.disabled = true;
+        btnReplayStop.disabled = false;
+      } else {
+        if (btnStop.disabled) btnRecord.disabled = false;
+        btnPlay.disabled = playback.playing || btnRecord.disabled;
+        btnPause.disabled = !playback.playing;
+        btnReplayStop.disabled = !playback.playing;
+      }
     }
     function showModal(html) {
       modalBox.innerHTML = html;
+      mask.dataset.locked = "";
       mask.classList.add("show");
     }
-    function hideModal() { mask.classList.remove("show"); }
-    mask.addEventListener("click", (e) => { if (e.target === mask) hideModal(); });
+    function hideModal() {
+      mask.classList.remove("show");
+      mask.dataset.locked = "";
+      takeoverOpen = false;
+      takeoverBusy = false;
+    }
+    mask.addEventListener("click", (e) => {
+      if (e.target === mask && mask.dataset.locked !== "1") hideModal();
+    });
 
     btnRecord.addEventListener("click", async () => {
       try {
-        const res = await fetch(API + "/record/start", { method: "POST" });
-        const data = await res.json();
+        const data = await apiJson("/record/start", { method: "POST" });
         if (data.ok) { setStatus("录制中…", "recording"); setRecording(true); }
         else setStatus(data.msg || "失败");
-      } catch { setStatus("服务未连接"); }
+      } catch (err) { setStatus(apiErrorMessage(err)); }
     });
     btnStop.addEventListener("click", async () => {
       try {
-        const res = await fetch(API + "/record/stop", { method: "POST" });
-        const data = await res.json();
+        const data = await apiJson("/record/stop", { method: "POST" });
         if (data.ok) {
-          setStatus(`已保存 ${data.event_count} 步`);
+          const count = Number(data.event_count || 0);
+          setStatus(data.replayable === false
+            ? (data.warning || "未捕获步骤，请确认目标窗口在前台后重试")
+            : `已保存 ${count} 步`, data.replayable === false ? "error" : "");
           setRecording(false);
           if (pendingAppendTarget && data.recording_id) await finishAppend(data.recording_id);
           else refreshTasks();
         }
         else setStatus(data.msg || "失败");
-      } catch (_) { setStatus("服务未连接"); }
+      } catch (err) { setStatus(apiErrorMessage(err)); }
     });
     btnPlay.addEventListener("click", async () => {
       const ok = await callReplay(null);
       if (ok) startPoll();
     });
     btnPause.addEventListener("click", async () => {
+      if (takeoverBusy || playback.paused) return;
       try {
-        const res = await fetch(API + "/replay/pause", { method: "POST" });
-        const data = await res.json();
-        setStatus(data.msg || data.msg || "", "paused");
-        if (data.ok) setTakeover();
-      } catch (_) { setStatus("服务未连接"); }
+        const data = await apiJson("/replay/pause", { method: "POST" });
+        if (data.ok) {
+          setReplayPaused(true);
+          setStatus(data.msg || "已暂停，请接管操作", "paused");
+          setTakeover(playback);
+        } else {
+          await syncReplayStatus(false);
+          setStatus(data.msg || "没有进行中的回放", "error");
+        }
+      } catch (err) { setStatus(apiErrorMessage(err)); await syncReplayStatus(false); }
     });
     btnReplayStop.addEventListener("click", async () => {
-      try {
-        await fetch(API + "/replay/stop", { method: "POST" });
-        setStatus("已停止回放"); setReplaying(false); stopPoll();
-      } catch (_) { setStatus("服务未连接"); }
+      await stopReplay();
     });
     btnList.addEventListener("click", async () => {
       panel.classList.toggle("show");
@@ -282,78 +362,270 @@
     });
 
     // ---------- 回放状态轮询（状态小窗 + 暂停接管） ----------
+    function applyReplayStatus(d, fromStartup = false) {
+      // `playing` is authoritative when supplied.  In particular the
+      // backend may retain a terminal `state: "stopping"` snapshot after the
+      // worker has been released; treating that state as active would strand
+      // the WebView in an endless replay loop.
+      const playing = d && (d.playing !== undefined
+        ? d.playing === true
+        : ["starting", "playing", "paused", "stopping"].includes(d.state));
+      playback.recordingId = (d && (d.recording_id || d.recordingId)) || playback.recordingId || "";
+      playback.currentStep = Number((d && (d.current_step ?? d.currentStep)) || 0);
+      playback.total = Number((d && d.total) || 0);
+      playback.stepDesc = (d && (d.step_desc || d.stepDesc)) || "";
+      playback.reason = (d && (d.pause_reason || d.reason)) || "";
+
+      if (!playing) {
+        playback.playing = false;
+        playback.paused = false;
+        takeoverOpen = false;
+        hideModal();
+        setReplaying(false);
+        setStatus(fromStartup ? "就绪" : "回放结束");
+        refreshTasks();
+        return false;
+      }
+
+      setReplaying(true);
+      if (d.paused || d.state === "paused") {
+        setReplayPaused(true);
+        setStatus(`等待接管${playback.stepDesc ? `（${playback.currentStep + 1}/${playback.total}: ${playback.stepDesc}）` : ""}`, "paused");
+        setTakeover({ ...playback, waitingStep: d.waiting_step, reason: playback.reason });
+      } else {
+        // A stale modal can survive a WebView reconnect.  Close it only after
+        // the server confirms that replay is active again.
+        if (takeoverOpen) hideModal();
+        setReplayPaused(false);
+        const stepInfo = playback.stepDesc
+          ? ` (${playback.currentStep + 1}/${playback.total}: ${playback.stepDesc})` : "";
+        setStatus(d.error ? `步骤出错: ${playback.stepDesc || "未知步骤"}` : "回放中…" + stepInfo,
+          d.error ? "error" : "replaying");
+      }
+      return true;
+    }
+
+    async function syncReplayStatus(showError = true) {
+      try {
+        const d = await apiJson("/replay/status", {}, 5000);
+        applyReplayStatus(d, false);
+        return d;
+      } catch (err) {
+        if (showError) setStatus(apiErrorMessage(err), "error");
+        return null;
+      }
+    }
+
     function startPoll() {
       stopPoll();
+      const generation = pollGeneration;
+      playback.playing = true;
       setReplaying(true);
-      pollTimer = setInterval(async () => {
+      let failures = 0;
+      const tick = async () => {
+        if (generation !== pollGeneration) return;
         try {
-          const res = await fetch(API + "/replay/status");
-          const d = await res.json();
-          if (!d.playing) { setStatus("回放结束"); setReplaying(false); stopPoll(); refreshTasks(); return; }
-          if (d.paused) {
-            setStatus("等待接管", "paused");
-            setReplaying(false);
+          const d = await apiJson("/replay/status", {}, 5000);
+          if (generation !== pollGeneration) return;
+          failures = 0;
+          if (!applyReplayStatus(d)) {
             stopPoll();
-            setTakeover();
-          } else if (d.error) {
-            setStatus(`步骤出错: ${d.step_desc || ''}`, "error");
-          } else {
-            const stepInfo = d.step_desc ? ` (${d.current_step + 1}/${d.total}: ${d.step_desc})` : '';
-            setStatus("回放中…" + stepInfo, "replaying");
+            return;
           }
-        } catch (_) { stopPoll(); }
-      }, 800);
+        } catch (err) {
+          if (generation !== pollGeneration) return;
+          failures += 1;
+          // Keep the replay controls alive across a short sidecar restart;
+          // stopping the timer here used to leave the UI permanently stuck.
+          setStatus(failures < 3 ? "正在重连后端…" : apiErrorMessage(err, "后端暂时不可用"), "error");
+        }
+        if (generation === pollGeneration) {
+          const delay = failures ? Math.min(4000, 700 + failures * 500) : 700;
+          pollTimer = setTimeout(tick, delay);
+        }
+      };
+      tick();
     }
-    function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+    function stopPoll() {
+      pollGeneration += 1;
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    }
 
     async function callReplay(id) {
       try {
-        const res = await fetch(API + "/replay/start", {
+        const data = await apiJson("/replay/start", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify(id ? { recording_id: id } : {}),
         });
-        const data = await res.json();
-        if (!data.ok) setStatus(data.msg || "启动回放失败");
+        if (!data.ok) {
+          setStatus(data.msg || "启动回放失败", "error");
+          return false;
+        }
+        playback.recordingId = data.recording_id || id || "";
+        playback.paused = false;
+        setStatus("回放启动中…", "replaying");
         return data.ok || false;
-      } catch (_) { setStatus("服务未连接"); return false; }
+      } catch (err) { setStatus(apiErrorMessage(err, "回放启动失败"), "error"); return false; }
     }
 
     // ---------- 接管对话框（阶段3 人在回路） ----------
-    function setTakeover() {
+    function setTakeover(info = playback) {
+      // Polling continues while paused so that a reconnect can recover. Do
+      // not rebuild the modal on every poll; rebuilding would detach a
+      // clicked button and make a slow resume request look ineffective.
+      if (takeoverOpen) return;
+      takeoverOpen = true;
+      const stepNo = Number.isFinite(Number(info.waitingStep))
+        ? Number(info.waitingStep) + 1
+        : Number(info.currentStep || 0) + 1;
+      const total = Number(info.total || 0);
+      const stepLabel = info.stepDesc
+        ? `${stepNo}${total ? `/${total}` : ""}：${escapeHtml(info.stepDesc)}` : "当前步骤";
+      const reason = escapeHtml(info.reason || "定位、输入或安全检查未能自动完成");
       showModal(`
         <h4>请接管操作</h4>
         <p style="font-size:12px;color:#ccc;margin-bottom:10px;">
-          回放遇到不确定情况已暂停。你可以：
+          回放已暂停（${stepLabel}）。<br/><span style="color:#aaa">原因：${reason}</span>
         </p>
-        <button class="primary" onclick="hideModal();resumeReplay()">已接管完成，继续</button>
-        <button class="cancel" onclick="hideModal();rerecordStep()">重新演示此步</button>
-        <button class="cancel" onclick="hideModal();stopReplay()">停止回放</button>
-        <div class="hint">接管：手动完成此步，助手记录为纠错；重新演示：从此步开始重新录制替代操作。</div>
+        <button class="primary" id="takeoverResume">已接管完成，继续</button>
+        <button class="cancel" id="takeoverRetry">重试当前步骤</button>
+        <button class="cancel" id="takeoverRerecord">重新演示此步</button>
+        <button class="cancel" id="takeoverStop">停止回放</button>
+        <div class="hint">接管后可继续执行；若目标已恢复可先重试。重新演示会从此步开始录制替代操作。</div>
       `);
+      mask.dataset.locked = "1";
+      const bind = (id, fn) => {
+        const button = $(id);
+        if (button) button.addEventListener("click", fn);
+      };
+      bind("takeoverResume", () => resumeReplay());
+      bind("takeoverRetry", () => retryReplay());
+      bind("takeoverRerecord", () => rerecordStep());
+      bind("takeoverStop", () => stopReplay());
     }
     async function resumeReplay() {
+      if (takeoverBusy) return;
+      takeoverBusy = true;
+      const button = $("takeoverResume");
+      if (button) button.disabled = true;
       try {
-        const res = await fetch(API + "/replay/resume", { method: "POST" });
-        const data = await res.json();
-        setStatus(data.msg || "已继续");
-        if (data.ok) startPoll();
-      } catch (_) { setStatus("服务未连接"); }
+        const data = await apiJson("/replay/resume", { method: "POST" });
+        if (data.ok) {
+          hideModal();
+          setReplayPaused(false);
+          setStatus(data.msg || "已继续回放", "replaying");
+          startPoll();
+        } else {
+          const state = await syncReplayStatus(false);
+          if (!state || !state.playing) {
+            hideModal();
+            setReplaying(false);
+            setStatus("回放已结束，请重新运行");
+          } else if (!state.paused) {
+            hideModal();
+            startPoll();
+          } else {
+            setStatus(data.msg || "回放仍在等待接管", "error");
+          }
+        }
+      } catch (err) {
+        setStatus(apiErrorMessage(err), "error");
+        await syncReplayStatus(false);
+      } finally {
+        takeoverBusy = false;
+        const b = $("takeoverResume");
+        if (b) b.disabled = false;
+      }
+    }
+    async function retryReplay() {
+      if (takeoverBusy) return;
+      takeoverBusy = true;
+      const button = $("takeoverRetry");
+      if (button) button.disabled = true;
+      try {
+        let data;
+        try {
+          data = await apiJson("/replay/retry", { method: "POST" });
+        } catch (err) {
+          // Older sidecars do not expose /replay/retry; resume is a safe
+          // compatibility fallback and simply skips the blocked step.
+          if (err && err.status === 404) data = await apiJson("/replay/resume", { method: "POST" });
+          else throw err;
+        }
+        if (data.ok) {
+          hideModal();
+          setReplayPaused(false);
+          setStatus(data.msg || "正在重试当前步骤", "replaying");
+          startPoll();
+        } else {
+          setStatus(data.msg || "无法重试当前步骤", "error");
+          await syncReplayStatus(false);
+        }
+      } catch (err) {
+        setStatus(apiErrorMessage(err), "error");
+        await syncReplayStatus(false);
+      } finally {
+        takeoverBusy = false;
+        const b = $("takeoverRetry");
+        if (b) b.disabled = false;
+      }
     }
     async function rerecordStep() {
+      if (takeoverBusy) return;
+      takeoverBusy = true;
+      const button = $("takeoverRerecord");
+      if (button) button.disabled = true;
       try {
-        const res = await fetch(API + "/replay/rerecord", { method: "POST" });
-        const data = await res.json();
+        const data = await apiJson("/replay/rerecord", { method: "POST" });
         if (data.ok) {
+          stopPoll();
+          hideModal();
+          playback.playing = false;
+          playback.paused = false;
           setStatus("重新演示中：请操作正确步骤…", "recording");
           setRecording(true);
         } else {
           setStatus(data.msg || "操作失败");
+          await syncReplayStatus(false);
         }
-      } catch (_) { setStatus("服务未连接"); }
+      } catch (err) { setStatus(apiErrorMessage(err), "error"); await syncReplayStatus(false); }
+      finally { takeoverBusy = false; }
     }
     async function stopReplay() {
-      await fetch(API + "/replay/stop", { method: "POST" });
-      setStatus("已停止"); setReplaying(false); refreshTasks();
+      if (takeoverBusy && !$("takeoverStop")) return;
+      takeoverBusy = true;
+      try {
+        let data = null;
+        try { data = await apiJson("/replay/stop", { method: "POST" }); }
+        catch (err) {
+          // A sidecar restart already stopped the worker; make stop idempotent
+          // from the user's perspective and reconcile the visible state.
+          if (!(err && err.status === 404)) throw err;
+        }
+        stopPoll();
+        hideModal();
+        playback.playing = false;
+        playback.paused = false;
+        setReplaying(false);
+        setStatus((data && data.msg) || "已停止回放");
+        refreshTasks();
+      } catch (err) {
+        setStatus(apiErrorMessage(err), "error");
+        const state = await syncReplayStatus(false);
+        if (!state) {
+          // If the sidecar is offline, there is no useful action left for a
+          // modal that belongs to the old session.  Release the local lock so
+          // the user can close/reconnect the UI instead of being trapped in
+          // “请接管操作”.  The next start request will still be guarded by
+          // the server if an old worker is alive.
+          stopPoll();
+          hideModal();
+          playback.playing = false;
+          playback.paused = false;
+          setReplaying(false);
+          setStatus("后端未连接，已解除本地回放状态", "error");
+        }
+      } finally { takeoverBusy = false; }
     }
 
     // ---------- 任务库渲染 ----------
@@ -375,6 +647,7 @@
 
     function taskCard(task) {
       const card = el("div", "task-card");
+      card.dataset.taskId = task.id;
       const row1 = el("div", "row1", null);
       row1.appendChild(el("span", "name", task.name));
       if (task.schedule) {
@@ -388,7 +661,11 @@
       card.appendChild(el("div", "meta",
         `${task.steps} 步 · 变量 ${task.vars} · 纠错 ${task.corrections}`));
       const btns = el("div", "btns");
-      const run = aBtn("运行", "mini play", () => runTask(task));
+      const run = aBtn(task.replayable === false ? "无步骤" : "运行", "mini play", () => {
+        if (task.replayable === false) { setStatus("该录制没有捕获步骤，请重新录制"); return; }
+        runTask(task);
+      });
+      run.disabled = task.replayable === false;
       const sch = aBtn("定时", "mini sched", () => schedModal(task));
       const vars = aBtn("步骤/变量", "mini var", async () => {
         const res = await fetch(API + "/recordings/" + task.id + "/steps");
@@ -449,18 +726,23 @@
       if (await callReplay(id)) { setStatus("回放中…", "replaying"); startPoll(); }
     }
     async function runTaskWithVars(id, vars) {
-      const res = await fetch(API + "/replay/start", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ recording_id: id, variables: vars }),
-      });
-      hideModal();
-      const d = await res.json();
-      if (d.ok) { setStatus("回放中…", "replaying"); startPoll(); }
-      else setStatus(d.msg || "失败");
+      try {
+        const d = await apiJson("/replay/start", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ recording_id: id, variables: vars }),
+        });
+        if (d.ok) {
+          hideModal();
+          playback.recordingId = d.recording_id || id;
+          setStatus("回放启动中…", "replaying");
+          startPoll();
+        } else setStatus(d.msg || "失败", "error");
+      } catch (err) { setStatus(apiErrorMessage(err, "回放启动失败"), "error"); }
     }
-    function runTask(task) {
+    async function runTask(task) {
       if (task.vars > 0) {
-        fetch(API + "/tasks/" + task.id + "/vars").then(r => r.json()).then(d => {
+        try {
+          const d = await apiJson("/tasks/" + task.id + "/vars", {}, 5000);
           const names = d.vars || ["value"];
           showModal(`
             <h4>运行「${task.name}」</h4>
@@ -470,9 +752,11 @@
             <button class="primary" onclick="runWithVars('${task.id}',${names.length})">运行</button>
             <button class="cancel" onclick="hideModal()">取消</button>
           `);
-        });
+        } catch (err) {
+          setStatus(apiErrorMessage(err, "读取变量失败"), "error");
+        }
       } else {
-        runTaskWithVars(task.id, {});
+        await runTaskWithVars(task.id, {});
       }
     }
     async function runWithVars(id, count) {
@@ -561,6 +845,47 @@
       showSteps(recId, d.steps || []);
       refreshTasks();
     }
+
+    // Reconcile the WebView with the sidecar whenever the window is opened or
+    // the backend is restarted.  Previously the page had no initial sync, so
+    // a stale takeover dialog could remain visible while all controls said
+    // “service disconnected”.
+    let startupRetryTimer = null;
+    async function syncAppState() {
+      try {
+        const s = await apiJson("/status", {}, 5000);
+        if (startupRetryTimer) { clearTimeout(startupRetryTimer); startupRetryTimer = null; }
+        if (s.recording) {
+          stopPoll();
+          playback.playing = false;
+          playback.paused = false;
+          hideModal();
+          setRecording(true);
+          setStatus("录制中…", "recording");
+        } else {
+          setRecording(false);
+          const replay = await syncReplayStatus(false);
+          if (replay && replay.playing) {
+            // syncReplayStatus already rendered the paused/playing state;
+            // start a resilient loop to follow it until terminal.
+            startPoll();
+          } else if (!playback.playing) {
+            setStatus("就绪");
+          }
+        }
+      } catch (_) {
+        setStatus("服务未连接", "error");
+        // Keep trying in the background so launching the sidecar after the UI
+        // still recovers without requiring a page reload.
+        if (!startupRetryTimer) {
+          startupRetryTimer = setTimeout(() => {
+            startupRetryTimer = null;
+            syncAppState();
+          }, 2500);
+        }
+      }
+    }
+    syncAppState();
   </script>
 </body>
 </html>

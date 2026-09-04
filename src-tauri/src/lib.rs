@@ -1,5 +1,5 @@
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Mutex;
 
@@ -15,20 +15,65 @@ fn backend_running() -> bool {
 }
 
 /// 启动 Python 后端 sidecar；已在运行则跳过
-fn spawn_backend() -> Option<Child> {
+fn project_root(resource_dir: Option<PathBuf>) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = resource_dir {
+        candidates.push(path);
+    }
+    if let Ok(path) = std::env::current_dir() {
+        candidates.push(path);
+    }
+    if let Ok(path) = std::env::current_exe() {
+        if let Some(parent) = path.parent() {
+            candidates.push(parent.to_path_buf());
+            if let Some(grandparent) = parent.parent() {
+                candidates.push(grandparent.to_path_buf());
+            }
+        }
+    }
+    candidates.into_iter().find(|root| {
+        root.join("python/server.py").exists()
+            || root.join("dist/tagent-server.exe").exists()
+    })
+}
+
+fn spawn_backend(resource_dir: Option<PathBuf>) -> Option<Child> {
     if backend_running() {
         return None;
     }
-    // 优先已打包的 sidecar exe（阶段5.4），其次源码模式
-    let sidecar = Path::new("dist/tagent-server.exe");
-    if sidecar.exists() {
-        return Command::new(sidecar).spawn().ok();
+    let root = project_root(resource_dir).unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    });
+    // Release 包使用随包发布的 sidecar；开发模式必须使用当前源码，
+    // 否则工作区里残留的旧 dist/tagent-server.exe 会掩盖最新修复。
+    let sidecar = root.join("dist/tagent-server.exe");
+    if !cfg!(debug_assertions) && sidecar.exists() {
+        return Command::new(sidecar)
+            .current_dir(&root)
+            .spawn()
+            .map_err(|err| eprintln!("TAGENT sidecar start failed: {err}"))
+            .ok();
     }
-    let venv_py = Path::new(".venv/Scripts/python.exe");
-    let base = if venv_py.exists() { venv_py } else { Path::new("python") };
-    let mut cmd = Command::new(base);
-    cmd.arg("python/server.py");
-    cmd.spawn().ok()
+    let venv_py = root.join(".venv/Scripts/python.exe");
+    let server = root.join("python/server.py");
+    let venv_ok = venv_py.exists()
+        && Command::new(&venv_py).arg("--version").output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+    let mut cmd = if venv_ok {
+        Command::new(venv_py)
+    } else {
+        Command::new("python")
+    };
+    cmd.current_dir(&root);
+    if server.exists() {
+        cmd.arg(server);
+    } else {
+        cmd.arg("python/server.py");
+    }
+    cmd.spawn()
+        .map_err(|err| eprintln!("TAGENT Python backend start failed: {err}"))
+        .ok()
 }
 
 #[tauri::command]
@@ -53,7 +98,8 @@ pub fn run() {
                         .build(),
                 )?;
             }
-            app.manage(BackendState(Mutex::new(spawn_backend())));
+            let resource_dir = app.path().resource_dir().ok();
+            app.manage(BackendState(Mutex::new(spawn_backend(resource_dir))));
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -16,6 +16,9 @@ from services.input.web_channel import get_web_channel
 log = get_logger("player")
 
 RELEASE_MODIFIERS = [0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C]
+HUMAN_WAIT_TIMEOUT = 120.0
+ACTION_RETRIES = 4
+ACTION_RETRY_DELAY = 1.0
 
 # 移植 openskills replay/engine.ts：定位重试与步骤验证
 LOCATOR_RETRIES = 3      # 定位失败重试次数
@@ -47,6 +50,10 @@ class Player:
         self.on_pause = None  # 阶段3：等待人工接管时的回调（state 更新）
         self._paused = False
         self._resume = None
+        self._resume_action = None
+        self._waiting_step = None
+        self._pause_reason = ""
+        self._last_pause_reason = ""
         self._session_steps = set(session_steps or [])  # 阶段2.4
         self.checkpoint_path = None  # 阶段5.1：断点续跑
         self._corrections = corrections or []  # 阶段3.3：自愈库
@@ -58,14 +65,21 @@ class Player:
 
     def stop(self):
         self._stopped = True
+        self._paused = False
         self._resume_cond_resume()
 
     def pause(self):
-        """请求暂停（阶段3.1：定位/验证失败时）"""
+        """请求在当前安全边界暂停回放。
+
+        ``pause`` 可能由 UI 线程调用，而回放线程此时通常正在等待步骤
+        时间戳。仅设置标志而不在主循环检查，会让工具栏上的“暂停”看起来
+        无效；主循环现在通过 ``_wait_if_paused`` 在下一次动作前阻塞。
+        """
         self._paused = True
 
-    def resume(self):
+    def resume(self, retry=False):
         """人工接管完成后继续回放"""
+        self._resume_action = "retry" if retry else "skip"
         self._paused = False
         self._resume_cond_resume()
         if self._resume:
@@ -92,12 +106,15 @@ class Player:
             _com_inited = True
         except Exception:
             pass
-        self._stopped = False
-        self._paused = False
+        # Preserve pause/stop requests issued while the worker was starting.
         self._step_results = []
         self._pause_reasons = []
+        self._resume_action = None
+        self._waiting_step = None
+        self._pause_reason = ""
+        self._last_pause_reason = ""
         if start_delay > 0:
-            time.sleep(start_delay)
+            self._sleep_interruptible(start_delay)
         # 强制前台窗口获得焦点
         try:
             fg = win32gui.GetForegroundWindow()
@@ -108,19 +125,20 @@ class Player:
         _check_foreground()
         # 释放所有修饰键（测试脚本的 Ctrl+A 等操作可能导致 VK_LCONTROL 卡住）
         _release_keys(RELEASE_MODIFIERS)
-        time.sleep(0.2)
+        self._sleep_interruptible(0.2)
         prev_t = 0.0
         done = from_step
         for i, step in enumerate(self.steps[from_step:], start=from_step):
-            if self._stopped:
+            if not self._wait_if_paused() or self._stopped:
                 break
             if step.get("action") == "wait":
                 self._do_wait(step, prev_t)
                 prev_t = step.get("t", 0)
                 continue
             wait = max(0.0, step.get("t", 0) - prev_t)
-            time.sleep(min(wait, max_wait))
-            if self._stopped:
+            if not self._sleep_interruptible(min(wait, max_wait)):
+                break
+            if not self._wait_if_paused() or self._stopped:
                 break
             # 阶段2.4：会话步骤（登录/2FA）暂停，等人工
             if i in self._session_steps:
@@ -142,6 +160,7 @@ class Player:
                     break
             # 阶段3.1：定位失败 -> 重试 -> 尝试纠错库 -> 尝试 LLM -> 暂停
             locator_failed = False
+            step_already_executed = False
             if step.get("action") in ("click", "right_click") and step.get("locator"):
                 if not self._check_locator_retry(step):
                     locator_failed = True
@@ -157,12 +176,19 @@ class Player:
                             step_detail = "定位失败"
                             self._pause_reasons.append({"step": i, "reason": f"定位失败: {action}"})
                             log.warning("  步骤 %d 定位失败，暂停等待人工", i)
-                            self._pause_for_human(i)
+                            action_after_pause = self._pause_for_human(i, step_detail)
+                            if action_after_pause == "retry" and not self._stopped:
+                                retry_result = self._play_step(step)
+                                if retry_result.ok:
+                                    step_ok = True
+                                    locator_failed = False
+                                    step_already_executed = True
+                                    step_detail = f"重试成功 ({retry_result.method})"
                             if self._stopped:
                                 break
-            if step_ok and not locator_failed:
+            if step_ok and not locator_failed and not step_already_executed:
                 if not self._try_correction(i):
-                    result = self._play_step(step)
+                    result = self._play_step_with_retry(step)
                     if not result.ok:
                         step_ok = False
                         hint = _web_failure_hint(step)
@@ -172,7 +198,13 @@ class Player:
                         self._pause_reasons.append(
                             {"step": i, "reason": step_detail})
                         log.warning("  步骤 %d %s，暂停等待人工", i, step_detail)
-                        self._pause_for_human(i)
+                        action_after_pause = self._pause_for_human(i, step_detail)
+                        if action_after_pause == "retry" and not self._stopped:
+                            retry_result = self._play_step(step)
+                            if retry_result.ok:
+                                step_ok = True
+                                step_already_executed = True
+                                step_detail = f"重试成功 ({retry_result.method})"
                         if self._stopped:
                             break
                 step_detail = step_detail or "成功"
@@ -194,7 +226,8 @@ class Player:
             done = i + 1
             self._save_checkpoint(i + 1)
             prev_t = step.get("t", 0)
-            time.sleep(step_delay)
+            if not self._sleep_interruptible(step_delay):
+                break
         interrupted = self._stopped
         summary = f"完成 {done}/{len(self.steps)} 步" + (" (已中断)" if interrupted else "")
         try:
@@ -205,13 +238,55 @@ class Player:
         return {"summary": summary, "steps": self._step_results,
                 "pause_reasons": self._pause_reasons}
 
-    def _pause_for_human(self, step_index):
+    def _wait_if_paused(self):
+        """在动作边界等待手动暂停/接管结束。
+
+        返回 False 表示收到停止请求。轮询间隔很短，且不依赖一个可能被
+        COM/UIA 调用占用的 ``threading.Event``，因此 stop/resume 始终可达。
+        """
+        while self._paused and not self._stopped:
+            time.sleep(0.1)
+        return not self._stopped
+
+    def _sleep_interruptible(self, duration):
+        """可响应 pause/stop 的短睡眠，避免时间戳等待吞掉控制请求。"""
+        try:
+            remaining = max(0.0, float(duration))
+        except (TypeError, ValueError):
+            remaining = 0.0
+        deadline = time.monotonic() + remaining
+        while remaining > 0:
+            if self._stopped:
+                return False
+            if self._paused and not self._wait_if_paused():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+        return not self._stopped
+
+    def _pause_for_human(self, step_index, reason=""):
         """阶段2.4：会话步骤（登录/2FA）暂停，等人工完成"""
         self._paused = True
+        self._waiting_step = step_index
+        self._pause_reason = reason or "需要人工接管"
+        self._last_pause_reason = self._pause_reason
+        self._resume_action = None
         log.info("会话步骤 %d：等待人工登录/验证", step_index)
+        deadline = time.monotonic() + HUMAN_WAIT_TIMEOUT
         while self._paused and not self._stopped:
-            time.sleep(0.3)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._pause_reason = f"{self._pause_reason}（等待超时）"
+                self._last_pause_reason = self._pause_reason
+                self._stopped = True
+                break
+            time.sleep(min(0.3, remaining))
+        action = self._resume_action or "skip"
         self._paused = False
+        self._waiting_step = None
+        self._pause_reason = ""
+        return action
 
     def _save_checkpoint(self, next_idx):
         """阶段5.1：每步完成写 checkpoint，崩溃后可续跑"""
@@ -239,7 +314,8 @@ class Player:
         for _ in range(LOCATOR_RETRIES):
             if self._check_locator(step):
                 return True
-            time.sleep(LOCATOR_RETRY_DELAY)
+            if not self._sleep_interruptible(LOCATOR_RETRY_DELAY):
+                return False
         return False
 
     def _verify_step(self, step):
@@ -383,6 +459,23 @@ class Player:
             if not ok:
                 return self._fail("switch_window", "no_window")
         return StepResult(True, "unknown_ok")
+
+    def _play_step_with_retry(self, step):
+        """Retry transient window/page availability before handing off.
+
+        A recorded window may take a moment to reopen or change its title.
+        Waiting here makes ordinary replay self-healing while still failing
+        closed for non-transient input errors.
+        """
+        result = self._play_step(step)
+        transient = {"no_window", "element_not_found", "element_hidden", "not_connected"}
+        for _ in range(ACTION_RETRIES - 1):
+            if result.ok or result.reason not in transient or self._stopped:
+                break
+            if not self._sleep_interruptible(ACTION_RETRY_DELAY):
+                break
+            result = self._play_step(step)
+        return result
 
     # ============ 定位 ============
 
@@ -543,7 +636,8 @@ class Player:
 
     def _locate_by_uia(self, loc, raw=(None, None)):
         """用 UI Automation 重新定位元素。多属性组合搜索，避免逐类型穷举。"""
-        ctrl = self._find_uia_ctrl(loc)
+        from services.input.engine import _timed_call
+        ctrl = _timed_call(lambda: self._find_uia_ctrl(loc), timeout=2.5)
         if ctrl is None:
             return None, None
         try:
@@ -779,8 +873,15 @@ class Player:
         window = step.get("window", "")
         return window in self._DESKTOP_WINDOWS or not window
 
-    def _target_hwnd(self, window_title):
+    def _target_hwnd(self, window_title, recorded_hwnd=None):
         """按标题找目标窗口；找不到时回退到前台窗口（仅限同种类窗口）"""
+        if recorded_hwnd:
+            try:
+                if win32gui.IsWindow(recorded_hwnd) and (
+                        not window_title or _same_window_kind(recorded_hwnd, window_title)):
+                    return recorded_hwnd
+            except Exception:
+                pass
         if window_title:
             hwnd = _find_window_by_title(window_title)
             if hwnd and win32gui.IsWindow(hwnd):
@@ -796,10 +897,11 @@ class Player:
         for loc in step.get("locator", []):
             if loc.get("type") != "uia":
                 continue
-            ctrl = self._find_uia_ctrl(loc)
+            from services.input.engine import _timed_call
+            ctrl = _timed_call(lambda: self._find_uia_ctrl(loc), timeout=2.5)
             if ctrl is None:
                 return None
-            if self._engine.uia.invoke_ctrl(ctrl):
+            if self._engine.invoke_ctrl(ctrl):
                 log.info("  -> UIA %s 成功: %r (%s)", action_name, ctrl.Name,
                          getattr(ctrl, "ControlTypeName", "?"))
                 return self._ok(f"uia_{action_name}")
@@ -834,7 +936,7 @@ class Player:
         if self._is_desktop_action(step):
             log.info("  -> 桌面点击 (%d,%d)", x, y)
             return self._engine.click_desktop(x, y)
-        hwnd = self._target_hwnd(step.get("window", ""))
+        hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
         if not hwnd:
             return self._fail("click", "no_window")
         self._activate_target(hwnd)
@@ -850,7 +952,7 @@ class Player:
         if self._is_desktop_action(step):
             log.info("  -> 桌面双击 (%d,%d)", x, y)
             return self._engine.double_click_desktop(x, y)
-        hwnd = self._target_hwnd(step.get("window", ""))
+        hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
         if not hwnd:
             return self._fail("double_click", "no_window")
         self._activate_target(hwnd)
@@ -866,7 +968,7 @@ class Player:
             self._engine.fg._mouse_right_click(x, y)
             time.sleep(0.5)
             return self._ok("desktop_right_click")
-        hwnd = self._target_hwnd(step.get("window", ""))
+        hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
         if not hwnd:
             return self._fail("right_click", "no_window")
         self._activate_target(hwnd)
@@ -884,7 +986,7 @@ class Player:
         if res is not None:
             log.info("  -> 网页输入 (CDP) %r", text[:30])
             return res
-        hwnd = self._target_hwnd(win)
+        hwnd = self._target_hwnd(win, step.get("hwnd"))
         if not hwnd:
             return self._fail("input_text", "no_window")
         self._activate_target(hwnd)
@@ -933,7 +1035,7 @@ class Player:
         if res is not None:
             log.info("  -> 网页按键 (CDP) %r", key)
             return res
-        hwnd = self._target_hwnd(step.get("window", ""))
+        hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
         if not hwnd:
             return self._fail("key_press", "no_window")
         log.info("  按键: %r -> %r", key, win32gui.GetWindowText(hwnd)[:40])

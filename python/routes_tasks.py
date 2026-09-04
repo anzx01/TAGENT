@@ -70,6 +70,15 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
                     count = json.loads(ef.read_text(encoding="utf-8")).get("count", 0)
                 except Exception:
                     pass
+            # The task card represents executable steps, not raw recorder
+            # events. Compilation may merge several text events into one task
+            # step, so prefer task.json when it is available.
+            tf = d / "task.json"
+            if tf.exists():
+                try:
+                    count = len(json.loads(tf.read_text(encoding="utf-8")).get("steps", []))
+                except Exception:
+                    pass
             corr_n = 0
             cf = d / "corrections.json"
             if cf.exists():
@@ -84,6 +93,7 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
                 "schedule": meta.get("schedule"),
                 "vars": len(store.variables(rec_id)),
                 "corrections": corr_n,
+                "replayable": count > 0,
             })
         return {"ok": True, "tasks": items}
 
