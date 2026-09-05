@@ -18,6 +18,15 @@ def compile_steps(steps):
         return json.loads((d / "task.json").read_text(encoding="utf-8"))
 
 
+def assert_artifacts(steps):
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "events.json").write_text(json.dumps({"steps": steps}), encoding="utf-8")
+        Compiler(d).compile()
+        for name in ("plan.json", "bundle.json", "review.json"):
+            assert (d / name).exists(), name
+
+
 def click(win, x=100, y=100, t=0.0):
     return {"action": "click", "t": t, "screen_x": x, "screen_y": y,
             "client_x": x, "client_y": y, "window": win,
@@ -32,6 +41,7 @@ def text(win, s, t, hwnd=123):
 
 # 1. 同窗口连续输入合并
 steps = [click("记事本"), text("记事本", "Hel", 0.5), text("记事本", "lo", 0.7)]
+assert_artifacts(steps)
 t = compile_steps(steps)
 inputs = [s for s in t["steps"] if s["action"] == "input_text"]
 assert len(inputs) == 1 and inputs[0]["text"] == "Hello", t["steps"]

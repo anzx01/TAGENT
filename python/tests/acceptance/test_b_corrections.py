@@ -58,6 +58,10 @@ r = post(f'{BASE_URL}/tasks/{rec_id}/correct',
              "correct": [{"action": "input_text", "text": "hello"}],
          }).encode())
 assert r['ok'], r
+correction_id = r.get('correction', {}).get('id')
+assert correction_id, r
+r = post(f'{BASE_URL}/tasks/{rec_id}/corrections/{correction_id}/approve')
+assert r.get('ok') and r.get('correction', {}).get('approved'), r
 print(f"[4] 已注入纠错: hlelo -> hello")
 
 # 4. 纠错后试运行 6 轮

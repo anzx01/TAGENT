@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from player import Player
+import player
 
 
 def make_player() -> Player:
@@ -26,6 +27,7 @@ def make_player() -> Player:
 
 
 def main() -> int:
+    assert player.WAIT_HARD_TIMEOUT <= 30
     p = make_player()
     result: list[str] = []
     t = threading.Thread(

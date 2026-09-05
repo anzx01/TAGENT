@@ -3,6 +3,21 @@
 set -e
 cd "$(dirname "$0")/.."
 
+if [ -n "${USERPROFILE:-}" ]; then
+    CARGO_USER_BIN="${USERPROFILE}/.cargo/bin"
+elif command -v cygpath >/dev/null 2>&1 && [ -n "${USERPROFILE_WIN:-}" ]; then
+    CARGO_USER_BIN="$(cygpath -u "${USERPROFILE_WIN}")/.cargo/bin"
+else
+    CARGO_USER_BIN=""
+fi
+if [ -d "$CARGO_USER_BIN" ]; then
+    export PATH="$CARGO_USER_BIN:$PATH"
+fi
+
+# Always rebuild the bundled Python backend first. Otherwise Tauri can package
+# a stale dist/tagent-server.exe and silently omit the latest replay fixes.
+./scripts/build_sidecar.sh
+
 # ---- MSVC/SDK 环境（路径不存在时降级为系统 PATH，仅提示）----
 MSVC_BASE="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
 SDK_BASE="/c/Program Files (x86)/Windows Kits/10"

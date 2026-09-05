@@ -121,7 +121,6 @@ def wait_for_replay(timeout=40):
 
 def cleanup_notepad():
     subprocess.run(["taskkill", "/IM", "Notepad.exe", "/F", "/T"], capture_output=True)
-    subprocess.run(["taskkill", "/IM", "Notepad.exe", "/F", "/T"], capture_output=True)
     time.sleep(1)
     pkg_root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Packages",
                             "Microsoft.WindowsNotepad_8wekyb3d8bbwe", "LocalState")

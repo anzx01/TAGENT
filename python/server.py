@@ -1,9 +1,11 @@
 """FastAPI 服务：连接前端 UI 与录制/回放引擎。"""
 
+import ctypes
 import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -93,7 +95,7 @@ def _scheduled_run(rec_id: str):
             if _player:
                 log.warning("[定时] 有回放进行中，跳过 %s", rec_id)
                 return
-        _launch_replay(rec_id, None)
+        _launch_replay(rec_id, None, trigger="schedule")
     except Exception:
         log.exception("[定时] 启动失败 %s", rec_id)
 
@@ -196,7 +198,26 @@ def _check_window_dependencies(rec_dir) -> list[str]:
     return missing
 
 
-def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
+def _attach_input_desktop() -> bool:
+    """Run desktop injection on the user's active Windows desktop.
+
+    Tauri normally starts the backend on the same desktop. A sidecar launched
+    from a service/sandbox can inherit an isolated desktop instead; switching
+    only the fresh replay worker allows Win32/UIA input to reach the active
+    shell without moving the HTTP server itself.
+    """
+    try:
+        user32 = ctypes.windll.user32
+        desktop = user32.OpenInputDesktop(0, False, 0x0100)
+        if not desktop:
+            return False
+        return bool(user32.SetThreadDesktop(desktop))
+    except Exception:
+        return False
+
+
+def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0,
+                   trigger: str = "manual"):
     """准备并启动回放。
 
     Player 必须在返回成功前登记到全局状态。旧实现在线程函数内部才赋值，
@@ -212,7 +233,17 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
     task_file = rec_dir / "task.json"
     events_file = rec_dir / "events.json"
     # 统一用最新 compiler 重编译：旧录制自动获得修复（双击合并/定位链升级）
-    if events_file.exists() and not task_file.exists():
+    task_needs_cleanup = False
+    if task_file.exists():
+        try:
+            existing = json.loads(task_file.read_text(encoding="utf-8"))
+            task_needs_cleanup = any(
+                Compiler.is_self_window(s.get("window", ""))
+                for s in existing.get("steps", [])
+            )
+        except Exception:
+            task_needs_cleanup = True
+    if events_file.exists() and (not task_file.exists() or task_needs_cleanup):
         try:
             Compiler(str(rec_dir)).compile()
         except Exception:
@@ -237,6 +268,34 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
         from_step = 0
     if from_step < 0 or from_step >= step_count:
         log.warning("回放起始步骤越界: %s (共 %d 步)", from_step, step_count)
+        return None
+
+    # Detach an immutable RunContext before starting the worker.  The player
+    # receives a deep snapshot, while the report carries the exact plan
+    # revision/hash used for this invocation.  Editing task.json mid-run can no
+    # longer change the active step list or invalidate the audit trail.
+    try:
+        from services.run_context import build_run_context
+        plan_data = task_data.get("plan") or {}
+        plan_path = rec_dir / "plan.json"
+        if plan_path.exists():
+            try:
+                plan_data = json.loads(plan_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                log.warning("plan.json 读取失败，使用 task.json 内嵌计划")
+        review_data = {}
+        review_path = rec_dir / "review.json"
+        if review_path.exists():
+            try:
+                review_data = json.loads(review_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                log.warning("review.json 读取失败，按 draft 回放")
+        run_context = build_run_context(
+            rec_dir.name, task_data, plan_data,
+            from_step=from_step, trigger=trigger, review=review_data,
+        )
+    except Exception as exc:
+        log.error("拒绝启动无有效 provenance 的回放 %s: %s", rec_id, exc)
         return None
 
     # 回放前窗口检测（仅警告，不拦截：player 会在目标缺失时进入接管态）。
@@ -277,7 +336,8 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
         player = Player(str(path), variables=variables or {},
                         session_steps=session_steps,
                         corrections=corrections,
-                        var_sources=var_sources)
+                        var_sources=var_sources,
+                        run_context=run_context)
         player.checkpoint_path = ckpt_file
         player._rec_id = rec_id
         # 阶段1.2：回放截图目录
@@ -305,6 +365,8 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
         global _player, _player_thread, _replay_state
         result = None
         try:
+            if not _attach_input_desktop():
+                log.warning("回放线程无法绑定输入桌面，桌面动作将进入接管保护")
             # stop 请求可能在 worker 获得执行权前到达；不要让 Player.play 的
             # 初始化覆盖这个停止信号。
             if player._stopped:
@@ -316,6 +378,10 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
                         _replay_state["state"] = "playing"
                 log.info("开始回放: %s (%d 步)", path, len(player.steps))
                 result = player.play(from_step=from_step)
+                if isinstance(result, dict):
+                    # Keep partial/checkpoint replays auditable and score them
+                    # against the same suffix rather than the full task.
+                    result.setdefault("from_step", from_step)
                 log.info("回放完成: %s", path)
                 # 只有自然完成才删除断点；中断结果保留断点供用户续跑。
                 if not player._stopped:
@@ -330,7 +396,7 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
                         "finished_at": time.time(),
                         "summary": result.get("summary") if isinstance(result, dict) else str(result),
                     })
-            _write_report(rec_id, result)
+            _write_report(rec_id, result, run_context)
         except Exception as exc:
             log.exception("回放出错: %s", path)
             result = {"summary": "回放异常", "steps": [], "pause_reasons": []}
@@ -338,7 +404,7 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
                 if _player is player:
                     _replay_state.update({"state": "failed", "finished_at": time.time(),
                                           "summary": "回放异常", "error": str(exc)})
-            _write_report(rec_id, result)
+            _write_report(rec_id, result, run_context)
         finally:
             with _player_lock:
                 # 旧线程绝不能清理已经被替换的实例。
@@ -367,7 +433,7 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0):
     return rec_id
 
 
-def _write_report(rec_id: str, result):
+def _write_report(rec_id: str, result, run_context=None):
     """阶段5.2：执行日志 REPORT（逐步结果+暂停原因）"""
     try:
         report_dir = BASE_DIR / "runs"
@@ -380,6 +446,29 @@ def _write_report(rec_id: str, result):
         else:
             report = {"rec_id": rec_id, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
             report.update(result)
+        report.setdefault("side_effects", [])
+        report.setdefault("human_takeovers", report.get("pause_reasons", []))
+        report.setdefault("agent_suggestions", [])
+        report["finished_at"] = time.time()
+        if run_context is not None:
+            context = run_context.to_dict()
+            report["run_id"] = f"{int(run_context.started_at * 1000)}-{rec_id}"
+            report["trigger"] = context.get("trigger", "manual")
+            report["plan_revision"] = context.get("plan_revision", 1)
+            report["source_hash"] = context.get("source_hash", "")
+            report["review_approved"] = bool(context.get("review_approved", False))
+            report["draft"] = bool(context.get("draft", not report["review_approved"]))
+            report["run_context"] = context
+            report["duration_ms"] = max(
+                0, int((report["finished_at"] - float(context.get("started_at", report["finished_at"]))) * 1000)
+            )
+            # Keep a separate provenance artifact so Run History can be
+            # audited without loading screenshots or the executable task.
+            context_file = report_dir / f"{report['run_id']}.context.json"
+            context_file.write_text(
+                json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            fname = f"{report['run_id']}_{rec_id}.json"
         _attach_eval(rec_id, report)
         (report_dir / fname).write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
@@ -410,6 +499,14 @@ def _attach_eval(rec_id: str, report: dict):
             expected = json.loads(events_file.read_text(encoding="utf-8")).get("steps", [])
         if not expected:
             return
+        try:
+            start = max(0, int(report.get("from_step", 0) or 0))
+        except (TypeError, ValueError):
+            start = 0
+        if start:
+            expected = expected[start:]
+            if not expected:
+                return
         report["eval"] = eval_scorer.score(expected, report["steps"]).to_dict()
     except Exception:
         log.exception("eval 评分失败")
@@ -422,6 +519,7 @@ class ReplayRequest(BaseModel):
     recording_id: str | None = None
     variables: dict[str, str] | None = None
     from_step: int = 0
+    trigger: str = "manual"
 
 
 @app.get("/")
@@ -553,7 +651,7 @@ def start_replay(req: ReplayRequest):
         step_count = 0
     if step_count == 0:
         return {"ok": False, "msg": "该录制没有捕获任何步骤，请重新录制后再回放"}
-    if _launch_replay(rec_dir.name, req.variables or {}, req.from_step):
+    if _launch_replay(rec_dir.name, req.variables or {}, req.from_step, req.trigger):
         return {"ok": True, "recording_id": rec_dir.name}
     return {"ok": False, "msg": "没有可回放的内容"}
 
@@ -971,7 +1069,10 @@ def _list_recordings() -> list[dict]:
 if __name__ == "__main__":
     import uvicorn
     # 挂载前端静态文件（不依赖 Tauri 也能浏览器访问）
-    frontend_dir = BASE_DIR / "src"
+    bundled_root = Path(getattr(sys, "_MEIPASS", BASE_DIR))
+    frontend_dir = bundled_root / "src"
+    if not frontend_dir.exists():
+        frontend_dir = BASE_DIR / "src"
     if frontend_dir.exists():
         app.mount("/ui", StaticFiles(directory=str(frontend_dir), html=True), name="ui")
 

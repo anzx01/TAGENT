@@ -21,14 +21,19 @@ class CorrectionStore:
     def load(self) -> list[dict]:
         if self.path.exists():
             try:
-                return json.loads(self.path.read_text(encoding="utf-8"))
+                value = json.loads(self.path.read_text(encoding="utf-8"))
+                return value if isinstance(value, list) else []
             except Exception:
                 return []
         return []
 
     def save(self, corrections: list[dict]):
-        self.path.write_text(
+        """Persist atomically so a crash cannot leave a half-written patch list."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(
             json.dumps(corrections, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
 
     # ---------- 3.2 纠错捕获 ----------
 
@@ -41,6 +46,11 @@ class CorrectionStore:
             "trials": 0,
             "frozen": 0,      # 连续试用成功次数
             "trusted": False,
+            "approved": False,
+            "approved_revision": None,
+            "active_revision": None,
+            "versions": [],
+            "history": [],
         }
         corrections = self.load()
         corrections.append(corr)
@@ -53,7 +63,11 @@ class CorrectionStore:
         if not actions:
             return None
         sig = self._signal(actions)
-        corr = self._best_candidate(sig)
+        # Formal replay only consumes an explicitly approved active revision.
+        # Callers that want to run an isolated trial must opt into the private
+        # ``_best_candidate(..., approved_only=False)`` path; the normal API is
+        # deliberately fail-closed.
+        corr = self._best_candidate(sig, approved_only=True)
         if corr is None:
             return None
         return corr["correct"]
@@ -62,24 +76,75 @@ class CorrectionStore:
         corrs = self.load()
         if not corrs:
             return 0.0
-        return min(1.0, sum(c.get("frozen", 0) for c in corrs) / (len(corrs) * 3))
+        approved = [c for c in corrs if c.get("approved") and c.get("active_revision") is not None]
+        if not approved:
+            return 0.0
+        return min(1.0, sum(c.get("frozen", 0) for c in approved) / (len(approved) * 3))
 
     # ---------- 3.3 信任机制 ----------
 
     def record_trial(self, corr_id: str, success: bool):
-        """试用成功后固化计数+1；失败清零。"""
+        """Record an isolated trial without changing the approved revision."""
         corrections = self.load()
         for c in corrections:
             if c["id"] == corr_id:
                 c["frozen"] = c["frozen"] + 1 if success else 0
+                c["trials"] = int(c.get("trials", 0)) + 1
+                c["successes"] = int(c.get("successes", 0)) + (1 if success else 0)
+                c["failures"] = int(c.get("failures", 0)) + (0 if success else 1)
+                c["success_rate"] = round(
+                    c["successes"] / c["trials"], 3) if c["trials"] else 0.0
+                c.setdefault("trial_history", []).append({
+                    "success": bool(success), "ts": time.time(),
+                })
         self.save(corrections)
+
+    def approve(self, corr_id: str) -> dict | None:
+        corrections = self.load()
+        for c in corrections:
+            if c.get("id") == corr_id:
+                next_revision = int(c.get("approved_revision") or 0) + 1
+                c["approved"] = True
+                c["trusted"] = True
+                c["approved_revision"] = next_revision
+                c["active_revision"] = next_revision
+                c.setdefault("versions", []).append({
+                    "revision": next_revision,
+                    "correct": [self._compact(s) for s in c.get("correct", [])],
+                    "approved_at": time.time(),
+                })
+                c.setdefault("history", []).append({
+                    "revision": next_revision, "action": "approve", "ts": time.time()
+                })
+                self.save(corrections)
+                return c
+        return None
+
+    def rollback(self, corr_id: str) -> dict | None:
+        corrections = self.load()
+        for c in corrections:
+            if c.get("id") == corr_id:
+                c["approved"] = False
+                c["trusted"] = False
+                c["active_revision"] = None
+                c.setdefault("history", []).append({
+                    "revision": c.get("approved_revision"), "action": "rollback", "ts": time.time()
+                })
+                self.save(corrections)
+                return c
+        return None
 
     # ---------- 内部 ----------
 
-    def _best_candidate(self, sig: str):
+    def _best_candidate(self, sig: str, *, approved_only: bool = False):
         best = None
         best_score = -1
         for corr in self.load():
+            if approved_only and (
+                not bool(corr.get("approved", False))
+                or ("active_revision" in corr and corr.get("active_revision") is None)
+            ):
+                continue
             score = self._score(corr, sig)
             if score > best_score:
                 best_score = score

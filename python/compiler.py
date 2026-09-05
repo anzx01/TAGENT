@@ -18,6 +18,13 @@ PARAM_KEYWORDS = ("搜索", "search", "查找", "账号", "user", "account", "�
 
 
 class Compiler:
+    SELF_WINDOW_MARKERS = ("智能操作助手", "操作助手")
+
+    @classmethod
+    def is_self_window(cls, title: str) -> bool:
+        value = str(title or "").lower()
+        return any(marker.lower() in value for marker in cls.SELF_WINDOW_MARKERS)
+
     def __init__(self, recording_dir):
         self.dir = Path(recording_dir)
         events_path = self.dir / "events.json"
@@ -41,6 +48,11 @@ class Compiler:
             first_in_segment = True
 
         for i, step in enumerate(self.steps):
+            # The browser-hosted TAGENT controls are part of the recorder UI,
+            # not the user's workflow. Recording the Stop button or the
+            # browser close button would make replay close its own controller.
+            if self.is_self_window(step.get("window", "")):
+                continue
             # 语义段锚点：切换到新窗口时开新段（移植 skill-recorder bundle.ts）
             window = step.get("window", "")
             if prev_window is not None and window != prev_window:
@@ -114,6 +126,16 @@ class Compiler:
             "segment_count": segment + 1,
             "steps": task_steps,
         }
+        # Persist a review-only plan alongside legacy steps. Player remains
+        # backward compatible, while UI/governance can distinguish
+        # deterministic, agent-assisted and human-required work.
+        plan = None
+        try:
+            from services.workflow_plan import build_plan
+            plan = build_plan(task)
+            task["plan"] = plan
+        except Exception:
+            task["plan"] = None
         # 弱定位警告（移植 openskills isWeakSelector）：全程无高质量定位
         located = [s for s in task_steps if s.get("locator")]
         if located and max((s["locator"][0].get("confidence", 0) for s in located), default=1) < 0.6:
@@ -122,6 +144,46 @@ class Compiler:
         task_path = self.dir / "task.json"
         with open(task_path, "w", encoding="utf-8") as f:
             json.dump(task, f, ensure_ascii=False, indent=2)
+        if plan is not None:
+            jsonl = self.dir / "events.jsonl"
+            if not jsonl.exists():
+                with jsonl.open("w", encoding="utf-8") as stream:
+                    for seq, step in enumerate(self.steps):
+                        stream.write(json.dumps({
+                            "seq": seq,
+                            "t": step.get("t", 0),
+                            "epoch": step.get("epoch"),
+                            "timestamp": step.get("timestamp"),
+                            "type": step.get("action", "unknown"),
+                            "source": "legacy-events-migration",
+                            "payload": step,
+                        }, ensure_ascii=False) + "\n")
+            (self.dir / "plan.json").write_text(
+                json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            bundle = {
+                "version": 1,
+                "source": self.dir.name,
+                "source_hash": plan.get("source_hash", ""),
+                "revision": plan.get("revision", 1),
+                "steps": task_steps,
+                "evidence": {"events": "events.jsonl", "screenshots": "screenshots/"},
+            }
+            (self.dir / "bundle.json").write_text(
+                json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            review = {
+                "revision": plan.get("revision", 1),
+                # A plan is always a draft until the user explicitly reviews
+                # it, even when the compiler found no open questions.
+                "approved": False,
+                "source_hash": plan.get("source_hash", ""),
+                "open_questions": plan.get("open_questions", []),
+                "feedback": [],
+            }
+            (self.dir / "review.json").write_text(
+                json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         return str(task_path)
 
     def _compile_step(self, step, index):

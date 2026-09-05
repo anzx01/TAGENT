@@ -75,6 +75,17 @@
       color: #ccc;
       margin-bottom: 8px;
     }
+    .workspace-nav { display:flex; gap:5px; margin:0 0 10px; border-bottom:1px solid rgba(255,255,255,.08); padding-bottom:8px; }
+    .workspace-tab { border:0; border-radius:5px; padding:5px 9px; color:#9ba0b0; background:rgba(255,255,255,.05); font-size:11px; cursor:pointer; }
+    .workspace-tab.active { color:#fff; background:#2d8f85; }
+    .workspace-copy { font-size:11px; color:#aeb4c4; line-height:1.5; margin:0 0 9px; }
+    .scout-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:5px; margin-bottom:8px; }
+    .scout-metric { background:rgba(255,255,255,.05); border-radius:6px; padding:7px; }
+    .scout-metric strong { display:block; color:#fff; font-size:16px; }
+    .scout-metric span { color:#8d93a4; font-size:10px; }
+    .history-row { padding:7px 8px; margin-bottom:5px; background:rgba(255,255,255,.05); border-radius:6px; font-size:11px; color:#c9ceda; }
+    .history-row .ok { color:#43d28b; float:right; }
+    .history-empty { color:#858b9b; font-size:11px; padding:10px 0; }
     .task-card {
       padding: 8px 10px;
       margin-bottom: 6px;
@@ -102,6 +113,8 @@
     .mini.sched { background: #16a085; }
     .mini.del { background: #c0392b; }
     .mini.steps { background: #7f8c8d; }
+    .mini.plan { background: #7f8c8d; }
+    .mini.export { background: #556b9c; }
     .timer-tag {
       display: inline-block; background: rgba(22,160,133,0.25);
       padding: 1px 6px; border-radius: 4px; font-size: 10px; color: #1abc9c;
@@ -166,9 +179,22 @@
   </div>
   <div class="panel" id="panel">
     <h3>任务库 <span id="confBadge" style="font-size:11px;color:#888;"></span></h3>
+    <div class="workspace-nav">
+      <button class="workspace-tab active" data-tab="scout">Scout</button>
+      <button class="workspace-tab" data-tab="tasks">Teach / Tasks</button>
+      <button class="workspace-tab" data-tab="history">Run History</button>
+    </div>
+    <div id="scoutView">
+      <p class="workspace-copy">发现重复工作，先看证据与重复程度，再决定要优化哪个流程。</p>
+      <div class="scout-grid"><div class="scout-metric"><strong id="scoutTaskCount">0</strong><span>流程</span></div><div class="scout-metric"><strong id="scoutStepCount">0</strong><span>步骤</span></div><div class="scout-metric"><strong id="scoutRunCount">0</strong><span>运行</span></div></div>
+      <div id="scoutCandidates" class="history-empty">加载重复工作候选…</div>
+    </div>
+    <div id="historyView" style="display:none"><p class="workspace-copy">每次运行都保留结果、暂停原因和评测，不上传原始截图。</p><div id="historyList"></div></div>
+    <div id="taskView">
     <div id="scoutSummary" style="padding:8px;background:rgba(22,160,133,.12);border-radius:6px;margin-bottom:8px;font-size:11px;color:#b8e8dc"></div>
     <div id="taskList"></div>
     <div class="step-list" id="stepList"></div>
+    </div>
   </div>
 
   <div class="modal-mask" id="modalMask">
@@ -183,6 +209,8 @@
     const btnClose = $("btnClose");
     const statusEl = $("status"), panel = $("panel"), taskList = $("taskList");
     const stepList = $("stepList"), mask = $("modalMask"), modalBox = $("modalBox");
+    const scoutView = $("scoutView"), taskView = $("taskView"), historyView = $("historyView");
+    let workspaceTab = "scout";
     let currentTask = null;
     let pollTimer = null;   // 回放状态轮询
     let pollGeneration = 0; // 丢弃旧请求返回，避免停止/继续后的竞态
@@ -287,6 +315,18 @@
     mask.addEventListener("click", (e) => {
       if (e.target === mask && mask.dataset.locked !== "1") hideModal();
     });
+    document.querySelectorAll(".workspace-tab").forEach((button) => {
+      button.addEventListener("click", () => {
+        workspaceTab = button.dataset.tab || "scout";
+        document.querySelectorAll(".workspace-tab").forEach((b) => b.classList.toggle("active", b === button));
+        scoutView.style.display = workspaceTab === "scout" ? "block" : "none";
+        taskView.style.display = workspaceTab === "tasks" ? "block" : "none";
+        historyView.style.display = workspaceTab === "history" ? "block" : "none";
+        if (workspaceTab === "scout") refreshDiscovery();
+        if (workspaceTab === "tasks") refreshTasks();
+        if (workspaceTab === "history") refreshHistory();
+      });
+    });
 
     btnRecord.addEventListener("click", async () => {
       try {
@@ -333,7 +373,7 @@
     });
     btnList.addEventListener("click", async () => {
       panel.classList.toggle("show");
-      if (panel.classList.contains("show")) refreshTasks();
+      if (panel.classList.contains("show")) { refreshTasks(); refreshDiscovery(); }
       // 悬浮条窗口默认 60px 高，任务库展开时需撑高窗口，否则面板在窗口外不可见
       try {
         const t = window.__TAURI__;
@@ -630,19 +670,62 @@
 
     // ---------- 任务库渲染 ----------
     async function refreshTasks() {
+      const refreshVersion = (window.__tagentTasksRefreshVersion || 0) + 1;
+      window.__tagentTasksRefreshVersion = refreshVersion;
       try {
         const res = await fetch(API + "/tasks");
         const data = await res.json();
+        if (refreshVersion !== window.__tagentTasksRefreshVersion) return;
         taskList.innerHTML = "";
         const conf = await fetch(API + "/tasks/security/summary").then(r => r.json()).catch(() => null);
+        if (refreshVersion !== window.__tagentTasksRefreshVersion) return;
         $("confBadge").textContent = conf && conf.password_edit ? "⚠ 前台含密码框" : "";
         const tasks = data.tasks || [];
         const scout = $("scoutSummary");
         if (scout) scout.textContent = `Scout · ${tasks.length} workflows · ${tasks.reduce((n,t)=>n+t.steps,0)} steps · repetitive work discovered`;
+        const taskCount = $("scoutTaskCount"), stepCount = $("scoutStepCount"), runCount = $("scoutRunCount");
+        if (taskCount) taskCount.textContent = tasks.length;
+        if (stepCount) stepCount.textContent = tasks.reduce((n, t) => n + Number(t.steps || 0), 0);
+        if (runCount) runCount.textContent = tasks.reduce((n, t) => n + Number(t.runs || 0), 0);
         for (const task of tasks) {
           taskList.appendChild(taskCard(task));
         }
       } catch (_) { taskList.innerHTML = "<p>加载失败</p>"; }
+    }
+
+    async function refreshHistory() {
+      const list = $("historyList");
+      if (!list) return;
+      list.innerHTML = "<div class='history-empty'>加载运行记录…</div>";
+      try {
+        const data = await apiJson("/tasks");
+        const tasks = data.tasks || [];
+        const runs = [];
+        for (const task of tasks.slice(0, 30)) {
+          const result = await apiJson(`/tasks/${task.id}/runs`, {}, 5000).catch(() => null);
+          for (const run of (result && result.runs) || []) runs.push({ ...run, task: task.name || task.id });
+        }
+        runs.sort((a, b) => String(b.ts || "").localeCompare(String(a.ts || "")));
+        list.innerHTML = runs.length ? runs.slice(0, 20).map((run) =>
+          `<div class="history-row"><span>${escapeHtml(run.task)} · ${escapeHtml(run.ts || "")}</span><span class="ok">${run.success ? "成功" : "需关注"}</span><br/><span style="color:#858b9b">${run.step_count} 步 · 暂停 ${run.pause_count} 次</span></div>`
+        ).join("") : "<div class='history-empty'>还没有运行记录。</div>";
+      } catch (err) {
+        list.innerHTML = `<div class='history-empty'>${escapeHtml(apiErrorMessage(err, "运行记录加载失败"))}</div>`;
+      }
+    }
+
+    async function refreshDiscovery() {
+      const list = $("scoutCandidates");
+      if (!list) return;
+      try {
+        const data = await apiJson("/tasks/discovery", {}, 8000);
+        const candidates = (data.candidates || []).filter((item) => item.steps > 0).slice(0, 5);
+        list.innerHTML = candidates.length ? candidates.map((item) =>
+          `<div class="history-row"><strong>${escapeHtml(item.name)}</strong><span class="ok">重复度 ${item.repeat_score}</span><br/><span style="color:#858b9b">${item.runs} 次运行 · 成功率 ${item.success_rate == null ? "—" : Math.round(item.success_rate * 100) + "%"} · 人工介入 ${item.human_takeovers} 次</span></div>`
+        ).join("") : "<div class='history-empty'>运行几次任务后，这里会显示可优先优化的重复流程。</div>";
+      } catch (err) {
+        list.innerHTML = `<div class='history-empty'>${escapeHtml(apiErrorMessage(err, "Discovery 暂不可用"))}</div>`;
+      }
     }
 
     function taskCard(task) {
@@ -667,6 +750,8 @@
       });
       run.disabled = task.replayable === false;
       const sch = aBtn("定时", "mini sched", () => schedModal(task));
+      const plan = aBtn("方案", "mini plan", () => showPlan(task));
+      const exportBtn = aBtn("导出", "mini export", () => exportModal(task));
       const vars = aBtn("步骤/变量", "mini var", async () => {
         const res = await fetch(API + "/recordings/" + task.id + "/steps");
         const d = await res.json();
@@ -679,10 +764,56 @@
           refreshTasks();
         }
       });
-      btns.appendChild(run); btns.appendChild(sch); btns.appendChild(vars);
+      btns.appendChild(run); btns.appendChild(plan); btns.appendChild(exportBtn); btns.appendChild(sch); btns.appendChild(vars);
       btns.appendChild(appd); btns.appendChild(del);
       card.appendChild(btns);
       return card;
+    }
+
+    async function showPlan(task) {
+      try {
+        const data = await apiJson(`/tasks/${task.id}/plan`);
+        if (!data.ok) { setStatus(data.msg || "方案加载失败", "error"); return; }
+        const plan = data.plan || {};
+        const modeLabel = { deterministic: "确定性", agent_assist: "辅助建议", human_required: "人工确认" };
+        const rows = (plan.steps || []).map((s) => `
+          <div class="step-item"><span><span class="action">${s.index + 1}. ${escapeHtml(s.action)}</span>
+          ${s.text_preview ? ` ${escapeHtml(s.text_preview)}` : ""}</span>
+          <span style="color:${s.mode === "human_required" ? "#f39c12" : s.mode === "agent_assist" ? "#9b59b6" : "#2ecc71"}">${modeLabel[s.mode] || s.mode}</span></div>`).join("");
+        const questions = (plan.open_questions || []).map((q) => `<li>步骤 ${q.step + 1}：${escapeHtml(q.question)}</li>`).join("");
+        showModal(`<h4>Automation Plan · ${escapeHtml(task.name)}</h4>
+          <div class="hint">执行策略：确定性优先，辅助只提出建议，不在运行中改写流程。</div>
+          <div class="step-list">${rows || "<div class='hint'>暂无步骤</div>"}</div>
+          ${questions ? `<div class="hint" style="color:#f3c26b;margin-top:8px">开放问题</div><ul style="padding-left:18px;font-size:11px;color:#ccc">${questions}</ul>` : "<div class='hint' style='color:#2ecc71'>没有待确认问题，可批准并导出。</div>"}
+          <button class="primary" id="approvePlan" ${questions ? "disabled" : ""}>批准此方案</button>
+          <button class="cancel" onclick="hideModal()">关闭</button>`);
+        const approve = $("approvePlan");
+        if (approve && !questions) approve.onclick = async () => {
+          const result = await apiJson(`/tasks/${task.id}/review`, {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({approved: true, feedback: []})});
+          if (result.ok) { approve.textContent = "已批准"; approve.disabled = true; setStatus("方案已批准，可导出最终产物", "ok"); }
+        };
+      } catch (err) { setStatus(apiErrorMessage(err, "方案加载失败"), "error"); }
+    }
+
+    function exportModal(task) {
+      showModal(`<h4>导出最终产物 · ${escapeHtml(task.name)}</h4>
+        <div class="hint">先审阅 Plan，再选择可移植的 Skill 或 Automation。导出不会自动运行任务。</div>
+        <button class="primary" id="exportSkill">导出 Skill.md</button>
+        <button class="primary" id="exportAutomation">导出 automation.json</button>
+        <button class="cancel" onclick="hideModal()">取消</button>`);
+      $("exportSkill").onclick = () => doExport(task, "skill");
+      $("exportAutomation").onclick = () => doExport(task, "automation");
+    }
+    async function doExport(task, kind) {
+      try {
+        const data = await apiJson(`/tasks/${task.id}/export`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ kind }),
+        });
+        if (!data.ok) { setStatus(data.msg || "导出失败", "error"); return; }
+        hideModal();
+        setStatus(`${kind === "skill" ? "Skill.md" : "automation.json"} 已生成`, "replaying");
+      } catch (err) { setStatus(apiErrorMessage(err, "导出失败"), "error"); }
     }
     let pendingAppendTarget = null;
     async function appendTask(task) {

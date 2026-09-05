@@ -34,6 +34,7 @@ fn project_root(resource_dir: Option<PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find(|root| {
         root.join("python/server.py").exists()
             || root.join("dist/tagent-server.exe").exists()
+            || root.join("tagent-server.exe").exists()
     })
 }
 
@@ -44,12 +45,21 @@ fn spawn_backend(resource_dir: Option<PathBuf>) -> Option<Child> {
     let root = project_root(resource_dir).unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     });
+    let data_dir = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|p| p.join("TAGENT"));
     // Release 包使用随包发布的 sidecar；开发模式必须使用当前源码，
     // 否则工作区里残留的旧 dist/tagent-server.exe 会掩盖最新修复。
-    let sidecar = root.join("dist/tagent-server.exe");
+    let packaged_sidecar = root.join("tagent-server.exe");
+    let development_sidecar = root.join("dist/tagent-server.exe");
+    let sidecar = if packaged_sidecar.exists() { packaged_sidecar } else { development_sidecar };
     if !cfg!(debug_assertions) && sidecar.exists() {
-        return Command::new(sidecar)
-            .current_dir(&root)
+        let mut command = Command::new(sidecar);
+        command.current_dir(&root);
+        if let Some(path) = data_dir {
+            command.env("TAGENT_DATA_DIR", path);
+        }
+        return command
             .spawn()
             .map_err(|err| eprintln!("TAGENT sidecar start failed: {err}"))
             .ok();

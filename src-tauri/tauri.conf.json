@@ -29,6 +29,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],
+    "resources": {
+      "../dist/tagent-server.exe": "tagent-server.exe"
+    },
     "publisher": "tagent",
     "shortDescription": "智能操作助手",
     "longDescription": "演示一次，自动学会并替你完成电脑操作",

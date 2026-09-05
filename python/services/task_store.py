@@ -8,6 +8,8 @@
 import json
 from pathlib import Path
 
+from services.workflow_plan import build_plan, plan_source_hash
+
 
 class TaskStore:
     def __init__(self, data_dir: Path):
@@ -32,6 +34,71 @@ class TaskStore:
         p = self.meta_path(rec_id)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _atomic_json(path: Path, value: dict):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _refresh_plan_after_edit(self, rec_id: str, task: dict, reason: str):
+        """Create a new plan revision and revoke prior approval after edits."""
+        root = self.data_dir / rec_id
+        old_plan = {}
+        plan_path = root / "plan.json"
+        if plan_path.exists():
+            try:
+                old_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                old_plan = {}
+        revision = int(old_plan.get("revision", task.get("plan_revision", 1)) or 1) + 1
+        meta = self.load_meta(rec_id)
+        plan = build_plan(task, session_steps=meta.get("session_steps", []), revision=revision)
+        task["plan"] = plan
+        task["plan_revision"] = revision
+        task["source_hash"] = plan_source_hash(task)
+        task_path = self.task_path(rec_id)
+        self._atomic_json(task_path, task)
+        self._atomic_json(plan_path, plan)
+        bundle_path = root / "bundle.json"
+        bundle = {}
+        if bundle_path.exists():
+            try:
+                bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                bundle = {}
+        bundle.update({
+            "version": int(bundle.get("version", 1) or 1),
+            "source": rec_id,
+            "source_hash": plan["source_hash"],
+            "revision": revision,
+            "steps": task.get("steps", []),
+        })
+        bundle.setdefault("evidence", {"events": "events.jsonl", "screenshots": "screenshots/"})
+        self._atomic_json(bundle_path, bundle)
+        review_path = root / "review.json"
+        review = {}
+        if review_path.exists():
+            try:
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                review = {}
+        review.update({
+            "approved": False,
+            "revision": revision,
+            "plan_revision": revision,
+            "source_hash": plan["source_hash"],
+            "open_questions": plan.get("open_questions", []),
+            "updated_at": __import__("time").time(),
+        })
+        review.setdefault("history", []).append({
+            "action": "invalidate", "reason": reason,
+            "revision": revision, "source_hash": plan["source_hash"],
+            "ts": __import__("time").time(),
+        })
+        self._atomic_json(review_path, review)
+        return plan
 
     # ---------- 阶段2.1：变量标注 ----------
 
@@ -67,9 +134,9 @@ class TaskStore:
         raw = step.get("_raw_text")
         if raw is None:
             raw = step.get("text", "")
-            step["_raw"] = raw
+            step["_raw_text"] = raw
         step["text"] = f"{{{{ {var_name} }}}}" if var_name else raw
-        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._refresh_plan_after_edit(rec_id, data, "variable_changed")
         return True
 
     # ---------- 阶段2.1：变量来源绑定 ----------
@@ -117,3 +184,10 @@ class TaskStore:
             steps.discard(step_index)
         meta["session_steps"] = sorted(steps)
         self.save_meta(rec_id, meta)
+        task_path = self.task_path(rec_id)
+        if task_path.exists():
+            try:
+                task = json.loads(task_path.read_text(encoding="utf-8"))
+                self._refresh_plan_after_edit(rec_id, task, "session_step_changed")
+            except (OSError, ValueError):
+                pass

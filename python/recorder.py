@@ -157,6 +157,8 @@ class UiaWorker:
 
 
 class Recorder:
+    _SELF_WINDOW_MARKERS = ("智能操作助手", "操作助手")
+
     def __init__(self, output_dir):
         self.output_dir = Path(output_dir)
         self.shot_dir = self.output_dir / "screenshots"
@@ -179,6 +181,8 @@ class Recorder:
         self._last_fg_hwnd = 0
         self._last_kdown_fg_hwnd = 0
         self._last_fg_title = ""
+        self._event_seq = 0
+        self._event_lock = threading.Lock()
 
     def start(self):
         self.steps = []
@@ -188,8 +192,12 @@ class Recorder:
         self._last_fg_hwnd = 0
         self._last_kdown_fg_hwnd = 0
         self._last_fg_title = ""
+        self._event_seq = 0
         self.recording = True
         self._write_meta("recording", {"started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+        # Start a fresh append-only evidence stream. Each completed step is
+        # appended immediately so an interrupted session remains recoverable.
+        (self.output_dir / "events.jsonl").write_text("", encoding="utf-8")
         if self._uia_worker is None:
             self._uia_worker = UiaWorker()
         self.hook.start()
@@ -279,6 +287,12 @@ class Recorder:
                 log.exception("_process 处理事件异常")
 
     def _process(self, evt):
+        # Ignore interactions with the TAGENT control surface itself. This is
+        # especially important when the UI is opened in Brave/Edge: the
+        # record and stop buttons must never become replay steps.
+        title = (evt.fg_title or "").lower()
+        if any(marker.lower() in title for marker in self._SELF_WINDOW_MARKERS):
+            return
         et = evt.event_type
         if evt.fg_hwnd:
             self._last_fg_hwnd = evt.fg_hwnd
@@ -463,12 +477,14 @@ class Recorder:
             prev_t = prev.get("t", 0)
             gap = round(now_us / 1_000_000, 3) - prev_t
             if gap >= WAIT_THRESHOLD:
-                self.steps.append({
-                    "action": "wait",
-                    "t": round(now_us / 1_000_000, 3),
-                    "duration": round(gap, 1),
-                    "window": prev.get("window", ""),
-                })
+                    synthetic = {
+                        "action": "wait",
+                        "t": round(now_us / 1_000_000, 3),
+                        "duration": round(gap, 1),
+                        "window": prev.get("window", ""),
+                    }
+                    self.steps.append(synthetic)
+                    self._append_event(synthetic)
 
         # 获取窗口信息
         hwnd = None
@@ -522,13 +538,15 @@ class Recorder:
             else:
                 prev_win, prev_hwnd = "", None
             if prev_hwnd and hwnd != prev_hwnd:
-                self.steps.append({
+                synthetic = {
                     "action": "switch_window",
                     "t": round(now_us / 1_000_000, 3),
                     "window": window_title,
                     "hwnd": hwnd,
                     "win_size": win_size,
-                })
+                }
+                self.steps.append(synthetic)
+                self._append_event(synthetic)
 
         # UIA 证据只对鼠标动作抓取（键盘回放用 WM_CHAR，不依赖定位）
         # 且 UIA 在大应用(如浏览器)上很慢，必须异步+超时
@@ -579,7 +597,44 @@ class Recorder:
             self._shot_threads.append(t)
 
         self.steps.append(step)
+        # Append every completed step immediately. _append_event makes a
+        # redacted copy for input_text, so sensitive values never enter the
+        # append-only stream in clear text.
+        self._append_event(step)
         return step
+
+    def _append_event(self, step):
+        try:
+            path = self.output_dir / "events.jsonl"
+            event_step = dict(step)
+            if event_step.get("action") == "input_text" and not event_step.get("sensitive"):
+                text = str(event_step.get("text", ""))
+                hwnd = event_step.get("hwnd") or win32gui.GetForegroundWindow()
+                sec = _get_security()
+                if hwnd and sec and sec.is_password_edit(hwnd):
+                    event_step["text"] = "{{PASSWORD}}"
+                    event_step["sensitive"] = True
+                else:
+                    masked = mask_pii(text)
+                    if masked.hit:
+                        event_step["text"] = masked.text
+                        event_step["sensitive"] = True
+                        event_step["pii_kinds"] = sorted({m.kind for m in masked.matches})
+            with self._event_lock:
+                event = {
+                    "seq": self._event_seq,
+                    "t": event_step.get("t", 0),
+                    "epoch": event_step.get("epoch") or time.time(),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "type": event_step.get("action", "unknown"),
+                    "source": "windows-hook",
+                    "payload": event_step,
+                }
+                self._event_seq += 1
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            log.exception("append events.jsonl failed")
 
     def _uia_grab_async(self, x, y):
         """通过专用工作线程抓取 UIA，短超时保护（慢时放弃，不阻塞分类）"""

@@ -27,14 +27,7 @@ echo "使用 Python: $PYTHON_BIN"
 mkdir -p dist
 
 # 排除无需打包的大模块可后续按需调优；--collect-all 收集 win32api/uiautomation 的隐藏依赖
-"$PYTHON_BIN" -m PyInstaller \
-    --name tagent-server \
-    --onefile \
-    --collect-all uiautomation \
-    --collect-all win32com \
-    --paths python \
-    --add-data "python;python" \
-    python/server.py
+"$PYTHON_BIN" -m PyInstaller --clean --noconfirm tagent-server.spec
 
 echo "完成: dist/tagent-server.exe"
 echo "运行: dist/tagent-server.exe  (监听 127.0.0.1:18899)"

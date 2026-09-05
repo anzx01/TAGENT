@@ -75,6 +75,10 @@ r = post(f'{BASE_URL}/tasks/{rec_a}/correct',
              "correct": [{"action": "input_text", "text": "Hi"}],
          }).encode())
 assert r['ok'], r
+correction_id = r.get('correction', {}).get('id')
+assert correction_id, r
+r = post(f'{BASE_URL}/tasks/{rec_a}/corrections/{correction_id}/approve')
+assert r.get('ok') and r.get('correction', {}).get('approved'), r
 print("[5] 纠错注入: Hello -> Hi")
 mark("纠错注入完成")
 

@@ -19,6 +19,7 @@ RELEASE_MODIFIERS = [0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B,
 HUMAN_WAIT_TIMEOUT = 120.0
 ACTION_RETRIES = 4
 ACTION_RETRY_DELAY = 1.0
+WAIT_HARD_TIMEOUT = 15.0
 
 # 移植 openskills replay/engine.ts：定位重试与步骤验证
 LOCATOR_RETRIES = 3      # 定位失败重试次数
@@ -37,7 +38,7 @@ for i in range(12):
 
 class Player:
     def __init__(self, events_path, variables=None, session_steps=None,
-                 corrections=None, var_sources=None):
+                 corrections=None, var_sources=None, run_context=None):
         self.events_path = Path(events_path)
         with open(self.events_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -54,11 +55,27 @@ class Player:
         self._waiting_step = None
         self._pause_reason = ""
         self._last_pause_reason = ""
+        self._desktop_menu_open = False
         self._session_steps = set(session_steps or [])  # 阶段2.4
         self.checkpoint_path = None  # 阶段5.1：断点续跑
         self._corrections = corrections or []  # 阶段3.3：自愈库
+        # A replay receives a detached immutable snapshot from the server.  The
+        # legacy file path remains available for correction storage, but edits
+        # made to task.json while this run is active cannot change ``steps``.
+        self._run_context = run_context
+        if run_context is not None:
+            try:
+                import copy
+                self.steps = copy.deepcopy(run_context.steps)
+                self._sort_locators()
+            except Exception:
+                # A malformed context must not make old callers unusable.
+                log.warning("invalid run context; using task file snapshot")
         self._step_results = []  # 阶段5.2：逐步结果
         self._pause_reasons = []  # 阶段5.2：暂停原因
+        self._agent_suggestions = []  # bounded suggestions; never executed in-run
+        self._last_correction_id = ""
+        self._last_correction_success = False
         self.screenshot_dir = None  # 阶段1.2：回放截图目录
         self._rec_id = ""  # 录制 ID（用于重新演示此步）
         self._engine = InputEngine()  # 输入注入引擎 V3
@@ -109,10 +126,14 @@ class Player:
         # Preserve pause/stop requests issued while the worker was starting.
         self._step_results = []
         self._pause_reasons = []
+        self._agent_suggestions = []
+        self._last_correction_id = ""
+        self._last_correction_success = False
         self._resume_action = None
         self._waiting_step = None
         self._pause_reason = ""
         self._last_pause_reason = ""
+        self._desktop_menu_open = False
         if start_delay > 0:
             self._sleep_interruptible(start_delay)
         # 强制前台窗口获得焦点
@@ -151,6 +172,7 @@ class Player:
             log.info("[回放 %d/%d] %s %s", i + 1, len(self.steps), action, text)
             step_ok = True
             step_detail = ""
+            step_method = ""
             # 阶段4 安全效果标签：破坏性操作暂停确认
             if step.get("effect") == "destructive":
                 self._pause_reasons.append({"step": i, "reason": f"破坏性操作需确认: {action} {text[:20]}"})
@@ -165,7 +187,16 @@ class Player:
                 if not self._check_locator_retry(step):
                     locator_failed = True
                     if self._try_correction(i):
-                        step_detail = "纠错库命中"
+                        step_ok = self._last_correction_success
+                        step_detail = "纠错库命中" if step_ok else "纠错动作失败"
+                        step_method = "approved_correction"
+                        if not step_ok:
+                            self._pause_reasons.append({
+                                "step": i, "reason": "已批准纠错动作执行失败"
+                            })
+                            self._pause_for_human(i, step_detail)
+                            if self._stopped:
+                                break
                     else:
                         llm_step = self._try_llm_heal(i, step, "定位失败")
                         if llm_step:
@@ -183,30 +214,18 @@ class Player:
                                     step_ok = True
                                     locator_failed = False
                                     step_already_executed = True
+                                    step_method = retry_result.method
                                     step_detail = f"重试成功 ({retry_result.method})"
                             if self._stopped:
                                 break
             if step_ok and not locator_failed and not step_already_executed:
                 if not self._try_correction(i):
                     result = self._play_step_with_retry(step)
-                    if not result.ok:
-                        step_ok = False
-                        hint = _web_failure_hint(step)
-                        step_detail = f"注入失败: {result.reason or result.method}"
-                        if hint:
-                            step_detail += f"。{hint}"
-                        self._pause_reasons.append(
-                            {"step": i, "reason": step_detail})
-                        log.warning("  步骤 %d %s，暂停等待人工", i, step_detail)
-                        action_after_pause = self._pause_for_human(i, step_detail)
-                        if action_after_pause == "retry" and not self._stopped:
-                            retry_result = self._play_step(step)
-                            if retry_result.ok:
-                                step_ok = True
-                                step_already_executed = True
-                                step_detail = f"重试成功 ({retry_result.method})"
-                        if self._stopped:
-                            break
+                    step_method = result.method
+                else:
+                    step_ok = self._last_correction_success
+                    step_detail = "纠错库命中" if step_ok else "纠错动作失败"
+                    step_method = "approved_correction"
                 step_detail = step_detail or "成功"
             # 步骤事后验证（移植 openskills verify，诊断不阻断）
             if step_ok and step.get("locator"):
@@ -221,6 +240,15 @@ class Player:
             self._step_results.append({
                 "step": i, "action": action, "text": text[:50],
                 "status": "ok" if step_ok else "paused", "detail": step_detail,
+                "method": step_method,
+                "effect": step.get("effect", "readonly"),
+                "window": step.get("window", ""),
+                "evidence": {
+                    "locator_types": [
+                        str(loc.get("type")) for loc in step.get("locator", [])
+                        if loc.get("type")
+                    ],
+                },
                 "ts": time.strftime("%H:%M:%S")
             })
             done = i + 1
@@ -235,8 +263,20 @@ class Player:
                 pythoncom.CoUninitialize()
         except Exception:
             pass
-        return {"summary": summary, "steps": self._step_results,
-                "pause_reasons": self._pause_reasons}
+        side_effects = [
+            {"step": item.get("step"), "effect": item.get("effect"),
+             "action": item.get("action"), "window": item.get("window", "")}
+            for item in self._step_results
+            if item.get("effect") in {"mutating", "destructive"}
+        ]
+        return {
+            "summary": summary,
+            "steps": self._step_results,
+            "pause_reasons": self._pause_reasons,
+            "human_takeovers": list(self._pause_reasons),
+            "side_effects": side_effects,
+            "agent_suggestions": list(self._agent_suggestions),
+        }
 
     def _wait_if_paused(self):
         """在动作边界等待手动暂停/接管结束。
@@ -371,6 +411,13 @@ class Player:
         best = None
         best_score = 0
         for corr in self._corrections:
+            # Corrections are governed patches, not implicit memory.  A
+            # rollback clears ``active_revision`` and must immediately stop a
+            # future replay from applying the patch.
+            if not bool(corr.get("approved", False)):
+                continue
+            if "active_revision" in corr and corr.get("active_revision") is None:
+                continue
             trig = corr.get("trigger", [])
             if not trig:
                 continue
@@ -385,14 +432,24 @@ class Player:
         if not correct:
             return False
         corr_id = best.get("id", "")
+        self._last_correction_id = str(corr_id)
         log.info("  命中纠错 %s：回放人工纠正步骤 (%d 步)", corr_id, len(correct))
         success = True
         for c in correct:
             if self._stopped:
                 success = False
                 break
-            self._play_step(c)
-            time.sleep(0.4)
+            try:
+                result = self._play_step(c)
+                if not result.ok:
+                    success = False
+                    break
+            except Exception:
+                success = False
+                break
+            if not self._sleep_interruptible(0.4):
+                success = False
+                break
         # 阶段3.3 信任闭环：回报试用结果，成功+1，失败清零
         if corr_id:
             try:
@@ -403,10 +460,19 @@ class Player:
                 log.info("  纠错 %s 信任计数 -> %d", corr_id, frozen)
             except Exception as e:
                 log.debug("信任回报失败: %s", e)
+        self._last_correction_success = bool(success)
+        # A matched correction is considered handled even if its trial failed;
+        # the caller records the failed governed patch and does not silently
+        # execute the original action on top of it.
         return True
 
     def _try_llm_heal(self, idx, failed_step, error=""):
-        """阶段3.3 LLM 自愈：纠错库未命中时，向 LLM 请求纠正建议"""
+        """Ask the bounded agent for a *proposal* without executing it.
+
+        R3 deliberately keeps model output outside the active plan.  The
+        proposal is reported for later review/approval; the caller continues
+        through the normal fail-closed human takeover path.
+        """
         try:
             from services.llm_heal import get_healer
             healer = get_healer()
@@ -417,14 +483,25 @@ class Player:
             result = healer.heal(failed_step, context, error)
             if result and isinstance(result, dict):
                 log.info("  LLM 自愈建议: %s", result.get("action", "?"))
-                return result
+                self._agent_suggestions.append({
+                    "step": idx,
+                    "error": str(error)[:200],
+                    "proposal": result,
+                    "status": "pending_approval",
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                })
+                # Never return a runnable step from the model path.
+                return None
         except Exception as e:
             log.debug("LLM 自愈异常: %s", e)
         return None
 
     def _do_wait(self, step, prev_t):
         """等待步骤：等待目标窗口出现（阶段2.3），超时则继续"""
-        duration = float(step.get("duration", 2.0))
+        try:
+            duration = min(max(0.0, float(step.get("duration", 2.0))), WAIT_HARD_TIMEOUT)
+        except (TypeError, ValueError):
+            duration = 2.0
         target = step.get("window", "")
         deadline = time.time() + duration
         while time.time() < deadline:
@@ -918,6 +995,29 @@ class Player:
         except Exception as e:
             log.debug("激活目标窗口失败: %s", e)
 
+    @staticmethod
+    def _is_idempotent_missing_window(step):
+        """Recognize a close-button click whose target is already closed.
+
+        Replaying a desktop recording often starts after the recorded app has
+        already been closed.  Only a click in the recorded top-right title-bar
+        region is safe to treat as an already-satisfied action; other missing
+        windows still require human takeover.
+        """
+        if step.get("action") not in {"click", "double_click"}:
+            return False
+        if not str(step.get("window", "")).strip():
+            return False
+        for loc in step.get("locator", []):
+            try:
+                x = float(loc.get("client_pct_x"))
+                y = float(loc.get("client_pct_y"))
+            except (TypeError, ValueError):
+                continue
+            if x >= 88.0 and 0.0 <= y <= 8.0:
+                return True
+        return False
+
     def _do_click(self, step):
         uia_result = self._try_uia_operate(step, "invoke")
         if uia_result:
@@ -935,9 +1035,23 @@ class Player:
             return self._fail("click", "no_coords")
         if self._is_desktop_action(step):
             log.info("  -> 桌面点击 (%d,%d)", x, y)
-            return self._engine.click_desktop(x, y)
+            if not self._desktop_menu_open:
+                _show_desktop()
+            if not _desktop_window_at(x, y, allow_menu=self._desktop_menu_open):
+                return self._fail("click", "desktop_not_target")
+            result = self._engine.click_desktop(x, y)
+            # A desktop context-menu click may open a nested submenu (for
+            # example Desktop -> New -> Text Document). Keep the menu context
+            # alive across that click so the next physical click can target
+            # the popup's ``#32768`` window. The next desktop right-click
+            # starts a fresh context; non-menu targets are still validated by
+            # ``_desktop_window_at``.
+            return result
         hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
         if not hwnd:
+            if self._is_idempotent_missing_window(step):
+                log.info("  -> skip already-closed window: %r", step.get("window", ""))
+                return self._ok("skip_missing_window")
             return self._fail("click", "no_window")
         self._activate_target(hwnd)
         log.info("  -> 点击 (%d,%d) -> %r", x, y, step.get("window", ""))
@@ -951,9 +1065,19 @@ class Player:
             return self._fail("double_click", "no_coords")
         if self._is_desktop_action(step):
             log.info("  -> 桌面双击 (%d,%d)", x, y)
-            return self._engine.double_click_desktop(x, y)
+            if not self._desktop_menu_open:
+                _show_desktop()
+            if not _desktop_window_at(x, y, allow_menu=self._desktop_menu_open):
+                return self._fail("double_click", "desktop_not_target")
+            result = self._engine.double_click_desktop(x, y)
+            # Preserve an open context-menu/submenu for the same reason as
+            # ``_do_click`` above.
+            return result
         hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
         if not hwnd:
+            if self._is_idempotent_missing_window(step):
+                log.info("  -> skip already-closed window: %r", step.get("window", ""))
+                return self._ok("skip_missing_window")
             return self._fail("double_click", "no_window")
         self._activate_target(hwnd)
         log.info("  -> 双击 (%d,%d) -> %r", x, y, step.get("window", ""))
@@ -965,7 +1089,11 @@ class Player:
             return self._fail("right_click", "no_coords")
         if self._is_desktop_action(step):
             log.info("  -> 桌面右键 (%d,%d)", x, y)
+            _show_desktop()
+            if not _desktop_window_at(x, y):
+                return self._fail("right_click", "desktop_not_target")
             self._engine.fg._mouse_right_click(x, y)
+            self._desktop_menu_open = True
             time.sleep(0.5)
             return self._ok("desktop_right_click")
         hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
@@ -1079,6 +1207,57 @@ def _check_foreground():
         log.info("[回放] 前台窗口: hwnd=%s title=%r", fg, win32gui.GetWindowText(fg))
     except Exception:
         pass
+
+
+def _desktop_window_at(x, y, allow_menu=False):
+    """Check that a physical desktop action is aimed at the shell.
+
+    ``mouse_event`` reports success even when no interactive desktop owns the
+    coordinates.  Verify the HWND under the point before treating a desktop
+    click as completed; a context-menu HWND is valid only for the click that
+    follows a recorded right-click.
+    """
+    try:
+        hwnd = win32gui.WindowFromPoint((int(x), int(y)))
+        if not hwnd:
+            # Some DPI-virtualized shells return a null WindowFromPoint while
+            # the visible Progman window still owns the desktop surface.
+            shell = win32gui.FindWindow("Progman", "Program Manager")
+            if shell and win32gui.IsWindowVisible(shell):
+                return True
+            shell = ctypes.windll.user32.GetShellWindow()
+            return bool(shell and win32gui.IsWindowVisible(shell))
+        classes = set()
+        current = hwnd
+        for _ in range(5):
+            if not current:
+                break
+            try:
+                classes.add(win32gui.GetClassName(current))
+                parent = win32gui.GetParent(current)
+            except Exception:
+                break
+            if not parent or parent == current:
+                break
+            current = parent
+        # The Windows taskbar is part of the shell surface too.  A common
+        # recorded flow right-clicks the desktop, chooses ``New -> Text
+        # Document``, then clicks a taskbar button to return to the recorder
+        # window.  That final click is still recorded with ``Program
+        # Manager`` as the foreground title, but WindowFromPoint resolves to
+        # ``Shell_TrayWnd`` (or one of its task-list children).  Accept only
+        # these explicit shell classes; never treat an arbitrary foreground
+        # window as a desktop target.
+        desktop_classes = {
+            "Progman", "WorkerW", "SHELLDLL_DefView", "SysListView32",
+            "Shell_TrayWnd", "MSTaskSwWClass", "MSTaskListWClass",
+            "TaskListThumbnailWnd", "Windows.UI.Core.CoreWindow",
+        }
+        if classes & desktop_classes:
+            return True
+        return allow_menu and "#32768" in classes
+    except Exception:
+        return False
 
 
 def _show_desktop():
@@ -1240,9 +1419,7 @@ def _find_window_by_title(title):
         return None
     best = max(lv for lv, _ in found)
     cands = [w for lv, w in found if lv == best]
-    if best == 1 and len(cands) > 1:
-        # 类名兜底命中多个同进程窗口：拒绝猜测，交给调用方回退前台
-        return None
+    # Multiple same-class windows are resolved by z-order below.
     if len(cands) == 1:
         return cands[0]
     # 同级多个匹配：Z 序最前的优先（前台 > 可见 > 最小化）

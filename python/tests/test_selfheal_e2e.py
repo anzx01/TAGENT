@@ -80,6 +80,13 @@ cr = post(API + f"/tasks/{rec_id}/correct", json.dumps({
     "correct": [{"action": "input_text", "text": "hello"}],
 }).encode())
 print("add correction:", cr)
+correction_id = cr.get("correction", {}).get("id")
+if not correction_id:
+    raise AssertionError(f"correction id missing: {cr}")
+approved = post(API + f"/tasks/{rec_id}/corrections/{correction_id}/approve")
+print("approve correction:", approved)
+if not approved.get("ok"):
+    raise AssertionError(f"correction approval failed: {approved}")
 
 # 3. 回放，应自动纠正为 hello
 r = post(API + "/replay/start", json.dumps({"recording_id": rec_id}).encode())

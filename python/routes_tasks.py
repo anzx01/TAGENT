@@ -10,13 +10,16 @@ import json
 from pathlib import Path
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from logger import get_logger
 from services.capability_registry import CapabilityRegistry
 from services.corrections import CorrectionStore
 from services.scheduler import Scheduler
 from services.task_store import TaskStore
+from services.workflow_plan import build_plan, plan_source_hash
+from services.workflow_artifacts import export_artifact
+from services.discovery import rank_candidates
 from services.security import get_security
 
 log = get_logger("routes")
@@ -39,6 +42,19 @@ class CapRegisterBody(BaseModel):
     source_task: str
     step_range: list[int] = [0, 0]
     description: str = ""
+
+
+class ExportBody(BaseModel):
+    kind: str = "skill"
+
+
+class ReviewBody(BaseModel):
+    approved: bool
+    feedback: list[str] = Field(default_factory=list)
+    # Answers are keyed by the plan step index.  They live in review.json,
+    # keeping the immutable plan/source untouched while making open questions
+    # auditable and resumable.
+    answers: dict[str, str] = Field(default_factory=dict)
 
 
 def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
@@ -86,6 +102,10 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
                     corr_n = len(json.loads(cf.read_text(encoding="utf-8")))
                 except Exception:
                     pass
+            run_count = 0
+            run_dir = data_dir.parent / "runs"
+            if run_dir.exists():
+                run_count = sum(1 for _ in run_dir.glob(f"*_{rec_id}.json"))
             items.append({
                 "id": rec_id,
                 "name": meta.get("name", rec_id),
@@ -94,8 +114,176 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
                 "vars": len(store.variables(rec_id)),
                 "corrections": corr_n,
                 "replayable": count > 0,
+                "runs": run_count,
             })
         return {"ok": True, "tasks": items}
+
+    @router.get("/{rec_id}/plan")
+    def get_plan(rec_id: str):
+        """Caddi-style Automation Plan: reviewable, non-executing metadata."""
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        task_file = d / "task.json"
+        if not task_file.exists():
+            return {"ok": False, "msg": "任务尚未编译"}
+        try:
+            task = json.loads(task_file.read_text(encoding="utf-8"))
+            meta = store.load_meta(rec_id)
+            plan_file = d / "plan.json"
+            if plan_file.exists():
+                plan = json.loads(plan_file.read_text(encoding="utf-8"))
+            else:
+                plan = task.get("plan") or build_plan(
+                    task, session_steps=meta.get("session_steps", []),
+                    revision=int(meta.get("plan_revision", 1)),
+                )
+            current_hash = plan_source_hash(task)
+            if plan.get("source_hash") != current_hash:
+                return {"ok": False, "msg": "方案已过期，请重新编译任务", "source_hash": current_hash}
+            return {"ok": True, "plan": plan}
+        except Exception as exc:
+            log.exception("读取任务计划失败: %s", rec_id)
+            return {"ok": False, "msg": str(exc)}
+
+    @router.get("/discovery")
+    def discover_workflows():
+        """Scout: rank repetitive local workflows without collecting telemetry."""
+        tasks = list_tasks().get("tasks", [])
+        run_dir = data_dir.parent / "runs"
+        runs_by_task: dict[str, list[dict]] = {}
+        if run_dir.exists():
+            for report_file in run_dir.glob("*.json"):
+                try:
+                    report = json.loads(report_file.read_text(encoding="utf-8"))
+                    rec_id = str(report.get("rec_id", ""))
+                    if not rec_id:
+                        continue
+                    steps = report.get("steps", [])
+                    runs_by_task.setdefault(rec_id, []).append({
+                        "success": bool(steps) and all(s.get("status") == "ok" for s in steps),
+                        "pause_count": len(report.get("pause_reasons", [])),
+                    })
+                except (OSError, ValueError):
+                    continue
+        return {"ok": True, "candidates": rank_candidates(tasks, runs_by_task)}
+
+    @router.get("/{rec_id}/runs")
+    def list_runs(rec_id: str):
+        """Run History: return summaries only; raw screenshots stay local."""
+        if _resolve(rec_id) is None:
+            return {"ok": False, "msg": "找不到任务"}
+        run_dir = data_dir.parent / "runs"
+        out = []
+        if run_dir.exists():
+            # RunContext reports use an epoch-millisecond prefix (for
+            # example ``178857...``), while legacy reports use a wall-clock
+            # prefix (``20260905_...``).  Lexicographic filename ordering
+            # therefore places a newer RunContext report *before or after*
+            # the wrong legacy report.  Use filesystem write time as the
+            # stable fallback ordering; the report is atomically written at
+            # completion, so this reflects actual Run History order.
+            report_files = list(run_dir.glob(f"*_{rec_id}.json"))
+            report_files.sort(
+                key=lambda p: (
+                    p.stat().st_mtime_ns if p.exists() else 0,
+                    p.name,
+                ),
+                reverse=True,
+            )
+            for report_file in report_files:
+                try:
+                    report = json.loads(report_file.read_text(encoding="utf-8"))
+                    steps = report.get("steps", [])
+                    out.append({
+                        "run_id": report_file.stem,
+                        "ts": report.get("ts"),
+                        "started_at": (report.get("run_context") or {}).get("started_at"),
+                        "finished_at": report.get("finished_at"),
+                        "trigger": report.get("trigger", "manual"),
+                        "plan_revision": report.get("plan_revision"),
+                        "source_hash": report.get("source_hash"),
+                        "summary": report.get("summary", ""),
+                        "success": bool(steps) and all(s.get("status") == "ok" for s in steps),
+                        "step_count": len(steps),
+                        "pause_count": len(report.get("pause_reasons", [])),
+                        "eval": report.get("eval"),
+                    })
+                except (OSError, ValueError):
+                    continue
+        return {"ok": True, "runs": out}
+
+    @router.post("/{rec_id}/export")
+    def export_task_artifact(rec_id: str, body: ExportBody):
+        """Create an opt-in portable Skill or Automation artifact."""
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        if body.kind not in {"skill", "automation"}:
+            return {"ok": False, "msg": "kind 必须是 skill 或 automation"}
+        try:
+            path = export_artifact(d, body.kind)
+            return {"ok": True, "kind": body.kind, "path": str(path)}
+        except Exception as exc:
+            log.exception("导出任务产物失败: %s", rec_id)
+            return {"ok": False, "msg": str(exc)}
+
+    @router.get("/{rec_id}/review")
+    def get_review(rec_id: str):
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        path = d / "review.json"
+        review = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"approved": False, "feedback": []}
+        return {"ok": True, "review": review}
+
+    @router.put("/{rec_id}/review")
+    def update_review(rec_id: str, body: ReviewBody):
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        plan_path = d / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8")) if plan_path.exists() else {}
+        if not plan:
+            return {"ok": False, "msg": "任务尚未生成可审阅方案"}
+        try:
+            task_for_hash = json.loads((d / "task.json").read_text(encoding="utf-8"))
+            if plan.get("source_hash") != plan_source_hash(task_for_hash):
+                return {"ok": False, "msg": "方案已过期，请重新编译任务"}
+        except (OSError, ValueError):
+            return {"ok": False, "msg": "任务文件不可读"}
+        path = d / "review.json"
+        current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        answers = dict(current.get("answers") or {})
+        answers.update({str(k): str(v) for k, v in body.answers.items() if str(v).strip()})
+        unresolved = [
+            q for q in plan.get("open_questions", [])
+            if not str(answers.get(str(q.get("step")), "")).strip()
+        ]
+        if body.approved and unresolved:
+            return {"ok": False, "msg": "仍有开放问题，不能批准", "open_questions": unresolved}
+        now = __import__("time").time()
+        prior = dict(current)
+        current.update({
+            "approved": bool(body.approved),
+            "feedback": list(body.feedback),
+            "answers": answers,
+            "revision": int(plan.get("revision", 1)),
+            "plan_revision": int(plan.get("revision", 1)),
+            "source_hash": plan.get("source_hash", ""),
+            "updated_at": now,
+        })
+        current.setdefault("history", []).append({
+            "action": "approve" if body.approved else "revoke",
+            "revision": current["revision"],
+            "source_hash": current["source_hash"],
+            "ts": now,
+            "feedback": list(body.feedback),
+        })
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return {"ok": True, "review": current}
 
     # ---------- 阶段2.1 变量标注 ----------
 
@@ -182,6 +370,22 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
         store_c = CorrectionStore(d)
         corr = store_c.add_correction(body.trigger, body.correct)
         return {"ok": True, "correction": corr}
+
+    @router.post("/{rec_id}/corrections/{corr_id}/approve")
+    def approve_correction(rec_id: str, corr_id: str):
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        corr = CorrectionStore(d).approve(corr_id)
+        return {"ok": bool(corr), "correction": corr}
+
+    @router.post("/{rec_id}/corrections/{corr_id}/rollback")
+    def rollback_correction(rec_id: str, corr_id: str):
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        corr = CorrectionStore(d).rollback(corr_id)
+        return {"ok": bool(corr), "correction": corr}
 
     # ---------- 阶段8 能力注册表（flows） ----------
 
