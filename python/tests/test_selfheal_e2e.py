@@ -46,11 +46,22 @@ rec_id = r["recording_id"]
 print("record start:", rec_id)
 time.sleep(0.5)
 
-subprocess.Popen(["notepad.exe"])
+proc = subprocess.Popen(["notepad.exe"])
 time.sleep(2.5)
 import win32gui
+import win32process
 
-hwnd = win32gui.FindWindow("Notepad", None)
+hwnd = None
+def _find_own_window(w, _):
+    global hwnd
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(w)
+        if pid == proc.pid and win32gui.IsWindowVisible(w):
+            hwnd = w
+    except Exception:
+        pass
+    return True
+win32gui.EnumWindows(_find_own_window, None)
 if not hwnd:
     def cb(w, l):
         t = win32gui.GetWindowText(w)
@@ -91,14 +102,23 @@ if not approved.get("ok"):
 # 3. 回放，应自动纠正为 hello
 r = post(API + "/replay/start", json.dumps({"recording_id": rec_id}).encode())
 print("replay start:", r)
-time.sleep(12)
+deadline = time.time() + 45
 state = get(API + "/replay/status")
-print("replay done, playing:", state.get("playing"))
+while state.get("playing") and time.time() < deadline:
+    time.sleep(0.5)
+    state = get(API + "/replay/status")
+print("replay done, playing:", state.get("playing"), "state:", state.get("state"))
+if state.get("playing") or state.get("state") not in {"finished", "stopped"}:
+    raise RuntimeError(f"replay did not reach terminal state: {state}")
 
 # 4. 验证记事本内容已纠正为 hello（而非 hlelo）: 全选+复制读剪贴板
 import win32clipboard
 
-click_at(1024, 616)
+win32gui.SetForegroundWindow(hwnd)
+time.sleep(0.5)
+rect = win32gui.GetWindowRect(hwnd)
+click_at((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
+time.sleep(0.3)
 time.sleep(0.3)
 import win32api
 import win32con

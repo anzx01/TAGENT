@@ -18,7 +18,7 @@ PARAM_KEYWORDS = ("搜索", "search", "查找", "账号", "user", "account", "�
 
 
 class Compiler:
-    SELF_WINDOW_MARKERS = ("智能操作助手", "操作助手")
+    SELF_WINDOW_MARKERS = ("智能操作助手", "操作助手", "TAGENT", "localhost:18899")
 
     @classmethod
     def is_self_window(cls, title: str) -> bool:
@@ -213,6 +213,12 @@ class Compiler:
 
         # 生成定位策略
         compiled["locator"] = self._build_locator(step)
+        # Desktop shell actions must remain physical clicks.  UIA often
+        # resolves the desktop root pane and reports Invoke success without
+        # selecting the context-menu item, so discard that generic evidence
+        # for shell-owned steps and retain coordinate fallbacks.
+        if step.get("window") == "Program Manager" and step.get("action") in ("click", "right_click", "double_click"):
+            compiled["locator"] = [loc for loc in compiled["locator"] if loc.get("type") != "uia"]
 
         # 可变输入建议参数（不替换 text，由用户在 UI 决定是否参数化）
         if step.get("action") == "input_text":

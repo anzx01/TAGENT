@@ -23,7 +23,7 @@ CLICK_TIME = 300_000     # 300ms
 SCROLL_MERGE = 500_000   # 500ms
 TEXT_TIMEOUT = 2_000_000  # 2s（避免长文本被拆分）
 SWIPE_TIME = 300_000     # 拖拽判定阈值，与 CLICK_TIME 一致
-UIA_GRAB_TIMEOUT = 0.2   # UIA 证据抓取超时（秒）
+UIA_GRAB_TIMEOUT = 0.8   # Shell 菜单异步出现时仍要捕获菜单项证据
 WAIT_THRESHOLD = 3.0      # 步骤间隔超过 3s 生成等待步骤（阶段2.3）
 
 MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
@@ -157,7 +157,7 @@ class UiaWorker:
 
 
 class Recorder:
-    _SELF_WINDOW_MARKERS = ("智能操作助手", "操作助手")
+    _SELF_WINDOW_MARKERS = ("智能操作助手", "操作助手", "TAGENT", "localhost:18899")
 
     def __init__(self, output_dir):
         self.output_dir = Path(output_dir)
@@ -183,6 +183,11 @@ class Recorder:
         self._last_fg_title = ""
         self._event_seq = 0
         self._event_lock = threading.Lock()
+        # Wall-clock anchor for deterministic event timestamps.  Hook ``t``
+        # is monotonic relative to the recording start; retaining the anchor
+        # lets diagnostics and later replays correlate actions with external
+        # application logs without using the delayed append time.
+        self._start_epoch = 0.0
 
     def start(self):
         self.steps = []
@@ -193,6 +198,7 @@ class Recorder:
         self._last_kdown_fg_hwnd = 0
         self._last_fg_title = ""
         self._event_seq = 0
+        self._start_epoch = time.time()
         self.recording = True
         self._write_meta("recording", {"started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
         # Start a fresh append-only evidence stream. Each completed step is
@@ -469,7 +475,17 @@ class Recorder:
     def _add_step(self, action, x=None, y=None, **extra):
         """记录一步操作 + 截图 + 窗口信息"""
         now_us = int(time.time() * 1_000_000) - self.hook._start_us
-        step = {"action": action, "t": round(now_us / 1_000_000, 3)}
+        elapsed = round(now_us / 1_000_000, 3)
+        step = {
+            "action": action,
+            "t": elapsed,
+            # Preserve the actual action time, not the time the processing
+            # thread happened to flush the event.
+            "epoch": round(self._start_epoch + elapsed, 6),
+            "timestamp": time.strftime(
+                "%Y-%m-%dT%H:%M:%S%z", time.localtime(self._start_epoch + elapsed)
+            ),
+        }
 
         # 跨窗口/等待检测（阶段2.2/2.3）：在动作步骤前插入 switch_window / wait
         if self.steps:
@@ -625,7 +641,7 @@ class Recorder:
                     "seq": self._event_seq,
                     "t": event_step.get("t", 0),
                     "epoch": event_step.get("epoch") or time.time(),
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "timestamp": event_step.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "type": event_step.get("action", "unknown"),
                     "source": "windows-hook",
                     "payload": event_step,

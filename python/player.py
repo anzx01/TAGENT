@@ -222,6 +222,18 @@ class Player:
                 if not self._try_correction(i):
                     result = self._play_step_with_retry(step)
                     step_method = result.method
+                    # A dispatched action is not successful merely because it
+                    # returned.  Propagate the executor result so a failed
+                    # input/window switch cannot be reported as a completed
+                    # run or silently allow the next step to continue.
+                    step_ok = bool(result.ok)
+                    if not step_ok:
+                        step_detail = result.reason or "执行失败"
+                        self._pause_reasons.append({
+                            "step": i,
+                            "reason": f"执行失败: {action} ({step_detail})",
+                        })
+                        self._pause_for_human(i, step_detail)
                 else:
                     step_ok = self._last_correction_success
                     step_detail = "纠错库命中" if step_ok else "纠错动作失败"
@@ -1019,9 +1031,44 @@ class Player:
         return False
 
     def _do_click(self, step):
-        uia_result = self._try_uia_operate(step, "invoke")
-        if uia_result:
-            return uia_result
+        # Shell desktop/menu coordinates are physical targets.  A generic
+        # PaneControl UIA locator (often the desktop root) can report Invoke
+        # success without selecting the menu item, so never let it short
+        # circuit desktop clicks.
+        if self._is_desktop_action(step) and self._desktop_menu_open:
+            # Context-menu items belong to the transient Shell popup, not the
+            # desktop root.  Prefer a real MenuItem UIA locator when one was
+            # captured; coordinates remain the fallback for older recordings.
+            for loc in step.get("locator", []):
+                if loc.get("type") == "uia" and "MenuItem" in str(loc.get("control_type", "")):
+                    result = self._try_uia_operate(step, "menu_invoke")
+                    if result:
+                        return result
+            # Windows 11 shell menus are transient and may expose only a
+            # generic XAML pane at the recorded point.  Re-discover the menu
+            # item by its captured OCR label when possible.
+            labels = " ".join(str(l.get("text", "")) for l in step.get("locator", []))
+            if any(k in labels for k in ("文本文档", "文本文件", "Text Document")):
+                try:
+                    import uiautomation as ua
+                    root = ua.GetRootControl()
+                    found = []
+                    def walk(c, _):
+                        try:
+                            if c.ControlTypeName == "MenuItemControl" and any(k in (c.Name or "") for k in ("文本文档", "文本文件", "Text Document")):
+                                found.append(c)
+                        except Exception:
+                            pass
+                        return True
+                    root.WalkControl(walk, None)
+                    if found and self._engine.invoke_ctrl(found[0]):
+                        return self._ok("uia_shell_menu_item")
+                except Exception:
+                    pass
+        if not self._is_desktop_action(step):
+            uia_result = self._try_uia_operate(step, "invoke")
+            if uia_result:
+                return uia_result
         # 网页通道优先（CDP 注入，不抢焦点——浏览器场景）
         web = get_web_channel()
         dom_loc = next((l for l in step.get("locator", []) if l.get("type") == "dom"), None)
@@ -1119,6 +1166,64 @@ class Player:
             return self._fail("input_text", "no_window")
         self._activate_target(hwnd)
         log.info("  输入: %r -> %r", text[:50], win32gui.GetWindowText(hwnd)[:40])
+        # Replace the captured field value so replay remains repeatable when
+        # the target contains data from an earlier run.
+        if step.get("replace", True):
+            # Native editors (including modern Notepad) may expose no usable
+            # UIA ValuePattern.  Set the actual child edit control directly
+            # when available; this makes replacement deterministic across
+            # repeated runs.
+            try:
+                import win32con
+                children = []
+                win32gui.EnumChildWindows(hwnd, lambda h, _: children.append(h), None)
+                for child in children:
+                    cls = win32gui.GetClassName(child).lower()
+                    if "edit" in cls or "richedit" in cls:
+                        win32gui.SendMessage(child, win32con.WM_SETTEXT, 0, text)
+                        return self._ok("win32_settext")
+            except Exception:
+                pass
+            self._uia_click_edit(hwnd)
+            try:
+                import uiautomation as ua
+                focused = ua.GetFocusedControl()
+                candidates = [focused] if focused else []
+                root = ua.ControlFromHandle(hwnd)
+                if root:
+                    for kind in ("DocumentControl", "EditControl"):
+                        try:
+                            candidates.append(getattr(root, kind)(searchDepth=32))
+                        except Exception:
+                            pass
+                for control in candidates:
+                    if control and control.Exists(0.2):
+                        pattern = control.GetValuePattern()
+                        if pattern:
+                            pattern.SetValue(text)
+                            return self._ok("uia_value_replace")
+            except Exception:
+                pass
+            selected = self._engine.fg.key_combo(hwnd, [0x11, 0x41])
+            if not selected.ok:
+                return selected
+            # Foreground typing targets the focused child control, unlike
+            # message-based replacement which can target the top-level hwnd.
+            try:
+                import win32clipboard
+                win32clipboard.OpenClipboard()
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+                win32clipboard.CloseClipboard()
+                pasted = self._engine.fg.key_combo(hwnd, [0x11, 0x56])
+                if pasted.ok:
+                    return pasted
+            except Exception:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+            return self._engine.fg.type_text(hwnd, text)
         return self._engine.type_text(hwnd, text)
 
     def _ok(self, method):
