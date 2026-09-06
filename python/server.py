@@ -391,10 +391,12 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0,
                           "pause_reasons": []}
             with _player_lock:
                 if _player is player:
+                    failed = isinstance(result, dict) and result.get("success") is False
                     _replay_state.update({
-                        "state": "stopped" if player._stopped else "finished",
+                        "state": "stopped" if player._stopped else ("failed" if failed else "finished"),
                         "finished_at": time.time(),
                         "summary": result.get("summary") if isinstance(result, dict) else str(result),
+                        "error": result.get("summary") if failed else None,
                     })
             _write_report(rec_id, result, run_context)
         except Exception as exc:

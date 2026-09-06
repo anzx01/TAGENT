@@ -88,6 +88,8 @@ _user32.WindowFromPoint.argtypes = [POINT]
 _user32.WindowFromPoint.restype = ctypes.wintypes.HWND
 _user32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.UINT]
 _user32.GetAncestor.restype = ctypes.wintypes.HWND
+_user32.GetClassNameW.argtypes = [ctypes.wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int]
+_user32.GetClassNameW.restype = ctypes.c_int
 
 HOOKPROC = ctypes.CFUNCTYPE(
     ctypes.wintypes.LPARAM, ctypes.c_int,
@@ -100,9 +102,13 @@ LBDOWN, LBUP, RBDOWN, RBUP, WHEEL, KDOWN, KUP = range(7)
 
 class RawEvent:
     """原始钩子事件"""
-    __slots__ = ("event_type", "x", "y", "vk", "scan", "delta", "t_us", "fg_hwnd", "fg_title")
+    __slots__ = ("event_type", "x", "y", "vk", "scan", "delta", "t_us",
+                 "fg_hwnd", "fg_title", "target_hwnd", "target_title", "target_class",
+                 "pointer_evidence")
 
-    def __init__(self, event_type, x=0, y=0, vk=0, scan=0, delta=0, t_us=0, fg_hwnd=0, fg_title=""):
+    def __init__(self, event_type, x=0, y=0, vk=0, scan=0, delta=0, t_us=0,
+                 fg_hwnd=0, fg_title="", target_hwnd=0, target_title="", target_class="",
+                 pointer_evidence=None):
         self.event_type = event_type
         self.x = x
         self.y = y
@@ -112,6 +118,10 @@ class RawEvent:
         self.t_us = t_us
         self.fg_hwnd = fg_hwnd
         self.fg_title = fg_title
+        self.target_hwnd = target_hwnd
+        self.target_title = target_title
+        self.target_class = target_class
+        self.pointer_evidence = pointer_evidence
 
 
 class HookManager:
@@ -128,6 +138,7 @@ class HookManager:
         self._kb_cb = None
         self._last_fg_hwnd = 0
         self._last_fg_title = ""
+        self.on_pointer_down = None
 
     def start(self):
         if self._running:
@@ -228,18 +239,32 @@ class HookManager:
                 if et is not None:
                     now = int(time.time() * 1_000_000) - self._start_us
                     fg, fg_title = self._fg_snapshot()
-                    if not fg:
-                        candidate = _user32.WindowFromPoint(POINT(sx, sy))
-                        if candidate:
-                            try:
-                                fg = _user32.GetAncestor(candidate, 2)
-                                buf = ctypes.create_unicode_buffer(256)
-                                _user32.GetWindowTextW(fg, buf, 256)
-                                fg_title = buf.value
-                            except Exception:
-                                pass
+                    target = 0
+                    target_title = ""
+                    target_class = ""
+                    pointer_evidence = None
+                    candidate = _user32.WindowFromPoint(POINT(sx, sy))
+                    if candidate:
+                        try:
+                            target = _user32.GetAncestor(candidate, 2) or candidate
+                            buf = ctypes.create_unicode_buffer(256)
+                            _user32.GetWindowTextW(target, buf, 256)
+                            target_title = buf.value
+                            cls = ctypes.create_unicode_buffer(128)
+                            _user32.GetClassNameW(target, cls, 128)
+                            target_class = cls.value
+                        except Exception:
+                            target = candidate
+                    if et in (LBDOWN, RBDOWN) and self.on_pointer_down:
+                        try:
+                            pointer_evidence = self.on_pointer_down(sx, sy)
+                        except Exception:
+                            pointer_evidence = None
                     self._queue.put(RawEvent(et, x=sx, y=sy, delta=delta, t_us=now,
-                                             fg_hwnd=fg, fg_title=fg_title), block=False)
+                                             fg_hwnd=fg, fg_title=fg_title,
+                                             target_hwnd=target, target_title=target_title,
+                                             target_class=target_class,
+                                             pointer_evidence=pointer_evidence), block=False)
         except Exception:
             pass
         return _user32.CallNextHookEx(None, nCode, wParam, lParam)

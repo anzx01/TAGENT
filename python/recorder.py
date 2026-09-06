@@ -80,8 +80,11 @@ class UiaWorker:
         self._req = _q.Queue()
         self._res = _q.Queue()
         self._seq = 0
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self._seq_lock = threading.Lock()
+        self._threads = [threading.Thread(target=self._run, daemon=True)
+                         for _ in range(2)]
+        for thread in self._threads:
+            thread.start()
 
     def _run(self):
         try:
@@ -93,25 +96,37 @@ class UiaWorker:
             item = self._req.get()
             if item is None:
                 break
-            seq, x, y = item
+            seq, x, y, response = item
             try:
                 import uiautomation as ua
                 result = self._grab(ua, x, y)
             except Exception:
                 result = None
-            self._res.put((seq, result))
+            response.put((seq, result))
 
     def _grab(self, ua, x, y):
         elem = None
         if x is not None and y is not None:
             try:
-                elem = ua.ControlFromPoint(ua.Point(x, y))
+                # uiautomation.ControlFromPoint takes integer coordinates
+                # directly (there is no public ``ua.Point`` type).
+                elem = ua.ControlFromPoint(int(x), int(y))
             except Exception:
                 pass
         if elem is None:
             elem = ua.GetFocusedControl()
         if elem is None:
             return None
+        # XAML Shell menus expose the text glyph as the point element while
+        # the actionable ancestor is MenuFlyoutItem/MenuItemControl. Promote
+        # to that ancestor so compilation/replay can invoke the item by its
+        # semantic label instead of recording a non-actionable TextBlock.
+        try:
+            parent = elem.GetParentControl()
+            if parent and parent.ControlTypeName == "MenuItemControl":
+                elem = parent
+        except Exception:
+            pass
         evidence = {
             "name": (elem.Name or "")[:200],
             "type": elem.ControlTypeName or "",
@@ -145,11 +160,25 @@ class UiaWorker:
 
     def grab(self, x, y, timeout=0.8):
         """请求 UIA 证据，超时返回 None。用序列号防止迟到结果污染。"""
-        self._seq += 1
-        self._req.put((self._seq, x, y))
+        return self.resolve(self.submit(x, y), timeout)
+
+    def submit(self, x, y):
+        import queue as _q
+        with self._seq_lock:
+            self._seq += 1
+            seq = self._seq
+        response = _q.Queue(maxsize=1)
+        self._req.put((seq, x, y, response))
+        return seq, response
+
+    @staticmethod
+    def resolve(request, timeout=0.8):
+        if not request:
+            return None
+        expected_seq, response = request
         try:
-            seq, result = self._res.get(timeout=timeout)
-            if seq != self._seq:
+            seq, result = response.get(timeout=timeout)
+            if seq != expected_seq:
                 return None  # 迟到/错位结果
             return result
         except Exception:
@@ -157,7 +186,7 @@ class UiaWorker:
 
 
 class Recorder:
-    _SELF_WINDOW_MARKERS = ("智能操作助手", "操作助手", "TAGENT", "localhost:18899")
+    _SELF_WINDOW_MARKERS = ("智能操作助手", "操作助手")
 
     def __init__(self, output_dir):
         self.output_dir = Path(output_dir)
@@ -206,6 +235,7 @@ class Recorder:
         (self.output_dir / "events.jsonl").write_text("", encoding="utf-8")
         if self._uia_worker is None:
             self._uia_worker = UiaWorker()
+        self.hook.on_pointer_down = self._uia_worker.submit
         self.hook.start()
         self._proc_thread = threading.Thread(target=self._loop, daemon=True)
         self._proc_thread.start()
@@ -217,6 +247,7 @@ class Recorder:
         # UWP 等应用的输入管线会延迟处理注入事件，先排空队列再收尾
         self._drain_quiet(2.0)
         self.hook.stop()
+        self.hook.on_pointer_down = None
         # 钩子线程退出后，处理队列中延迟到达的剩余事件
         self._drain_quiet(1.0)
         if self._proc_thread:
@@ -296,10 +327,11 @@ class Recorder:
         # Ignore interactions with the TAGENT control surface itself. This is
         # especially important when the UI is opened in Brave/Edge: the
         # record and stop buttons must never become replay steps.
-        title = (evt.fg_title or "").lower()
+        et = evt.event_type
+        pointer_event = et in (LBDOWN, LBUP, RBDOWN, RBUP, WHEEL)
+        title = ((evt.target_title if pointer_event else evt.fg_title) or "").lower()
         if any(marker.lower() in title for marker in self._SELF_WINDOW_MARKERS):
             return
-        et = evt.event_type
         if evt.fg_hwnd:
             self._last_fg_hwnd = evt.fg_hwnd
         if evt.fg_title:
@@ -322,11 +354,11 @@ class Recorder:
                     self._finalize_text(self._pending_text)
                 finally:
                     self._pending_text = None
-            self._pending_click = (evt.x, evt.y, evt.t_us, evt.fg_hwnd)
+            self._pending_click = self._pointer_context(evt)
         elif et == LBUP:
             self._on_left_up(evt)
         elif et == RBDOWN:
-            self._pending_click = (evt.x, evt.y, evt.t_us, evt.fg_hwnd)
+            self._pending_click = self._pointer_context(evt)
         elif et == RBUP:
             self._on_right_up(evt)
         elif et == WHEEL:
@@ -341,7 +373,7 @@ class Recorder:
         self._pending_click = None
         if not pc:
             return
-        sx, sy, st, fg = pc
+        sx, sy, st = pc["x"], pc["y"], pc["t_us"]
         dist = ((evt.x - sx) ** 2 + (evt.y - sy) ** 2) ** 0.5
         dur = evt.t_us - st
         if dist < CLICK_DIST:
@@ -350,15 +382,48 @@ class Recorder:
             action = "swipe"
         else:
             action = "drag"
-        self._add_step(action, sx, sy, end_x=evt.x, end_y=evt.y, duration_us=dur, fg_hwnd=fg)
+        self._add_step(action, sx, sy, end_x=evt.x, end_y=evt.y, duration_us=dur, **pc["context"])
 
     def _on_right_up(self, evt):
         pc = self._pending_click
         self._pending_click = None
         if not pc:
             return
-        sx, sy, st, fg = pc[:4]
-        self._add_step("right_click", sx, sy, fg_hwnd=fg)
+        sx, sy = pc["x"], pc["y"]
+        self._add_step("right_click", sx, sy, **pc["context"])
+
+    def _pointer_context(self, evt):
+        """Capture the window/control under the pointer before click-up.
+
+        The foreground window is not the click target (notably after Show
+        Desktop and inside transient Shell menus).  Capturing on button-down
+        also preserves menu-item UIA evidence before the menu disappears.
+        """
+        target = evt.target_hwnd or win32gui.WindowFromPoint((evt.x, evt.y))
+        root, title, size = self._get_window_info(target) if target else (None, "", None)
+        client = (None, None)
+        if root:
+            try:
+                client = win32gui.ScreenToClient(root, (evt.x, evt.y))
+            except Exception:
+                pass
+        uia_evidence = self._uia_worker.resolve(
+            evt.pointer_evidence, UIA_GRAB_TIMEOUT
+        ) if self._uia_worker and evt.pointer_evidence else self._uia_grab_async(evt.x, evt.y)
+        return {
+            "x": evt.x,
+            "y": evt.y,
+            "t_us": evt.t_us,
+            "context": {
+                "fg_hwnd": evt.fg_hwnd,
+                "target_hwnd": root or target,
+                "target_title": title or evt.target_title,
+                "target_class": evt.target_class,
+                "target_size": size,
+                "target_client": client,
+                "uia_evidence": uia_evidence,
+            },
+        }
 
     def _on_scroll(self, evt):
         now_us = evt.t_us
@@ -507,14 +572,19 @@ class Recorder:
         window_title = ""
         win_size = None
         if x is not None and y is not None:
-            # 优先用按下时刻前台窗口（点击后窗口可能已关闭，WindowFromPoint 会落空/落错）
-            fg_hwnd = extra.get("fg_hwnd") or 0
-            hwnd = fg_hwnd or win32gui.WindowFromPoint((x, y))
-            if hwnd:
+            # 鼠标动作属于指针下方窗口，不属于点击前的前台窗口。
+            # button-down 快照还可保留点击后已经消失的菜单/对话框信息。
+            hwnd = extra.get("target_hwnd") or win32gui.WindowFromPoint((x, y))
+            captured_title = extra.get("target_title", "")
+            captured_size = extra.get("target_size")
+            if hwnd and win32gui.IsWindow(hwnd):
                 hwnd, window_title, win_size = self._get_window_info(hwnd)
-            if not hwnd and fg_hwnd:
-                # 按下时刻窗口已销毁，用事件时刻缓存的前台标题
-                window_title = self._last_fg_title
+            else:
+                window_title, win_size = captured_title, captured_size
+            if not window_title:
+                window_title = captured_title
+            if not win_size:
+                win_size = captured_size
             # 屏幕坐标转百分比
             sw, sh = _screen_size()
             step["pct_x"] = round(x / sw * 100, 1) if sw else 0
@@ -523,7 +593,10 @@ class Recorder:
             step["screen_y"] = y
 
             # 转客户区坐标
-            if hwnd:
+            target_client = extra.get("target_client")
+            if target_client and target_client != (None, None):
+                step["client_x"], step["client_y"] = target_client
+            elif hwnd and win32gui.IsWindow(hwnd):
                 try:
                     cx, cy = win32gui.ScreenToClient(hwnd, (x, y))
                     step["client_x"] = cx
@@ -543,6 +616,8 @@ class Recorder:
         step["hwnd"] = hwnd
         step["window"] = window_title
         step["win_size"] = win_size
+        if extra.get("target_class"):
+            step["target_class"] = extra["target_class"]
 
         # 窗口切换检测：动作目标窗口与前一步窗口不同 -> 插入 switch_window（阶段2.2）
         if hwnd and window_title and self.steps:
@@ -567,13 +642,15 @@ class Recorder:
         # UIA 证据只对鼠标动作抓取（键盘回放用 WM_CHAR，不依赖定位）
         # 且 UIA 在大应用(如浏览器)上很慢，必须异步+超时
         if action in ("click", "right_click", "double_click", "scroll"):
-            step["uia"] = self._uia_grab_async(x, y)
+            step["uia"] = extra.get("uia_evidence") or self._uia_grab_async(x, y)
         else:
             step["uia"] = None
 
         # 合并额外字段
+        internal = {"fg_hwnd", "target_hwnd", "target_title", "target_class",
+                    "target_size", "target_client", "uia_evidence"}
         for k, v in extra.items():
-            if k not in step and k != "fg_hwnd":
+            if k not in step and k not in internal:
                 step[k] = v
 
         # 截图（仅鼠标动作截图；渲染较重，放后台线程避免阻塞事件分类）

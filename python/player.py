@@ -134,6 +134,10 @@ class Player:
         self._pause_reason = ""
         self._last_pause_reason = ""
         self._desktop_menu_open = False
+        expects_text_document = any(
+            step.get("semantic") == "shell_create_text_document" for step in self.steps
+        )
+        desktop_before = _desktop_text_files() if expects_text_document else set()
         if start_delay > 0:
             self._sleep_interruptible(start_delay)
         # 强制前台窗口获得焦点
@@ -155,6 +159,7 @@ class Player:
             if step.get("action") == "wait":
                 self._do_wait(step, prev_t)
                 prev_t = step.get("t", 0)
+                done = i + 1
                 continue
             wait = max(0.0, step.get("t", 0) - prev_t)
             if not self._sleep_interruptible(min(wait, max_wait)):
@@ -269,7 +274,37 @@ class Player:
             if not self._sleep_interruptible(step_delay):
                 break
         interrupted = self._stopped
+        artifacts = []
+        artifact_ok = True
+        if expects_text_document and not interrupted:
+            deadline = time.monotonic() + 3.0
+            created = set()
+            while time.monotonic() < deadline:
+                created = _desktop_text_files() - desktop_before
+                if created:
+                    break
+                time.sleep(0.2)
+            if created:
+                artifacts = sorted(str(path) for path in created)
+            else:
+                artifact_ok = False
+                self._step_results.append({
+                    "step": done,
+                    "action": "verify_artifact",
+                    "text": "desktop *.txt",
+                    "status": "failed",
+                    "detail": "未检测到新建文本文件",
+                    "method": "filesystem",
+                    "effect": "readonly",
+                    "window": "Program Manager",
+                    "evidence": {"locator_types": []},
+                    "ts": time.strftime("%H:%M:%S"),
+                })
+        success = (not interrupted and done >= len(self.steps) and artifact_ok
+                   and all(item.get("status") == "ok" for item in self._step_results))
         summary = f"完成 {done}/{len(self.steps)} 步" + (" (已中断)" if interrupted else "")
+        if not artifact_ok:
+            summary += "；失败：未生成新的文本文件"
         try:
             if _com_inited:
                 pythoncom.CoUninitialize()
@@ -288,6 +323,8 @@ class Player:
             "human_takeovers": list(self._pause_reasons),
             "side_effects": side_effects,
             "agent_suggestions": list(self._agent_suggestions),
+            "artifacts": artifacts,
+            "success": success,
         }
 
     def _wait_if_paused(self):
@@ -1035,36 +1072,28 @@ class Player:
         # PaneControl UIA locator (often the desktop root) can report Invoke
         # success without selecting the menu item, so never let it short
         # circuit desktop clicks.
-        if self._is_desktop_action(step) and self._desktop_menu_open:
-            # Context-menu items belong to the transient Shell popup, not the
-            # desktop root.  Prefer a real MenuItem UIA locator when one was
-            # captured; coordinates remain the fallback for older recordings.
-            for loc in step.get("locator", []):
-                if loc.get("type") == "uia" and "MenuItem" in str(loc.get("control_type", "")):
-                    result = self._try_uia_operate(step, "menu_invoke")
-                    if result:
-                        return result
-            # Windows 11 shell menus are transient and may expose only a
-            # generic XAML pane at the recorded point.  Re-discover the menu
-            # item by its captured OCR label when possible.
-            labels = " ".join(str(l.get("text", "")) for l in step.get("locator", []))
-            if any(k in labels for k in ("文本文档", "文本文件", "Text Document")):
-                try:
-                    import uiautomation as ua
-                    root = ua.GetRootControl()
-                    found = []
-                    def walk(c, _):
-                        try:
-                            if c.ControlTypeName == "MenuItemControl" and any(k in (c.Name or "") for k in ("文本文档", "文本文件", "Text Document")):
-                                found.append(c)
-                        except Exception:
-                            pass
-                        return True
-                    root.WalkControl(walk, None)
-                    if found and self._engine.invoke_ctrl(found[0]):
-                        return self._ok("uia_shell_menu_item")
-                except Exception:
-                    pass
+        if self._desktop_menu_open:
+            x0, y0 = self._resolve_coords(step)
+            menu_name = next((str(loc.get("name", "")).strip()
+                              for loc in step.get("locator", [])
+                              if loc.get("type") == "uia"
+                              and "MenuItem" in str(loc.get("control_type", ""))
+                              and str(loc.get("name", "")).strip()), "")
+            if step.get("semantic") == "shell_create_text_document":
+                menu_name = "Text Document" if not menu_name else menu_name
+            if menu_name and self._invoke_shell_menu_label((menu_name,), prefer_physical=True):
+                time.sleep(0.25)
+                self._desktop_menu_open = self._shell_menu_visible()
+                return self._ok("uia_shell_menu_label")
+            if x0 is not None and y0 is not None and self._invoke_shell_menu_at(x0, y0, prefer_physical=True):
+                time.sleep(0.25)
+                self._desktop_menu_open = self._shell_menu_visible()
+                return self._ok("uia_shell_menu_point")
+            # The previous leaf selection may already have closed the menu;
+            # continue with the ordinary desktop target instead of treating a
+            # subsequent file click as a missing menu item.
+            if not self._shell_menu_visible():
+                self._desktop_menu_open = False
         if not self._is_desktop_action(step):
             uia_result = self._try_uia_operate(step, "invoke")
             if uia_result:
@@ -1103,6 +1132,132 @@ class Player:
         self._activate_target(hwnd)
         log.info("  -> 点击 (%d,%d) -> %r", x, y, step.get("window", ""))
         return self._engine.click(hwnd, x, y)
+
+    def _invoke_shell_menu_at(self, x, y, prefer_physical=False):
+        """Invoke the live menu item at a recorded point.
+
+        Prefer ControlFromPoint so XAML menu descendants with Handle=0 are
+        still reachable.  Walk parents because Windows may return a text/icon
+        child rather than the MenuItem itself.
+        """
+        try:
+            import uiautomation as ua
+            from services.input.engine import _timed_call
+
+            control = _timed_call(
+                lambda: ua.ControlFromPoint(int(x), int(y)), timeout=1.5)
+            for _ in range(8):
+                if control is None:
+                    break
+                try:
+                    if control.ControlTypeName == "MenuItemControl":
+                        return self._activate_shell_menu_control(control, prefer_physical)
+                    control = control.GetParentControl()
+                except Exception:
+                    break
+        except Exception as exc:
+            log.debug("Shell menu point lookup failed: %s", exc)
+            return False
+        return False
+
+    def _activate_shell_menu_control(self, control, prefer_physical=False):
+        if prefer_physical:
+            try:
+                rect = control.BoundingRectangle
+                x = int((rect.left + rect.right) / 2)
+                y = int((rect.top + rect.bottom) / 2)
+                if rect.right > rect.left and rect.bottom > rect.top:
+                    self._engine.fg._mouse_click(x, y)
+                    return True
+            except Exception:
+                pass
+        try:
+            if self._engine.invoke_ctrl(control):
+                return True
+        except Exception:
+            pass
+        try:
+            rect = control.BoundingRectangle
+            x = int((rect.left + rect.right) / 2)
+            y = int((rect.top + rect.bottom) / 2)
+            if rect.right > rect.left and rect.bottom > rect.top:
+                self._engine.fg._mouse_click(x, y)
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _shell_menu_visible():
+        visible = False
+
+        def visit(hwnd, _):
+            nonlocal visible
+            try:
+                cls = win32gui.GetClassName(hwnd)
+                if win32gui.IsWindowVisible(hwnd) and (
+                        cls == "#32768" or "XamlExplorerHostIslandWindow" in cls
+                        or "PopupWindowSiteBridge" in cls):
+                    visible = True
+            except Exception:
+                pass
+            return not visible
+
+        try:
+            win32gui.EnumWindows(visit, None)
+        except Exception:
+            pass
+        return visible
+
+    def _invoke_shell_menu_label(self, labels, prefer_physical=False):
+        """Find and invoke a visible Windows Shell menu item by its label.
+
+        Windows 11 menus are transient XAML/UIA trees and their coordinates
+        move with DPI, taskbar position, and submenu placement.  Enumerate
+        only the current popup/menu roots and recurse through their children;
+        this avoids accidentally invoking a similarly named item in another
+        application.
+        """
+        try:
+            import uiautomation as ua
+            labels = tuple(str(x).casefold() for x in labels)
+            roots = []
+            desktop = ua.GetRootControl()
+            for child in desktop.GetChildren():
+                try:
+                    cls = str(child.ClassName or "")
+                    typ = str(child.ControlTypeName or "")
+                    if (typ == "MenuControl" or cls == "#32768" or "Xaml" in cls
+                            or "PopupWindowSiteBridge" in cls):
+                        roots.append(child)
+                except Exception:
+                    continue
+            # Win32 popup menus may not appear as direct RootControl children
+            # while a XAML submenu is open; ask UIA for the known popup class
+            # explicitly as an additional root.
+            try:
+                popup = ua.WindowControl(ClassName="#32768")
+                if popup.Exists(0.2):
+                    roots.append(popup)
+            except Exception:
+                pass
+            queue = list(roots)
+            visited = 0
+            while queue and visited < 2000:
+                control = queue.pop(0)
+                visited += 1
+                try:
+                    name = str(control.Name or "").strip().casefold()
+                    typ = str(control.ControlTypeName or "")
+                    if typ == "MenuItemControl" and any(label in name for label in labels):
+                        if self._activate_shell_menu_control(control, prefer_physical):
+                            return True
+                    queue.extend(control.GetChildren())
+                except Exception:
+                    continue
+        except Exception as exc:
+            log.debug("Shell menu dynamic lookup failed: %s", exc)
+        return False
 
     def _do_double_click(self, step):
         # 双击不走 pattern 链：桌面 ListItem 的 Invoke 会抛 COMError 且 Select 只是选中，
@@ -1162,6 +1317,73 @@ class Player:
             log.info("  -> 网页输入 (CDP) %r", text[:30])
             return res
         hwnd = self._target_hwnd(win, step.get("hwnd"))
+        if step.get("window") == "Program Manager" and any(
+                s.get("semantic") == "shell_create_text_document" for s in self.steps):
+            # After Shell creates a document the rename edit is a transient
+            # UIA control, not the desktop root.  Resolve it by focus before
+            # sending any text; never type into Program Manager itself.
+            try:
+                import uiautomation as ua
+                for _ in range(20):
+                    focused = ua.GetFocusedControl()
+                    if focused and focused.ControlTypeName in ("EditControl", "DocumentControl"):
+                        pattern = focused.GetValuePattern()
+                        if pattern:
+                            pattern.SetValue(text)
+                            return self._ok("uia_shell_rename")
+                    time.sleep(0.15)
+                # Shell may create the item without entering rename mode when
+                # Invoke is used. Locate the newly-created desktop item and
+                # explicitly enter F2 rename mode before setting its value.
+                root = ua.ControlFromHandle(hwnd) if hwnd else ua.GetRootControl()
+                candidate = None
+                queue = [root] if root else []
+                while queue and not candidate:
+                    control = queue.pop(0)
+                    try:
+                        name = str(control.Name or "").casefold()
+                        is_text_item = control.ControlTypeName == "ListItemControl" and any(
+                                key in name for key in ("文本文档", "文本文件", "text document", "new text"))
+                        if not is_text_item and control.ControlTypeName == "ListItemControl":
+                            try:
+                                current = _desktop_text_files()
+                                is_text_item = bool(current - desktop_before)
+                            except Exception:
+                                pass
+                        if is_text_item:
+                            candidate = control
+                            break
+                        queue.extend(control.GetChildren())
+                    except Exception:
+                        continue
+                if candidate:
+                    candidate.SetFocus()
+                    rect = candidate.BoundingRectangle
+                    self._engine.fg._mouse_click(
+                        int((rect.left + rect.right) / 2), int((rect.top + rect.bottom) / 2))
+                    self._engine.fg.key_combo(hwnd, [0x71])  # F2
+                    for _ in range(12):
+                        time.sleep(0.15)
+                        focused = ua.GetFocusedControl()
+                        if focused and focused.ControlTypeName in ("EditControl", "DocumentControl"):
+                            pattern = focused.GetValuePattern()
+                            if pattern:
+                                pattern.SetValue(text)
+                                return self._ok("uia_shell_rename_f2")
+            except Exception:
+                pass
+            # Windows Explorer may begin rename only after its shell view has
+            # returned focus.  As the last deterministic fallback, type into
+            # the active shell rename field via foreground input; no generic
+            # top-level-window injection is allowed.
+            try:
+                fg = win32gui.GetForegroundWindow()
+                if fg and _same_window_kind(fg, "Program Manager"):
+                    self._engine.fg.type_text(fg, text)
+                    return self._ok("shell_foreground_rename")
+            except Exception:
+                pass
+            return self._fail("input_text", "shell_rename_control_not_found")
         if not hwnd:
             return self._fail("input_text", "no_window")
         self._activate_target(hwnd)
@@ -1293,6 +1515,20 @@ class Player:
 
 # ============ 模块级工具 ============
 
+def _desktop_text_files():
+    """Return current user desktop text files using the Shell folder path."""
+    try:
+        from win32com.shell import shell, shellcon
+        desktop = Path(shell.SHGetFolderPath(0, shellcon.CSIDL_DESKTOP, None, 0))
+    except Exception:
+        import os
+        desktop = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
+    try:
+        return {path.resolve() for path in desktop.iterdir()
+                if path.is_file() and path.suffix.casefold() == ".txt"}
+    except Exception:
+        return set()
+
 def _web_failure_hint(step) -> str:
     """浏览器步骤注入失败时给出网页通道提示（避免盲目等待人工）"""
     win = step.get("window", "")
@@ -1360,7 +1596,13 @@ def _desktop_window_at(x, y, allow_menu=False):
         }
         if classes & desktop_classes:
             return True
-        return allow_menu and "#32768" in classes
+        menu_classes = {
+            "#32768", "InputSiteWindowClass",
+            "Microsoft.UI.Content.DesktopChildSiteBridge",
+            "XamlExplorerHostIslandWindow_WASDK",
+            "Microsoft.UI.Content.PopupWindowSiteBridge",
+        }
+        return allow_menu and bool(classes & menu_classes)
     except Exception:
         return False
 
