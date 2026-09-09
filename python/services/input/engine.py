@@ -123,7 +123,10 @@ class InputEngine:
         vks = self._parse_combo(key)
         if not vks:
             return StepResult(False, "key_press", f"unknown_key: {combo}")
-        if self.msg.key_press(hwnd, vks):
+        # 修饰键组合（ctrl/alt/win+key）是命令意图：目标应用普遍不吃
+        # PostMessage 的 WM_KEYDOWN 快捷键（如记事本 Ctrl+S 假成功不弹
+        # 另存为），必须走真实键盘注入；仅单键保留 PostMessage 后台通道
+        if len(vks) == 1 and self.msg.key_press(hwnd, vks[0]):
             log.info("  key_press %r -> post_message", key)
             return StepResult(True, "post_message_key")
         ok, reason = self.guard.ensure(hwnd)
