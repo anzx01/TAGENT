@@ -21,6 +21,7 @@ E2E_TESTS=(
     python/tests/test_replay_switch.py
     python/tests/test_selfheal_e2e.py
     python/tests/test_switch_wait.py
+    python/tests/test_e2e_versions.py
 )
 
 for f in "${E2E_TESTS[@]}"; do

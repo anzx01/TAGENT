@@ -285,6 +285,28 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
         tmp.replace(path)
         return {"ok": True, "review": current}
 
+    # ---------- task.json 版本历史（移植 openskills 版本快照） ----------
+
+    @router.get("/{rec_id}/versions")
+    def list_versions(rec_id: str):
+        from services.task_versions import TaskVersions
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        mf = TaskVersions(d).manifest()
+        return {"ok": True, "current": mf.get("current", 0), "history": mf.get("history", [])}
+
+    @router.get("/{rec_id}/versions/{n}/diff")
+    def diff_version(rec_id: str, n: int):
+        from services.task_versions import TaskVersions
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        entries = TaskVersions(d).diff_vs_current(n)
+        if entries is None:
+            return {"ok": False, "msg": "版本不存在或已是当前版本"}
+        return {"ok": True, "version": n, "diff": entries}
+
     # ---------- 阶段2.1 变量标注 ----------
 
     @router.get("/{rec_id}/vars")

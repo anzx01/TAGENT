@@ -1,0 +1,71 @@
+{
+  "ran_at": "2026-09-09T07:14:12+0800",
+  "pass_line": 0.8,
+  "results": [
+    {
+      "id": "notepad_input_merge",
+      "title": "记事本输入合并+UIA定位",
+      "pass": true,
+      "score": 1.0,
+      "checks": [
+        {
+          "name": "actions_exact",
+          "pass": true,
+          "detail": "['switch_window', 'click', 'input_text', 'key_press']",
+          "critical": true
+        },
+        {
+          "name": "input_merged",
+          "pass": true,
+          "detail": "['Hello world']",
+          "critical": true
+        },
+        {
+          "name": "click_uia_top",
+          "pass": true,
+          "detail": "{'type': 'uia', 'name': '文本编辑器', 'control_type': 'Edit', 'class': 'Edit', 'auto_id': '', 'confidence': 0.95}",
+          "critical": true
+        },
+        {
+          "name": "steps_ordered",
+          "pass": true,
+          "detail": "缺失组: None",
+          "critical": true
+        }
+      ]
+    },
+    {
+      "id": "cross_app_switch",
+      "title": "跨应用切换保留/冗余过滤",
+      "pass": true,
+      "score": 1.0,
+      "checks": [
+        {
+          "name": "real_switch_kept",
+          "pass": true,
+          "detail": "[('无标题 - 记事本', 111), ('计算器', 222)]",
+          "critical": true
+        },
+        {
+          "name": "redundant_switch_filtered",
+          "pass": true,
+          "detail": "['switch_window', 'click', 'switch_window', 'click']",
+          "critical": true
+        },
+        {
+          "name": "segments",
+          "pass": true,
+          "detail": "2",
+          "critical": true
+        },
+        {
+          "name": "ordered",
+          "pass": true,
+          "detail": "",
+          "critical": true
+        }
+      ]
+    }
+  ],
+  "all_pass": true
+}

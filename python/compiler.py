@@ -88,12 +88,13 @@ class Compiler:
                     prev_step = step
                     continue
 
-            # 过滤冗余 switch_window（连续相同窗口）
+            # 过滤冗余 switch_window：上一个已保留步骤的窗口相同时丢弃。
+            # （不能用 prev_window——它在段锚点处已被无条件更新为当前窗口，
+            #   旧写法会把所有 switch_window 误判为冗余，跨应用切换步骤全部丢失）
             if step.get("action") == "switch_window":
                 window = step.get("window", "")
-                if window == prev_window:
+                if task_steps and task_steps[-1].get("window") == window:
                     continue
-                prev_window = window
 
             # 过滤冗余 click（相同位置 0.5~1 秒内重复；<0.5s 已在上面合并为双击）
             if step.get("action") == "click":
@@ -144,6 +145,13 @@ class Compiler:
         task_path = self.dir / "task.json"
         with open(task_path, "w", encoding="utf-8") as f:
             json.dump(task, f, ensure_ascii=False, indent=2)
+        # 版本化快照（移植 openskills 不可变版本）：编译/合并产生新版本；
+        # 内容未变时幂等跳过，快照失败不阻断编译
+        try:
+            from services.task_versions import TaskVersions
+            TaskVersions(self.dir).snapshot(task, "compiled")
+        except Exception:
+            pass
         if plan is not None:
             jsonl = self.dir / "events.jsonl"
             if not jsonl.exists():
@@ -199,16 +207,18 @@ class Compiler:
             if key in step:
                 compiled[key] = step[key]
 
-        # 等待/切换窗口步骤：仅复制语义字段，无需定位
+        # 等待/切换窗口步骤：仅复制语义字段，无需定位（effect 恒 readonly）
         if step.get("action") == "wait":
             for key in ("duration", "window"):
                 if key in step:
                     compiled[key] = step[key]
+            compiled["effect"] = "readonly"
             return compiled
         if step.get("action") == "switch_window":
             for key in ("window", "hwnd"):
                 if key in step:
                     compiled[key] = step[key]
+            compiled["effect"] = "readonly"
             return compiled
 
         # 生成定位策略
@@ -265,7 +275,10 @@ class Compiler:
         action = step.get("action", "")
         text = (step.get("text", "") or "").lower()
         key = (step.get("key", "") or "").lower()
-        combined = f"{action} {text} {key}"
+        # 点击步骤的语义目标在 uia.name（如"删除所选内容"菜单项），
+        # 不并入会把破坏性点击误标为 mutating，绕过回放确认闸门
+        uia_name = str((step.get("uia") or {}).get("name", "") or "").lower()
+        combined = f"{action} {text} {key} {uia_name}"
         # 破坏性：含删除/清空/格式化等关键词
         for kw in self.DESTRUCTIVE_KEYWORDS:
             if kw in combined:

@@ -217,10 +217,17 @@ class Recorder:
         # lets diagnostics and later replays correlate actions with external
         # application logs without using the delayed append time.
         self._start_epoch = 0.0
+        # 截图敏感遮挡（frame_redactor）状态：文本层检出的原始值 cross-feed 到帧
+        self._known_secrets: set[str] = set()
+        self._frame_stats = {"frames": 0, "redacted": 0, "regions": 0, "withheld": 0}
+        self._ocr_status = "enabled"
 
     def start(self):
         self.steps = []
         self._shot_idx = 0
+        self._known_secrets = set()
+        self._frame_stats = {"frames": 0, "redacted": 0, "regions": 0, "withheld": 0}
+        self._ocr_status = "enabled"
         self._shot_threads = []
         self._stop_event.clear()
         self._last_fg_hwnd = 0
@@ -256,9 +263,14 @@ class Recorder:
                  self._pending_text, self._pending_scroll, self.hook._queue.qsize())
         # 冲刷未完成状态
         self._flush_pending()
-        # 等后台截图线程收尾
+        # 等后台截图线程收尾。截图落盘前要过 OCR 敏感遮挡（串行锁，
+        # 密集全屏约 1.8s/帧），连点积压时 3s 不够 -> 提到 8s 并在
+        # 超时（极罕见）时告警，保证 meta 审计计数与落盘一致。
+        deadline = time.time() + 8.0
         for t in self._shot_threads:
-            t.join(timeout=3.0)
+            t.join(timeout=max(0.1, deadline - time.time()))
+        if any(t.is_alive() for t in self._shot_threads):
+            log.warning("截图 OCR 队列未在 8s 内收尾，部分截图可能延迟落盘")
         # 保存
         path = self.output_dir / "events.json"
         with open(path, "w", encoding="utf-8") as f:
@@ -268,7 +280,13 @@ class Recorder:
             "stopped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "step_count": len(self.steps),
             "screenshot_count": self._shot_idx,
-            "privacy": {"text_masking": "enabled", "screenshot_ocr": "pending"},
+            "privacy": {
+                "text_masking": "enabled",
+                "screenshot_ocr": self._ocr_status,
+                "frames_redacted": self._frame_stats["redacted"],
+                "regions_blurred": self._frame_stats["regions"],
+                "frames_withheld": self._frame_stats["withheld"],
+            },
         })
         log.info("录制完成: %s, %d 步", path, len(self.steps))
         return str(path)
@@ -514,6 +532,9 @@ class Recorder:
                         step["sensitive"] = True
                         step["pii_kinds"] = sorted({m.kind for m in masked.matches})
                         log.info("检测到 PII(%s)，已掩码", step["pii_kinds"])
+                        # 原始值只留在内存，供截图 OCR 遮挡 cross-feed（不上屏、不落盘）
+                        if len(self._known_secrets) < 200:
+                            self._known_secrets.update(m.value for m in masked.matches)
         except Exception:
             log.exception("finalize_text 异常")
 
@@ -683,6 +704,7 @@ class Recorder:
                 shot_name_jpg = shot_name.replace(".png", ".jpg")
                 # JPEG 不支持 RGBA/透明通道，需先转换为 RGB
                 save_img = img.convert("RGB") if img.mode != "RGB" else img
+                save_img = self._redact_before_save(save_img)
                 save_img.save(str(shot_dir / shot_name_jpg), "JPEG", quality=70)
 
             t = threading.Thread(target=_shoot, daemon=True)
@@ -695,6 +717,35 @@ class Recorder:
         # append-only stream in clear text.
         self._append_event(step)
         return step
+
+    _ocr_lock = threading.Lock()  # 串行化截图 OCR（防连点导致多 tesseract 并发）
+
+    def _redact_before_save(self, img):
+        """落盘前对截图做敏感遮挡（gap 分析整改项：截图 OCR 遮挡）。
+
+        - known values：本会话文本层 mask_pii 检出的原始值 cross-feed 到帧
+        - OCR 引擎异常 -> withheld 计数（本地优先保留原图，审计里可见）
+        """
+        stats = self._frame_stats
+        stats["frames"] += 1
+        try:
+            from services.frame_redactor import redact_image
+            # 拿锁等待（截图线程本身在后台，排队不阻塞事件分类）
+            with self._ocr_lock:
+                img, audit = redact_image(img, known_values=self._known_secrets)
+        except Exception as exc:
+            log.warning("截图敏感遮挡不可用: %s", exc)
+            self._ocr_status = "unavailable"
+            return img
+        if audit.get("withheld"):
+            stats["withheld"] += 1
+            if self._ocr_status == "enabled":
+                self._ocr_status = "degraded"
+                log.warning("截图 OCR 失败（%s），该帧未验证即落盘", audit.get("error"))
+        if audit.get("redacted"):
+            stats["redacted"] += 1
+            stats["regions"] += audit.get("boxes", 0)
+        return img
 
     def _append_event(self, step):
         try:

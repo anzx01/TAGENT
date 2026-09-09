@@ -79,11 +79,16 @@ class ForegroundChannel:
         if not ok:
             return StepResult(False, "foreground_key_combo", reason)
         u32 = ctypes.windll.user32
+        # Win/右修饰键是扩展键：keybd_event 不带 KEYEVENTF_EXTENDEDKEY 时
+        # LWIN 会被系统丢弃，"win r" 组合实际只按下了 r（实测验证）
+        EXTENDED_VKS = {0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
         for vk in vks:
-            u32.keybd_event(vk, u32.MapVirtualKeyW(vk, 0), 0, 0)
+            flags = 0x0001 if vk in EXTENDED_VKS else 0
+            u32.keybd_event(vk, u32.MapVirtualKeyW(vk, 0), flags, 0)
             time.sleep(0.06)
         for vk in reversed(vks):
-            u32.keybd_event(vk, 0, 2, 0)
+            flags = 0x0003 if vk in EXTENDED_VKS else 2  # KEYUP(+EXTENDED)
+            u32.keybd_event(vk, 0, flags, 0)
             time.sleep(0.06)
         release_keys(RELEASE_MODIFIERS)
         time.sleep(0.8)

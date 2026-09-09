@@ -68,7 +68,7 @@ t = compile_steps(steps)
 segs = [s.get("segment") for s in t["steps"]]
 leads = [s.get("index") for s in t["steps"] if s.get("segment_lead")]
 assert len(set(segs)) == 2, f"应有两段: {segs}"
-assert leads == [0, 2], f"段首应为首个与第3步(switch 被过滤): {leads}"
+assert leads == [0, 3], f"段首应为首个与第4步(switch 本身不做段首): {leads}"
 assert t["segment_count"] == 2
 
 # 5. 冗余 switch_window 过滤不产生孤儿段

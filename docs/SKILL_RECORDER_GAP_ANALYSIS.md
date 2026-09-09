@@ -79,5 +79,26 @@ Skill Recorder 的 `evals/` 将描述器和 builder 分开评分，并使用固�
 
 - [x] 会话状态与心跳元数据：`python/recorder.py` 已在 start/stop 阶段原子更新 `meta.json`。
 - [x] 基础 Windows 诊断：新增 `python/doctor.py`，检查 Python、录制目录、Tesseract、Win32/UI 依赖及中断会话。
-- [ ] 录制前确认面板与截图 OCR 遮挡（下一轮 UI/图像处理改造）。
-- [ ] compiler/locator fixture 评测门槛（下一轮测试基线改造）。
+- [x] 截图 OCR 遮挡（2026-09-09）：重写 `python/services/frame_redactor.py`，对齐 skill-recorder 四层检测
+      （known values cross-feed / 凭证赋值右值 / 高熵 token 结构检测 / pii_guard 正则）+
+      OCR 预处理（3x 放大+灰度+对比度归一化）+ 词框映射（@ 粘合）+ 纯色不透明遮挡 + fail-closed 审计；
+      `recorder.py` 落盘前调用，meta.json 记录 `frames_redacted / regions_blurred / frames_withheld`。
+- [x] compiler/locator 评测门槛（2026-09-09）：新增 `python/tests/evals/compiler_eval.py`，
+      7 个合成场景跑真实 Compiler 管线，确定性 rubric 打分（pass 线 0.8，critical 一票否决），
+      任一场景失败 exit 1；已加入 `scripts/run_tests.sh`。
+- [x] task.json 版本化（2026-09-09）：新增 `python/services/task_versions.py`，
+      编译/合并/人工编辑产生 `versions/v{N}` 不可变快照（幂等，易变字段不触发新版本）+ manifest 指针 +
+      结构化 diff；`GET /tasks/{id}/versions` 与 `/versions/{n}/diff` 查询端点。
+- [ ] 录制前确认面板（下一轮 UI 改造；检测与审计层已就绪）。
+
+### 评测基线首轮即抓到并修复的缺陷（2026-09-09）
+
+1. `switch_window` 全丢弃：冗余过滤对比的 `prev_window` 已被段锚点无条件更新，
+   导致所有跨应用切换步骤被误判冗余——真实切换与回放激活链路断裂。已改为对比上一个已保留步骤的窗口。
+2. wait/switch 步骤缺 `effect` 标签：`_compile_step` 提前返回绕过分类器，已补 `readonly`。
+3. 破坏性点击误标 mutating：`_classify_effect` 未并入 `uia.name`（如"删除所选内容"），
+   导致删除类操作绕过回放确认闸门，已修复。
+
+### 已知未修复（记录待办）
+
+- 三击（段落选择）会被合并为一次 double_click，第三击被冗余过滤吞掉——回放保真度问题，待专门处理。

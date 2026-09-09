@@ -60,6 +60,12 @@ class TaskStore:
         task["source_hash"] = plan_source_hash(task)
         task_path = self.task_path(rec_id)
         self._atomic_json(task_path, task)
+        # 版本化快照：人工编辑（变量标注/会话标记等）产生新版本，便于审计与回滚
+        try:
+            from services.task_versions import TaskVersions
+            TaskVersions(root).snapshot(task, reason)
+        except Exception:
+            pass
         self._atomic_json(plan_path, plan)
         bundle_path = root / "bundle.json"
         bundle = {}

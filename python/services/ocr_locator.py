@@ -6,6 +6,7 @@ OCR 兜底定位模块（阶段1.1）
 """
 import ctypes
 import shutil
+import time
 from pathlib import Path
 
 from logger import get_logger
@@ -42,9 +43,35 @@ def is_available() -> bool:
     return _find_tesseract() is not None
 
 
+_LANG = None
+
+
+def best_lang() -> str:
+    """返回 OCR 语言组合：装了 chi_sim 则 chi_sim+eng（中文 UI 必需），否则 eng 降级。
+    探测结果缓存；未装中文包时 chi_sim+eng 会让 tesseract 直接抛错，不能硬编码。"""
+    global _LANG
+    if _LANG:
+        return _LANG
+    exe = _find_tesseract()
+    if exe:
+        chi = Path(exe).parent / "tessdata" / "chi_sim.traineddata"
+        _LANG = "chi_sim+eng" if chi.exists() else "eng"
+    else:
+        _LANG = "eng"
+    return _LANG
+
+
+import re as _re
+_PUNCT_RE = _re.compile(r"[^\w]+", _re.UNICODE)
+
+
 def _normalize(s):
-    """去空白+小写，用于文本比较（OCR 词间空格与目标文本空格不对应）"""
-    return "".join(s.split()).lower()
+    """文本比较归一化：NFKC(全角->半角) + 去空白与标点噪声 + 小写。
+
+    OCR 常把菜单图标读成前导引号（'”新建'）、竖线等符号，
+    剥掉非文字字符后短目标（如两字菜单项）才能精确命中。"""
+    import unicodedata
+    return _PUNCT_RE.sub("", unicodedata.normalize("NFKC", s)).lower()
 
 
 def find_text_on_screen(image, target_text):
@@ -61,8 +88,10 @@ def find_text_on_screen(image, target_text):
         # 获取图片尺寸用于坐标换算
         w, h = image.size
         # OCR 识别，返回带位置的数据
+        # --psm 6（单块文本）：截屏 UI 文本密集，自动分割(psm 3)对稀疏/混排行
+        # 召回差（实测中文行被读成 'k='），psm 6 稳定（skill-recorder 同款选择）
         data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT,
-                                         lang="chi_sim+eng")
+                                         lang=best_lang(), config="--psm 6")
         target_norm = _normalize(target_text)
         if not target_norm:
             return None
@@ -82,11 +111,31 @@ def find_text_on_screen(image, target_text):
                 lines[key] = {"words": [], "left": data["left"][i],
                               "top": data["top"][i], "width": 0, "height": data["height"][i]}
             entry = lines[key]
-            entry["words"].append(word)
+            entry["words"].append((data["left"][i], word))
             entry["width"] = max(entry["width"], data["left"][i] + data["width"][i] - entry["left"])
             entry["height"] = max(entry["height"], data["height"][i])
-        for key, entry in lines.items():
-            line_norm = _normalize(" ".join(entry["words"]))
+
+        # 中文菜单/图标文字常被 OCR 拆成 y 错位的相邻"行"（如"新"(98,342) +
+        # "建"(142,335)），按 y 接近度把同一视觉行合并，否则行匹配必失败；
+        # 词按 x 坐标排序拼接，避免错位行导致词序颠倒
+        merged = []
+        for entry in sorted(lines.values(), key=lambda e: (e["top"], e["left"])):
+            for m in merged:
+                same_row = abs((entry["top"] + entry["height"] / 2)
+                               - (m["top"] + m["height"] / 2)) \
+                    <= 0.6 * max(entry["height"], m["height"], 1)
+                adjacent = entry["left"] <= m["left"] + m["width"] + 40
+                if same_row and adjacent:
+                    m["words"].extend(entry["words"])
+                    m["width"] = max(m["width"],
+                                     entry["left"] + entry["width"] - m["left"])
+                    m["height"] = max(m["height"], entry["height"])
+                    break
+            else:
+                merged.append(dict(entry))
+
+        for entry in merged:
+            line_norm = _normalize(" ".join(w for _, w in sorted(entry["words"])))
             if not line_norm:
                 continue
             # 完整行匹配（最高优先）
@@ -137,12 +186,17 @@ def capture_and_find(target_text, hwnd=None):
             img = capture_window(hwnd)
         else:
             import mss
-            with mss.mss() as sct:
-                monitor = sct.monitors[1]
-                import mss.tools
-                shot = sct.grab(monitor)
-                from PIL import Image
-                img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+            from PIL import Image
+            img = None
+            # 菜单/弹窗刚出现时 DWM 合成中，BitBlt 会偶发失败 —— 重试
+            for _ in range(3):
+                try:
+                    with mss.mss() as sct:
+                        shot = sct.grab(sct.monitors[1])
+                    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                    break
+                except Exception:
+                    time.sleep(0.25)
         if img is None:
             return None
         return find_text_on_screen(img, target_text)

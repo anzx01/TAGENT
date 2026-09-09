@@ -27,6 +27,9 @@ UNIT_TESTS=(
     python/tests/test_discovery.py
     python/tests/test_merge_warning.py
     python/tests/test_pii_guard.py
+    python/tests/test_frame_redactor.py
+    python/tests/test_task_versions.py
+    python/tests/evals/compiler_eval.py
     python/tests/test_web_channel.py
     python/tests/test_replay_control.py
     python/tests/test_workspace_ui.py
