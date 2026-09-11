@@ -5,9 +5,15 @@ cd "$(dirname "$0")/.."
 
 PY=".venv/Scripts/python.exe"
 if [ ! -f "$PY" ] || ! "$PY" --version >/dev/null 2>&1; then
-    PY="$(command -v python || true)"
+    PY="$(command -v python.exe || command -v python || true)"
 fi
 if [ -z "$PY" ]; then
+    echo "[ERROR] Python 3.11+ was not found"
+    exit 1
+fi
+
+# Reject an interpreter older than the supported runtime.
+if ! "$PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
     echo "[ERROR] Python 3.11+ was not found"
     exit 1
 fi
@@ -32,11 +38,25 @@ UNIT_TESTS=(
     python/tests/evals/compiler_eval.py
     python/tests/test_web_channel.py
     python/tests/test_replay_control.py
+    python/tests/test_uitars_actions.py
+    python/tests/test_visual_agent.py
+    python/tests/test_outlook_fields.py
+    python/tests/test_outlook_input.py
+    python/tests/test_outlook_verify.py
     python/tests/test_workspace_ui.py
 )
 
 for f in "${UNIT_TESTS[@]}"; do
     echo "== $f =="
-    "$PY" "$f" 2>&1 | tail -n 2
+    # Preserve the test process exit code while keeping output concise.
+    set +e
+    output=$("$PY" "$f" 2>&1)
+    status=$?
+    printf '%s\n' "$output" | tail -n 2
+    set -e
+    if [ "$status" -ne 0 ]; then
+        echo "[ERROR] $f failed (exit $status)"
+        exit "$status"
+    fi
 done
 echo "全部单元测试通过"

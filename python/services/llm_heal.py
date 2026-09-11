@@ -43,13 +43,22 @@ class LLMHealer:
     def get_config(self) -> dict:
         return self._config
 
+    def plan_visual(self, goal: str, image_bytes: bytes) -> dict | None:
+        """Ask an OpenAI-compatible vision model for a structured next action."""
+        if not self.enabled:
+            return None
+        import base64
+        payload = {"model": self._config.get("model", "gpt-4o-mini"), "temperature": 0.1,
+                   "max_tokens": 500, "messages": [{"role": "system", "content": "Return JSON only with action, target, x, y, text, expected."},
+                   {"role": "user", "content": [{"type": "text", "text": goal}, {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(image_bytes).decode()}}]}]}
+        req = urllib.request.Request(self._config["api_base"].rstrip("/") + "/chat/completions", method="POST", headers={"Content-Type":"application/json", "Authorization":"Bearer " + self._config["api_key"]}, data=json.dumps(payload).encode())
+        try:
+            content = json.loads(urllib.request.urlopen(req, timeout=20).read())["choices"][0]["message"]["content"]
+            if "```" in content: content = content.split("```", 2)[1].removeprefix("json").strip()
+            return json.loads(content)
+        except Exception as exc:
+            log.warning("视觉规划失败: %s", exc); return None
     def heal(self, failed_step: dict, context: list, error: str = "") -> dict | None:
-        """向 LLM 请求纠正建议。
-        failed_step: 失败的步骤
-        context: 前几步作为上下文
-        error: 失败原因
-        返回: {action, text/key, ...} 纠正步骤，或 None
-        """
         if not self.enabled:
             return None
         api_base = self._config["api_base"].rstrip("/")

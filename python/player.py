@@ -530,6 +530,17 @@ class Player:
             context = self.steps[max(0, idx-2):idx]
             log.info("  尝试 LLM 自愈 (步骤 %d)...", idx)
             result = healer.heal(failed_step, context, error)
+            try:
+                from services.computer_use_adapter import ComputerUseAdapter
+                from paths import BASE_DIR
+                evidence = BASE_DIR / "runs" / "screenshots" / "llm" / f"step_{idx:04d}.png"
+                observed = ComputerUseAdapter().observe(evidence)
+                visual = ComputerUseAdapter().plan(
+                    f"Analyze the current screen and suggest the next safe action for this failed step: {failed_step}. Error: {error}", evidence)
+                if visual:
+                    result = {**(result or {}), "visual_plan": visual, "evidence": observed}
+            except Exception as visual_error:
+                log.debug("visual planning unavailable: %s", visual_error)
             if result and isinstance(result, dict):
                 log.info("  LLM 自愈建议: %s", result.get("action", "?"))
                 self._agent_suggestions.append({
@@ -1561,11 +1572,7 @@ def _desktop_window_at(x, y, allow_menu=False):
     try:
         hwnd = win32gui.WindowFromPoint((int(x), int(y)))
         if not hwnd:
-            # Some DPI-virtualized shells return a null WindowFromPoint while
-            # the visible Progman window still owns the desktop surface.
-            shell = win32gui.FindWindow("Progman", "Program Manager")
-            if shell and win32gui.IsWindowVisible(shell):
-                return True
+            return False
             shell = ctypes.windll.user32.GetShellWindow()
             return bool(shell and win32gui.IsWindowVisible(shell))
         classes = set()

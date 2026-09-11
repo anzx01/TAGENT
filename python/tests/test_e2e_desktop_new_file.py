@@ -82,6 +82,43 @@ def foreground():
     return win32gui.GetWindowText(win32gui.GetForegroundWindow())
 
 
+_server_proc = None
+
+
+def ensure_server():
+    """服务端探活；不在运行则拉起子进程（本环境后台 web_server 常被回收）"""
+    global _server_proc
+    try:
+        get(API + "/status")
+        print("服务端已在运行，复用")
+        return
+    except Exception:
+        pass
+    _server_proc = subprocess.Popen(
+        [sys.executable, "server.py"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(60):
+        time.sleep(0.5)
+        try:
+            get(API + "/status")
+            print("已拉起服务端 pid=", _server_proc.pid)
+            return
+        except Exception:
+            continue
+    raise SystemExit("服务端 60s 未就绪")
+
+
+def shutdown_server():
+    if _server_proc is not None:
+        try:
+            post(API + "/shutdown")
+        except Exception:
+            pass
+        _server_proc.wait(timeout=10)
+        print("已关闭拉起的服务端")
+
+
 def wait_foreground(substr, timeout=8.0):
     subs = substr if isinstance(substr, tuple) else (substr,)
     deadline = time.time() + timeout
@@ -102,23 +139,91 @@ def get(url):
     return json.loads(urllib.request.urlopen(url, timeout=10).read())
 
 
+def close_system_dialogs():
+    """关掉挂在前台的系统级模态框（如 Alt+F4 误触桌面的「关闭 Windows」），
+    否则它们会一直占住前台，后续任何置前/键入全部失效"""
+    import win32con
+    import win32gui
+    targets = []
+
+    def cb(h, _):
+        if win32gui.IsWindowVisible(h):
+            t = win32gui.GetWindowText(h)
+            c = win32gui.GetClassName(h)
+            if c == "#32770" and any(k in t for k in
+                                      ("关闭 Windows", "Closing Windows", "关闭这些应用")):
+                targets.append((h, t))
+                win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+
+    win32gui.EnumWindows(cb, None)
+    if targets:
+        time.sleep(0.8)
+        print("已关闭系统对话框:", [t for _, t in targets])
+
+
+def force_foreground(hwnd):
+    """强制窗口到前台（AttachThreadInput + ALT trick，与 player._force_foreground 同款）"""
+    import win32gui
+    import win32process
+    fg = win32gui.GetForegroundWindow()
+    if fg == hwnd:
+        return True
+    _, fg_tid = win32process.GetWindowThreadProcessId(fg)
+    _, tid = win32process.GetWindowThreadProcessId(hwnd)
+    key(0x12)
+    key(0x12, KEYEVENTF_KEYUP)                     # ALT trick
+    attached = fg_tid != tid
+    if attached:
+        u32.AttachThreadInput(fg_tid, tid, True)
+    try:
+        u32.ShowWindow(hwnd, 9)
+        u32.BringWindowToTop(hwnd)
+        u32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            u32.AttachThreadInput(fg_tid, tid, False)
+    time.sleep(0.5)
+    return win32gui.GetForegroundWindow() == hwnd
+
+
+def clear_notepad_session():
+    """删除 Win11 记事本会话恢复数据（TabState/WindowState）。
+    会话恢复到指向不存在文件的标签时会卡死活动标签，Ctrl+N 全部被吞
+    （实测），清掉会话可保证每次启动都是干净的「无标题 - Notepad」。"""
+    import shutil
+    base = Path(r"C:\Users\Administrator\AppData\Local\Packages"
+                r"\Microsoft.WindowsNotepad_8wekyb3d8bbwe\LocalState")
+    for sub in ("TabState", "WindowState"):
+        shutil.rmtree(base / sub, ignore_errors=True)
+
+
 def launch_notepad():
+    close_system_dialogs()
     subprocess.run(["taskkill", "/IM", "notepad.exe", "/F"], capture_output=True)
     time.sleep(1.0)
+    clear_notepad_session()
     subprocess.Popen(["notepad"])
-    assert wait_foreground("Notepad"), f"Notepad 未启动，前台={foreground()!r}"
-    time.sleep(1.5)
+    if not wait_foreground("Notepad", timeout=8.0):
+        # 新进程偶发不抢前台：按类名找 Notepad 窗口强制置前再继续
+        h = u32.FindWindowW("Notepad", None)
+        if not h or not force_foreground(h):
+            raise AssertionError(f"Notepad 无法置前，前台={foreground()!r}")
+    time.sleep(1.0)
+
+
+def align_untitled(retries=5):
+    """确保 Notepad 活动标签为「无标题」，失败 fail-fast"""
+    for _ in range(retries):
+        if "无标题" in foreground() or "Untitled" in foreground():
+            return
+        combo(0x11, 0x4E, tail=1.2)
+        time.sleep(0.5)
+    raise AssertionError(f"无法对齐无标题标签，前台={foreground()!r}")
 
 
 def demo_actions():
     """演示操作（录制期间执行）；回放走产品通道复现同一序列"""
-    for _ in range(3):                                # 会话恢复标签可能抢占，重试
-        combo(0x11, 0x4E, tail=1.2)                   # Ctrl+N 无标题新标签
-        if "无标题" in foreground() or "Untitled" in foreground():
-            break
-        time.sleep(0.5)
-    else:
-        raise AssertionError(f"Ctrl+N 未切到无标题标签，前台={foreground()!r}")
+    align_untitled()                                   # 会话恢复标签会抢占，验证+重试
     combo(0x11, 0x41, tail=0.3)                       # Ctrl+A 清会话残留
     type_digits("123")                                # 内容 123（数字 IME 免疫）
     time.sleep(0.6)
@@ -134,7 +239,7 @@ def demo_actions():
 
 
 print("=== E2E: 桌面新建文本文档写入 123 ===")
-assert get(API + "/status") is not None, "服务端不可用"
+ensure_server()
 TARGET.unlink(missing_ok=True)
 
 # ---------- 1. 录制 ----------
@@ -171,16 +276,13 @@ assert content.strip() == "123", f"录制内容不是 123: {content!r}"
 print("录制产物 OK:", TARGET, "内容 =", content.strip())
 
 # ---------- 3. 删除文件，回放复现 ----------
-TARGET.unlink()
+# 先重启并对齐、最后才删文件：若先删，会话恢复会恢复指向不存在文件的
+# 123.txt 标签，恢复流程卡住活动标签，之后 Ctrl+N 全部被吞（实测）
 launch_notepad()
-# 对齐回放环境：录制的 key_press 锚定「无标题 - Notepad」窗口，
-# 会话恢复的标签标题不同会导致 no_window 暂停，先 Ctrl+N 对齐
-for _ in range(3):
-    combo(0x11, 0x4E, tail=1.2)
-    if "无标题" in foreground() or "Untitled" in foreground():
-        break
-    time.sleep(0.5)
+align_untitled()
+TARGET.unlink()
 set_clip(str(TARGET))                                # 回放环境：预置剪贴板=路径
+align_untitled()                                     # 二次验证：防 set_clip 期间被抢占
 print("已删除 123.txt、重开 Notepad 对齐无标题标签、预置剪贴板，开始回放...")
 
 post(API + "/replay/start", json.dumps({"recording_id": rec_id}).encode())
@@ -200,14 +302,14 @@ for _ in range(150):
     if not state.get("playing"):
         break
 print("回放状态:", state.get("state"), "| 暂停原因:", state.get("pause_reason"))
-runs_dir = rec_dir / "runs"
-if runs_dir.exists():
-    reports = sorted(runs_dir.glob("*.json"))
-    if reports:
-        report = json.loads(reports[-1].read_text(encoding="utf-8"))
-        for st in report.get("steps", []):
-            print("  ", st.get("action"), st.get("text", st.get("key", "")),
-                  "->", st.get("status"))
+# REPORT 落盘在 BASE_DIR/runs（文件名 *_<rec_id>.json），不在录制目录下
+runs_dir = Path(r"D:\aiapp\TAGENT\runs")
+reports = sorted(runs_dir.glob(f"*_{rec_id}.json")) if runs_dir.exists() else []
+if reports:
+    report = json.loads(reports[-1].read_text(encoding="utf-8"))
+    for st in report.get("steps", []):
+        print("  ", st.get("action"), st.get("text", st.get("key", "")),
+              "->", st.get("status"), st.get("method", ""))
 
 ok = TARGET.exists() and TARGET.read_text(encoding="utf-8").strip() == "123"
 content2 = TARGET.read_text(encoding="utf-8").strip() if TARGET.exists() else None
@@ -215,14 +317,12 @@ print("复现结果:", "PASS" if ok else "FAIL",
       f"(存在={TARGET.exists()}, 内容={content2!r})")
 
 # ---------- 4. 清理 ----------
-try:
-    combo(0x12, 0x73)
-except Exception:
-    pass
+subprocess.run(["taskkill", "/IM", "notepad.exe", "/F"], capture_output=True)
 if TARGET.exists():
     TARGET.unlink()
 if ok and rec_dir.exists():
     import shutil
     shutil.rmtree(rec_dir, ignore_errors=True)
+shutdown_server()
 print("=== E2E 结束:", "PASS" if ok else "FAIL", "===")
 sys.exit(0 if ok else 1)

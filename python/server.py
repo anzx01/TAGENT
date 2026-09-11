@@ -198,20 +198,41 @@ def _check_window_dependencies(rec_dir) -> list[str]:
     return missing
 
 
-def _attach_input_desktop() -> bool:
-    """Run desktop injection on the user's active Windows desktop.
+def _desktop_name(desktop) -> str:
+    """取桌面对象名（UOI_NAME），用于判断两个桌面句柄是否同一桌面"""
+    try:
+        user32 = ctypes.windll.user32
+        buf = ctypes.create_unicode_buffer(256)
+        if desktop and user32.GetUserObjectInformationW(
+                desktop, 2, buf, 512, None):  # UOI_NAME
+            return buf.value
+    except Exception:
+        pass
+    return ""
 
-    Tauri normally starts the backend on the same desktop. A sidecar launched
-    from a service/sandbox can inherit an isolated desktop instead; switching
-    only the fresh replay worker allows Win32/UIA input to reach the active
-    shell without moving the HTTP server itself.
+
+def _attach_input_desktop() -> bool:
+    """确保回放线程能访问用户的活跃桌面。
+
+    注意：SetThreadDesktop 会重置线程的桌面输入状态，切换成功后
+    keybd_event/SendInput 等真实注入会静默失效（实测：ctrl+s 弹不出
+    另存为、ALT trick 失效导致前台切换失败）。因此只在当前线程确实
+    不在输入桌面（服务/沙箱启动的罕见部署）时才切换；普通 sidecar
+    与用户同桌面时直接短路返回，保住注入能力。
     """
     try:
         user32 = ctypes.windll.user32
-        desktop = user32.OpenInputDesktop(0, False, 0x0100)
-        if not desktop:
+        input_desk = user32.OpenInputDesktop(0, False, 0x0100)
+        if not input_desk:
             return False
-        return bool(user32.SetThreadDesktop(desktop))
+        try:
+            cur = user32.GetThreadDesktop(user32.GetCurrentThreadId())
+            if _desktop_name(cur) and \
+                    _desktop_name(cur) == _desktop_name(input_desk):
+                return True  # 已在输入桌面，切换反而会杀死键盘注入
+            return bool(user32.SetThreadDesktop(input_desk))
+        finally:
+            user32.CloseDesktop(input_desk)
     except Exception:
         return False
 
@@ -1091,5 +1112,37 @@ if __name__ == "__main__":
         h = get_healer()
         h.set_config(body)
         return {"ok": True, "enabled": h.enabled}
+
+    # 视觉智能接管（架构借鉴 mano-skill MIT-0：模型决策 + 本地执行，
+    # 模型端点用户可配，见 services/visual_agent.py）
+    @app.get("/visual/status")
+    def visual_status():
+        from services.visual_agent import get_visual_agent
+        va = get_visual_agent()
+        return {"ok": True, "running": va.running, "state": va.state,
+                "configured": va.configured()}
+
+    @app.post("/visual/run")
+    def visual_run(body: dict):
+        from services.visual_agent import get_visual_agent
+        task = str(body.get("task", "")).strip()
+        if not task:
+            return JSONResponse({"ok": False, "error": "task 不能为空"}, 400)
+        max_steps = body.get("max_steps") or 30
+        va = get_visual_agent()
+        if not va.configured():
+            return JSONResponse({"ok": False,
+                                 "error": "视觉模型未配置（api_base/api_key）"}, 400)
+        if va.running:
+            return JSONResponse({"ok": False, "error": "已有视觉任务在运行"}, 409)
+        va.start(task, max_steps=int(max_steps))
+        return {"ok": True, "running": True}
+
+    @app.post("/visual/stop")
+    def visual_stop():
+        from services.visual_agent import get_visual_agent
+        va = get_visual_agent()
+        va.stop()
+        return {"ok": True}
 
     uvicorn.run(app, host="127.0.0.1", port=18899)

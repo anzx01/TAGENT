@@ -8,6 +8,7 @@ import shutil
 import sys
 import argparse
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from paths import BASE_DIR
@@ -28,7 +29,13 @@ def check() -> dict:
             try:
                 data = json.loads(meta.read_text(encoding="utf-8"))
                 if data.get("state") in {"recording", "stopping", "analyzing"}:
-                    interrupted.append(meta.parent.name)
+                    heartbeat = data.get("heartbeat") or data.get("started_at")
+                    try:
+                        age = (datetime.now(timezone.utc) - datetime.fromisoformat(heartbeat).astimezone(timezone.utc)).total_seconds()
+                    except (TypeError, ValueError):
+                        age = 0
+                    if age < 3600:
+                        interrupted.append(meta.parent.name)
             except (OSError, ValueError):
                 pass
     checks["interrupted_sessions"] = {"ok": not interrupted, "value": interrupted}

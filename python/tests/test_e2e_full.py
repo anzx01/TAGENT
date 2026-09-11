@@ -8,7 +8,8 @@ import zipfile, os
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 XLSX = os.path.join(BASE, "..", "..", "recordings", "_wps_test.xlsx")
-ET = r"D:\Users\DELL\AppData\Local\Kingsoft\WPS Office\12.1.0.28043\office6\et.exe"
+import glob
+ET = next(iter(glob.glob(os.path.join(os.environ.get("LOCALAPPDATA", ""), "Kingsoft", "WPS Office", "*", "office6", "et.exe"))), "")
 FX = (1030, 426)
 
 def post(url, data=b'{}'):

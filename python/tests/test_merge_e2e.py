@@ -15,7 +15,8 @@ import zipfile
 import win32gui
 
 API = "http://127.0.0.1:18899"
-ET = r"D:\Users\DELL\AppData\Local\Kingsoft\WPS Office\12.1.0.28043\office6\et.exe"
+import glob
+ET = next(iter(glob.glob(os.path.join(os.environ.get("LOCALAPPDATA", ""), "Kingsoft", "WPS Office", "*", "office6", "et.exe"))), "")
 XLSX = r"D:\aiapp\TAGENT\recordings\_wps_test.xlsx"
 u32 = ctypes.windll.user32
 FX = (1030, 426)  # WPS 公式栏

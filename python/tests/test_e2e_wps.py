@@ -3,6 +3,7 @@ import ctypes
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.request
 import win32gui
@@ -10,7 +11,12 @@ import win32clipboard
 import uiautomation as ua
 
 API = "http://127.0.0.1:18899"
-ET = r"D:\Users\DELL\AppData\Local\Kingsoft\WPS Office\12.1.0.28043\office6\et.exe"
+_wps_roots = [os.environ.get("LOCALAPPDATA", ""), r"C:\Program Files", r"C:\Program Files (x86)"]
+_et_candidates = []
+for _root in _wps_roots:
+    if _root and os.path.isdir(_root):
+        _et_candidates.extend(__import__('glob').glob(os.path.join(_root, "Kingsoft", "WPS Office", "*", "office6", "et.exe")))
+ET = _et_candidates[-1] if _et_candidates else ""
 XLSX = r"D:\aiapp\TAGENT\recordings\_wps_test.xlsx"
 u32 = ctypes.windll.user32
 
@@ -82,7 +88,7 @@ def close_recover_banner(hwnd):
 
 print("=== 阶段5.3 WPS 表格 xlsx E2E ===")
 post(API + "/record/stop")
-subprocess.run([r"D:\aiapp\TAGENT\.venv\Scripts\python.exe",
+subprocess.run([sys.executable,
                 r"D:\aiapp\TAGENT\python\tests\make_xlsx.py"], check=True)
 
 subprocess.Popen([ET, XLSX])
