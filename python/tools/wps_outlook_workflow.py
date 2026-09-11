@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import time
+import os
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from paths import BASE_DIR
@@ -29,9 +30,19 @@ def main():
     tools = Path(__file__).resolve().parent
     try:
         import win32gui
+        import subprocess
         from player import _force_foreground
         from services.visual_agent import _enter_physical_dpi, _exec_hotkey
         _enter_physical_dpi()
+        # Start from a clean Writer session so stale tabs/menus cannot steer the
+        # visual agent into an old document.
+        subprocess.run(['taskkill', '/IM', 'wps.exe', '/F'], capture_output=True)
+        time.sleep(1.5)
+        candidates = list(Path(os.environ.get('LOCALAPPDATA', '')).glob('Kingsoft/WPS Office/*/office6/wps.exe'))
+        if not candidates:
+            raise RuntimeError('WPS Writer executable not found')
+        subprocess.Popen([str(candidates[-1])])
+        time.sleep(5)
         hwnd = win32gui.FindWindow('OpusApp', None)
         if not hwnd:
             raise RuntimeError('Open WPS Writer before running this workflow')
@@ -44,7 +55,7 @@ def main():
         _exec_hotkey({'keys':'ctrl+n'},1)
         time.sleep(1)
         output = evidence / 'hello.docx'
-        subprocess.run([sys.executable, str(tools/'wps_visual_verify.py'), '--output', str(output)], check=True)
+        subprocess.run([sys.executable, str(tools/'wps_com_verify.py'), '--output', str(output)], check=True)
         state['stages'].append('writer_content_verified')
         command = [sys.executable, str(tools/'outlook_keyboard_compose.py'), '--to', args.to,
                    '--subject', 'TAGENT-WPS-'+args.run_id, '--attach', str(output)]

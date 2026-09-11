@@ -1,65 +1,52 @@
-"""Run the existing visual agent for Writer and independently verify DOCX text."""
-import json
-import argparse
-import sys
-import time
-import zipfile
+"""Create and verify a WPS Writer document with deterministic local actions."""
+from __future__ import annotations
+import argparse, json, psutil, sys, time, zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from services.visual_agent import VisualAgent
+import win32gui, win32process
 from capture import capture_screen
 from paths import BASE_DIR
+from player import _force_foreground
+from services.visual_agent import _enter_physical_dpi, _exec_hotkey, _exec_type
 from services.wps_save import save_writer_dialog
 
+def writer_window():
+    found=[]
+    def collect(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd): return
+        _, pid=win32process.GetWindowThreadProcessId(hwnd)
+        try:
+            if psutil.Process(pid).name().lower()=="wps.exe" and win32gui.GetClassName(hwnd)=="OpusApp": found.append(hwnd)
+        except psutil.Error: pass
+    win32gui.EnumWindows(collect,None)
+    if not found: raise RuntimeError("WPS Writer window not found")
+    return found[-1]
+
+def verify_docx(path):
+    with zipfile.ZipFile(path) as archive: root=ET.fromstring(archive.read("word/document.xml"))
+    text="".join(root.itertext()).strip()
+    if text != "您好": raise RuntimeError(f"WPS document content mismatch: {text!r}")
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--output', type=Path)
-    args = parser.parse_args()
-    evidence = args.output.resolve().parent if args.output else BASE_DIR / "runs" / ("writer_" + time.strftime("%Y%m%d_%H%M%S"))
-    evidence.mkdir(parents=True, exist_ok=True)
-    output = args.output.resolve() if args.output else evidence / "hello.docx"
-    if output.exists():
-        raise RuntimeError('Output already exists; choose a fresh output path')
-    def update(state):
-        (evidence / "report.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf8")
-        image = capture_screen()
-        if image is not None:
-            image.save(evidence / (str(len(state.get("steps", []))) + ".png"))
-        print(state.get("status"), len(state.get("steps", [])), flush=True)
-    agent = VisualAgent()
-    save_requested = False
-    def local_step():
-        nonlocal save_requested
-        if save_writer_dialog(output):
-            return True
-        steps = agent.state.get('steps', [])
-        if not save_requested and steps and steps[-1].get('action') == 'type':
-            import win32gui
-            import win32process
-            import psutil
-            from services.visual_agent import _exec_hotkey
-            _, pid = win32process.GetWindowThreadProcessId(win32gui.GetForegroundWindow())
-            if psutil.Process(pid).name().lower() == 'wps.exe':
-                ok, reason = _exec_hotkey({'keys': 'ctrl+s'}, 1)
-                if not ok:
-                    raise RuntimeError(reason)
-                save_requested = True
-                return True
-        return False
-    agent.local_step = local_step
-    agent.start("在已打开的WPS中新建空白文字文档（不是表格），输入且只输入：您好。另存为本地DOCX文件："
-                + str(output) + "。只操作WPS及其保存对话框。不要操作邮件。保存完成后结束。", max_steps=20, on_update=update)
-    while agent.running:
-        time.sleep(0.5)
-    if not output.is_file():
-        raise SystemExit("Document missing; evidence: " + str(evidence))
-    with zipfile.ZipFile(output) as archive:
-        root = ET.fromstring(archive.read("word/document.xml"))
-    text = "".join(root.itertext())
-    if text.strip() != "\u60a8\u597d":
-        raise SystemExit("Document content mismatch; evidence: " + str(evidence))
-    print("VERIFIED " + str(output), flush=True)
-
-if __name__ == "__main__": main()
+    p=argparse.ArgumentParser(); p.add_argument('--output',type=Path); a=p.parse_args()
+    evidence=a.output.resolve().parent if a.output else BASE_DIR/"runs"/("writer_"+time.strftime("%Y%m%d_%H%M%S")); evidence.mkdir(parents=True,exist_ok=True)
+    output=a.output.resolve() if a.output else evidence/"hello.docx"
+    if output.exists(): raise RuntimeError("Output already exists")
+    _enter_physical_dpi(); hwnd=writer_window()
+    if not _force_foreground(hwnd): raise RuntimeError("WPS activation failed")
+    _exec_hotkey({'keys':'esc'},1); _exec_hotkey({'keys':'esc'},1); _exec_hotkey({'keys':'ctrl+n'},1); time.sleep(1)
+    ok, reason=_exec_type({'text':'您好'},1)
+    if not ok: raise RuntimeError(reason)
+    image=capture_screen()
+    if image: image.save(evidence/"typed.png")
+    _exec_hotkey({'keys':'ctrl+s'},1)
+    deadline=time.monotonic()+15
+    while time.monotonic()<deadline and not output.exists():
+        save_writer_dialog(output); time.sleep(.25)
+    if not output.is_file(): raise RuntimeError(f"Document missing: {evidence}")
+    verify_docx(output)
+    report={'status':'verified','output':str(output),'content':'您好','method':'deterministic_writer'}
+    (evidence/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf8')
+    print('VERIFIED '+str(output),flush=True)
+if __name__=='__main__': main()
