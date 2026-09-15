@@ -222,14 +222,20 @@ def _attach_input_desktop() -> bool:
     """
     try:
         user32 = ctypes.windll.user32
-        input_desk = user32.OpenInputDesktop(0, False, 0x0100)
+        kernel32 = ctypes.windll.kernel32
+        cur = user32.GetThreadDesktop(kernel32.GetCurrentThreadId())
+        cur_name = _desktop_name(cur)
+        input_desk = user32.OpenInputDesktop(0, False, 0x0101)  # SWITCHDESKTOP|READOBJECTS
         if not input_desk:
-            return False
+            # 打不开输入桌面句柄：若当前线程已在普通交互桌面（Default），
+            # 实际上具备注入能力，按已绑定处理，避免误报告警
+            return cur_name.strip().lower() == "default"
         try:
-            cur = user32.GetThreadDesktop(user32.GetCurrentThreadId())
-            if _desktop_name(cur) and \
-                    _desktop_name(cur) == _desktop_name(input_desk):
+            in_name = _desktop_name(input_desk)
+            if cur_name and in_name and cur_name == in_name:
                 return True  # 已在输入桌面，切换反而会杀死键盘注入
+            if not in_name and cur_name.strip().lower() == "default":
+                return True  # 拿不到输入桌面名（权限受限），按同名处理
             return bool(user32.SetThreadDesktop(input_desk))
         finally:
             user32.CloseDesktop(input_desk)

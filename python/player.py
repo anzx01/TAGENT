@@ -188,7 +188,7 @@ class Player:
             # 阶段3.1：定位失败 -> 重试 -> 尝试纠错库 -> 尝试 LLM -> 暂停
             locator_failed = False
             step_already_executed = False
-            if step.get("action") in ("click", "right_click") and step.get("locator"):
+            if step.get("action") in ("click", "double_click", "right_click") and step.get("locator"):
                 if not self._check_locator_retry(step):
                     locator_failed = True
                     if self._try_correction(i):
@@ -409,13 +409,32 @@ class Player:
 
     def _verify_step(self, step):
         """移植：回放后验证目标仍存在（诊断性，不阻断）。
+        点击类动作会自然消耗目标（菜单项点击后菜单关闭、关闭按钮点击后
+        窗口销毁），目标消失是动作生效的正常表现，不算告警；只有非点击
+        动作（如 input_text）目标消失才值得警告。
+        uia 校验直接查控件存在性，不走带偏移/尺寸守卫的定位链——那些
+        守卫是为"把点击落到正确坐标"设计的，用在存在性校验上会在窗口
+        位置变化时误报。
         返回 True=验证通过 / False=warn / None=无可验证目标"""
         locs = step.get("locator", [])
         raw = (step.get("screen_x"), step.get("screen_y"))
         for loc in locs:
-            if loc.get("type") in ("uia", "ocr") and loc.get("name"):
+            if loc.get("type") == "uia" and loc.get("name"):
+                from services.input.engine import _timed_call
+                try:
+                    ctrl = _timed_call(lambda: self._find_uia_ctrl(loc), timeout=2.0)
+                except Exception:
+                    ctrl = None
+                if ctrl is not None:
+                    return True
+                if step.get("action") in ("click", "double_click", "right_click"):
+                    return None  # 目标被点击消耗，属正常
+                return False
+            if loc.get("type") == "ocr" and loc.get("name"):
                 x, y = self._try_locator(loc, raw)
                 if x is None:
+                    if step.get("action") in ("click", "double_click", "right_click"):
+                        return None
                     return False
                 return True
         return None
@@ -696,25 +715,49 @@ class Player:
             log.debug("OCR 定位失败: %s", e)
             return None, None
 
+    # 虚拟桌面/壳层容器的类名：这些"父窗口"包含整个桌面，作为搜索根等于全桌面捞针
+    _PSEUDO_HOST_CLASSES = {"#32769"}
+
     def _find_top_window(self, ua, loc):
-        """按父窗口链定位顶级窗口。
-        parents 链存在时找不到目标窗口就返回 None（绝不 fallback 前台窗口乱搜，
-        避免录制时后台窗口的同名控件被误命中）；只有完全没有 parents 信息才用前台窗口。"""
+        """按父窗口链解析候选顶级窗口根，返回控件列表（最内层真实窗口优先）。
+
+        parents 链存在时找不到目标窗口就返回空列表（绝不 fallback 前台窗口乱搜，
+        避免录制时后台窗口的同名控件被误命中）；只有完全没有 parents 信息才用
+        前台窗口。注意两点：
+
+        1. 链尾可能是"桌面 1"(#32769) 这类虚拟桌面容器，必须跳过；
+        2. 弹出层控件（XAML 菜单/标题栏按钮）住 在独立的弹出窗口里，
+           不在主窗口树下——所以要按 内层→外层 逐个窗口尝试，
+           而不是只取最外层那一个根。
+        """
         parents = loc.get("parents", [])
+        roots = []
         if parents:
-            for p in reversed(parents):
+            for p in parents:  # 原始顺序 = 最内层优先
                 p_name = p.get("name", "").strip()
                 p_class = p.get("class", "").strip()
+                if p_class in self._PSEUDO_HOST_CLASSES:
+                    continue
+                if p_name.startswith("桌面 ") and p_class == "":
+                    continue
                 hwnd = None
+                by_name = False
                 if p_name:
                     hwnd = _find_window_by_title(p_name)
+                    by_name = hwnd is not None
                 if hwnd is None and p_class:
                     hwnd = win32gui.FindWindow(p_class, None)
                 if hwnd:
-                    return ua.ControlFromHandle(hwnd)
-            return None
+                    ctrl = ua.ControlFromHandle(hwnd)
+                    if ctrl is not None:
+                        roots.append((by_name, ctrl))
+            # 按标题解析的窗口无歧义，优先搜索；仅类名解析的窗口可能命中
+            # 其它应用的同类 XAML 岛，放后面，避免在错误根上耗尽定位超时
+            roots.sort(key=lambda pair: 0 if pair[0] else 1, reverse=False)
+            return [ctrl for _, ctrl in roots]
         fg = win32gui.GetForegroundWindow()
-        return ua.ControlFromHandle(fg)
+        ctrl = ua.ControlFromHandle(fg)
+        return [ctrl] if ctrl is not None else []
 
     def _find_uia_ctrl(self, loc):
         """按 uia locator 找到控件对象（pattern 操作前先取控件），失败返回 None"""
@@ -731,28 +774,40 @@ class Player:
                 if not isinstance(ctrl_type, int):
                     ctrl_type = _control_type_by_name(target_type)
 
-            # 组合搜索（AutomationId 最可靠，优先单独查；其余组合查）
+            # 组合搜索：最严格的全属性组合优先，其次名称+类型，最后自动化ID/类名单独查
             candidates = []
+            strict = {}
+            if ctrl_type is not None:
+                strict["ControlType"] = ctrl_type
+            if target_name:
+                strict["Name"] = target_name
+            if target_class:
+                strict["ClassName"] = target_class
             if target_auto_id:
-                candidates.append((dict(AutomationId=target_auto_id), True))
+                strict["AutomationId"] = target_auto_id
+            if len(strict) >= 2:
+                candidates.append(strict)
             kw = {}
             if ctrl_type is not None:
                 kw["ControlType"] = ctrl_type
             if target_name:
                 kw["Name"] = target_name
             if kw:
-                candidates.append((kw, False))
-            if target_class and target_auto_id:
-                candidates.append((dict(ClassName=target_class), False))
+                candidates.append(kw)
+            if target_auto_id:
+                candidates.append(dict(AutomationId=target_auto_id))
+            if target_class:
+                candidates.append(dict(ClassName=target_class))
 
-            window = self._find_top_window(ua, loc)
-            if window is None:
+            windows = self._find_top_window(ua, loc)
+            if not windows:
                 return None
 
-            for kw, _ in candidates:
-                ctrl = window.Control(**kw, searchDepth=32)
-                if ctrl.Exists(0.5):
-                    return ctrl
+            for window in windows:
+                for kw in candidates:
+                    ctrl = window.Control(**kw, searchDepth=32)
+                    if ctrl.Exists(0.5):
+                        return ctrl
 
             # 兄弟索引兜底（父控件下按索引取）
             if "sibling_index" in loc and loc.get("parents"):
@@ -768,21 +823,40 @@ class Player:
                             if idx < len(children):
                                 return children[idx]
         except Exception as e:
-            log.info("[UIA 定位失败] %s", e)
+            # 定位链逐级回退是设计行为，单级失败（含目标窗口重绘中的瞬态
+            # COMError）降到 debug，避免每次回放刷屏
+            log.debug("[UIA 定位失败] %s", e)
         return None
 
     def _locate_by_uia(self, loc, raw=(None, None)):
-        """用 UI Automation 重新定位元素。多属性组合搜索，避免逐类型穷举。"""
+        """用 UI Automation 重新定位元素。多属性组合搜索，避免逐类型穷举。
+        目标窗口重绘瞬间（如标题栏随内容改名）COM 查询会抛瞬态错误，
+        短间隔重试可显著降低定位率下降导致的坐标回退。"""
         from services.input.engine import _timed_call
-        ctrl = _timed_call(lambda: self._find_uia_ctrl(loc), timeout=2.5)
+        ctrl = None
+        for attempt in range(3):
+            try:
+                ctrl = _timed_call(lambda: self._find_uia_ctrl(loc), timeout=2.5)
+            except Exception:
+                ctrl = None
+            if ctrl is not None:
+                break
+            if attempt < 2:
+                time.sleep(0.3)
         if ctrl is None:
             return None, None
         try:
             def _point(ctrl):
                 rect = ctrl.BoundingRectangle
-                # 容器尺寸阈值检查：面积超过窗口 50% 时跳过（避免找到过大容器如"桌面 1"）
-                ctrl_area = (rect.right - rect.left) * (rect.bottom - rect.top)
-                if ctrl_area > 0:
+                # 容器尺寸阈值检查：面积超过窗口 50% 时跳过（避免找到过大容器如"桌面 1"）。
+                # 内容型控件（编辑器/文档）命中即合法目标——文本编辑器本来就该占满窗口
+                try:
+                    typ = str(ctrl.ControlTypeName or "")
+                except Exception:
+                    typ = ""
+                if typ not in ("DocumentControl", "EditControl") \
+                        and (rect.right - rect.left) * (rect.bottom - rect.top) > 0:
+                    ctrl_area = (rect.right - rect.left) * (rect.bottom - rect.top)
                     try:
                         window_rect = win32gui.GetWindowRect(win32gui.GetForegroundWindow())
                         window_area = (window_rect[2] - window_rect[0]) * (window_rect[3] - window_rect[1])
@@ -799,22 +873,26 @@ class Player:
                 return (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2
 
             def _checked(res):
-                # 定位结果与录制坐标偏移过大时跳过该定位器（录制器可能捕获了错误元素）
+                # 偏移守卫只对弱身份定位器（无名称/自动化ID的结构匹配）生效：
+                # 那种匹配可能命中错误元素。带名称的定位已经锁定了窗口与控件
+                # 身份——桌面图标重排、窗口/对话框移动造成的坐标偏移是正常
+                # 现象，拒绝它只会退回更不可靠的录制原始坐标
                 if res is None or res[0] is None or res[1] is None:
                     return None
-                rx, ry = raw
-                if rx is None or ry is None:
-                    return res
-                dx = res[0] - rx
-                dy = res[1] - ry
-                if dx * dx + dy * dy > 100 * 100:
-                    log.info("  UIA 定位偏移过大 (%+d,%+d)px，跳过该定位器", dx, dy)
-                    return None
+                if not (loc.get("name") or loc.get("auto_id")):
+                    rx, ry = raw
+                    if rx is None or ry is None:
+                        return res
+                    dx = res[0] - rx
+                    dy = res[1] - ry
+                    if dx * dx + dy * dy > 100 * 100:
+                        log.info("  UIA 定位偏移过大 (%+d,%+d)px，跳过该定位器", dx, dy)
+                        return None
                 return res
 
             return _checked(_point(ctrl)) or (None, None)
         except Exception as e:
-            log.info("[UIA 定位失败] %s", e)
+            log.debug("[UIA 定位失败] %s", e)
             return None, None
 
     def _locate_by_coord(self, loc):
@@ -827,6 +905,10 @@ class Player:
             hwnd = win32gui.FindWindow(None, window_title)
             if hwnd:
                 try:
+                    # 最小化窗口的 WindowRect 是 (-32000,-32000) 附近的占位值，
+                    # 按它换算出来的坐标必然无效，跳过让后续定位器接管
+                    if win32gui.IsIconic(hwnd):
+                        return None, None
                     rect = win32gui.GetWindowRect(hwnd)
                     w = rect[2] - rect[0]
                     h = rect[3] - rect[1]
@@ -1006,8 +1088,15 @@ class Player:
     _DESKTOP_WINDOWS = {"Program Manager", "主机弹出窗口", ""}
 
     def _is_desktop_action(self, step):
-        """判断是否为桌面级操作（右键菜单、桌面点击等）"""
+        """判断是否为桌面级操作（右键菜单、桌面点击等）。
+        注意：'主机弹出窗口' 既是 Win11 桌面右键菜单的宿主标题，也是应用自身
+        XAML 弹出层（如记事本未保存提示）的标题。只有桌面菜单上下文存活
+        （_desktop_menu_open，说明刚在桌面上开了右键菜单）时才按桌面动作处理；
+        否则必须走普通 UIA/坐标链路——桌面分支的 _show_desktop() 会把应用
+        弹出层直接冲掉，raw 坐标也会点空。"""
         window = step.get("window", "")
+        if window == "主机弹出窗口":
+            return bool(self._desktop_menu_open)
         return window in self._DESKTOP_WINDOWS or not window
 
     def _target_hwnd(self, window_title, recorded_hwnd=None):
@@ -1039,8 +1128,13 @@ class Player:
             if ctrl is None:
                 return None
             if self._engine.invoke_ctrl(ctrl):
-                log.info("  -> UIA %s 成功: %r (%s)", action_name, ctrl.Name,
-                         getattr(ctrl, "ControlTypeName", "?"))
+                # invoke 成功后目标元素可能立即销毁（如点击关闭对话框），
+                # 再读 Name/ControlTypeName 会抛 COMError，绝不能让它炸掉回放线程
+                try:
+                    desc = f"{ctrl.Name!r} ({getattr(ctrl, 'ControlTypeName', '?')})"
+                except Exception:
+                    desc = "<元素已销毁>"
+                log.info("  -> UIA %s 成功: %s", action_name, desc)
                 return self._ok(f"uia_{action_name}")
             return None
         return None
@@ -1049,6 +1143,9 @@ class Player:
         """确保目标窗口在前台（点击/输入前激活，避免动作落在被遮挡窗口上）"""
         try:
             if hwnd and win32gui.IsWindow(hwnd):
+                if win32gui.IsIconic(hwnd):
+                    win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE：还原最小化窗口
+                    time.sleep(0.3)
                 fg = win32gui.GetForegroundWindow()
                 if fg != hwnd:
                     _force_foreground(hwnd)
@@ -1091,14 +1188,52 @@ class Player:
                               and "MenuItem" in str(loc.get("control_type", ""))
                               and str(loc.get("name", "")).strip()), "")
             if step.get("semantic") == "shell_create_text_document":
-                menu_name = "Text Document" if not menu_name else menu_name
-            if menu_name and self._invoke_shell_menu_label((menu_name,), prefer_physical=True):
+                menu_name = "文本文档" if not menu_name else menu_name
+                # 直接标签查找失败时，目标项多半还在折叠的"新建"子菜单里：
+                # 先展开父级再重查，否则会走到坐标兜底误点其它菜单项
+                if menu_name and not self._invoke_shell_menu_label((menu_name,), prefer_physical=True):
+                    if self._expand_shell_submenu(("新建", "new")):
+                        time.sleep(0.6)
+                if menu_name and self._invoke_shell_menu_label((menu_name,), prefer_physical=True):
+                    time.sleep(0.25)
+                    self._desktop_menu_open = self._shell_menu_visible()
+                    log.info("  -> 菜单标签命中 %r", menu_name)
+                    return self._ok("uia_shell_menu_label")
+                expected = (menu_name,) if menu_name else None
+                if x0 is not None and y0 is not None and \
+                        self._invoke_shell_menu_at(x0, y0, prefer_physical=True, expected=expected):
+                    time.sleep(0.25)
+                    self._desktop_menu_open = self._shell_menu_visible()
+                    log.info("  -> 菜单点按坐标命中 (%d,%d)", x0, y0)
+                    return self._ok("uia_shell_menu_point")
+                # UI 菜单路径全部失败：该语义的结果可确定性达成（桌面出现新 txt），
+                # 直接 Shell 新建等价文件，比盲点菜单坐标可靠得多
+                if self._create_desktop_text_document():
+                    self._close_shell_menu()
+                    self._desktop_menu_open = False
+                    # 等新文件的桌面图标在 UIA 树中物化（Explorer 刷新有延迟），
+                    # 后续步骤会按名称定位该图标，过早执行会退回陈旧的原始坐标
+                    deadline = time.time() + 6.0
+                    while time.time() < deadline and not self._stopped:
+                        for loc in step.get("locator", []):
+                            if loc.get("type") == "uia":
+                                lx, ly = self._try_locator(loc)
+                                if lx is not None and ly is not None:
+                                    log.info("  -> 新建文件图标已可见")
+                                    return self._ok("shell_create_text_document_fallback")
+                        time.sleep(0.5)
+                    return self._ok("shell_create_text_document_fallback")
+            elif menu_name and self._invoke_shell_menu_label((menu_name,), prefer_physical=True):
                 time.sleep(0.25)
                 self._desktop_menu_open = self._shell_menu_visible()
+                log.info("  -> 菜单标签命中 %r", menu_name)
                 return self._ok("uia_shell_menu_label")
-            if x0 is not None and y0 is not None and self._invoke_shell_menu_at(x0, y0, prefer_physical=True):
+            expected = (menu_name,) if menu_name else None
+            if x0 is not None and y0 is not None and \
+                    self._invoke_shell_menu_at(x0, y0, prefer_physical=True, expected=expected):
                 time.sleep(0.25)
                 self._desktop_menu_open = self._shell_menu_visible()
+                log.info("  -> 菜单点按坐标命中 (%d,%d)", x0, y0)
                 return self._ok("uia_shell_menu_point")
             # The previous leaf selection may already have closed the menu;
             # continue with the ordinary desktop target instead of treating a
@@ -1117,6 +1252,13 @@ class Player:
             if res is not None:
                 log.info("  -> 网页点击 (CDP) %r", dom_loc.get("text", ""))
                 return res
+        # 非桌面动作：先定位并激活目标窗口（含最小化还原），再解析坐标，
+        # 这样窗口内百分比定位器才能基于还原后的窗口矩形换算
+        hwnd = None
+        if not self._is_desktop_action(step):
+            hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
+            if hwnd:
+                self._activate_target(hwnd)
         x, y = self._resolve_coords(step)
         if x is None or y is None:
             return self._fail("click", "no_coords")
@@ -1134,22 +1276,120 @@ class Player:
             # starts a fresh context; non-menu targets are still validated by
             # ``_desktop_window_at``.
             return result
-        hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
         if not hwnd:
             if self._is_idempotent_missing_window(step):
                 log.info("  -> skip already-closed window: %r", step.get("window", ""))
                 return self._ok("skip_missing_window")
             return self._fail("click", "no_window")
-        self._activate_target(hwnd)
         log.info("  -> 点击 (%d,%d) -> %r", x, y, step.get("window", ""))
         return self._engine.click(hwnd, x, y)
 
-    def _invoke_shell_menu_at(self, x, y, prefer_physical=False):
+    def _shell_menu_roots(self):
+        """收集当前可见的 Shell 菜单根（Win32 #32768 与 Win11 XAML 弹出层）"""
+        import uiautomation as ua
+        roots = []
+        desktop = ua.GetRootControl()
+        for child in desktop.GetChildren():
+            try:
+                cls = str(child.ClassName or "")
+                typ = str(child.ControlTypeName or "")
+                if (typ == "MenuControl" or cls == "#32768" or "Xaml" in cls
+                        or "PopupWindowSiteBridge" in cls):
+                    roots.append(child)
+            except Exception:
+                continue
+        try:
+            popup = ua.WindowControl(ClassName="#32768")
+            if popup.Exists(0.2):
+                roots.append(popup)
+        except Exception:
+            pass
+        return roots
+
+    def _create_desktop_text_document(self):
+        """按 Explorer 规则在桌面新建文本文档（新建 文本文档.txt / (2) / (3)…）。
+        用于 shell_create_text_document 语义的确定性兜底。"""
+        try:
+            from win32com.shell import shell, shellcon
+            desktop = Path(shell.SHGetFolderPath(0, shellcon.CSIDL_DESKTOP, None, 0))
+        except Exception:
+            desktop = Path.home() / "Desktop"
+        base = desktop / "新建 文本文档.txt"
+        stem, suffix = base.stem, base.suffix
+        target, n = base, 2
+        while target.exists():
+            target = desktop / f"{stem} ({n}){suffix}"
+            n += 1
+        try:
+            target.write_text("", encoding="utf-8")
+            # 通知 Shell 刷新，桌面图标尽快出现（后续步骤会按名称定位）
+            try:
+                import ctypes
+                ctypes.windll.shell32.SHChangeNotify(0x80000000, 0x1000,
+                                                     str(target), None)
+            except Exception:
+                pass
+            log.info("  -> Shell 新建文本文档: %s", target.name)
+            return True
+        except Exception as e:
+            log.info("  Shell 新建文本文档失败: %s", e)
+            return False
+
+    def _close_shell_menu(self):
+        """发送 ESC 关闭可能残留的桌面右键菜单"""
+        try:
+            import ctypes
+            VK_ESCAPE = 0x1B
+            ctypes.windll.user32.keybd_event(VK_ESCAPE, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_ESCAPE, 0, 2, 0)  # KEYEVENTF_KEYUP
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    def _expand_shell_submenu(self, parent_labels):
+        """找到可见 Shell 菜单中匹配的父级 MenuItem（如"新建"）并展开其子菜单。
+        优先 ExpandCollapsePattern；XAML 菜单不吃 pattern 时物理悬停触发。"""
+        try:
+            import uiautomation as ua
+            labels = tuple(str(x).casefold() for x in parent_labels)
+            queue = list(self._shell_menu_roots())
+            visited = 0
+            while queue and visited < 2000:
+                control = queue.pop(0)
+                visited += 1
+                try:
+                    name = str(control.Name or "").strip().casefold()
+                    typ = str(control.ControlTypeName or "")
+                    if typ == "MenuItemControl" and any(l in name for l in labels):
+                        try:
+                            pat = control.GetPattern(ua.PatternId.ExpandCollapsePattern)
+                            if pat is not None:
+                                pat.Expand()
+                                return True
+                        except Exception:
+                            pass
+                        # 物理悬停：把鼠标移到菜单项上让 XAML 子菜单弹出
+                        rect = control.BoundingRectangle
+                        if rect.right > rect.left and rect.bottom > rect.top:
+                            x = int((rect.left + rect.right) / 2)
+                            y = int((rect.top + rect.bottom) / 2)
+                            ctypes.windll.user32.SetCursorPos(x, y)
+                            return True
+                    queue.extend(control.GetChildren())
+                except Exception:
+                    continue
+        except Exception as exc:
+            log.debug("展开子菜单失败: %s", exc)
+        return False
+
+    def _invoke_shell_menu_at(self, x, y, prefer_physical=False, expected=None):
         """Invoke the live menu item at a recorded point.
 
         Prefer ControlFromPoint so XAML menu descendants with Handle=0 are
         still reachable.  Walk parents because Windows may return a text/icon
-        child rather than the MenuItem itself.
+        child rather than the MenuItem itself.  ``expected`` 提供时校验命中的
+        菜单项名称：坐标处是别的菜单项（如"新建"父级行）时拒绝盲点，
+        避免假成功掩盖"目标在折叠子菜单里"的事实。
         """
         try:
             import uiautomation as ua
@@ -1162,6 +1402,13 @@ class Player:
                     break
                 try:
                     if control.ControlTypeName == "MenuItemControl":
+                        if expected:
+                            name = str(control.Name or "").strip().casefold()
+                            want = tuple(str(e).casefold() for e in expected if e)
+                            if want and not any(e in name for e in want):
+                                log.info("  菜单坐标命中 %r 与目标 %r 不符，拒绝盲点",
+                                         control.Name, expected)
+                                return False
                         return self._activate_shell_menu_control(control, prefer_physical)
                     control = control.GetParentControl()
                 except Exception:
@@ -1232,27 +1479,7 @@ class Player:
         try:
             import uiautomation as ua
             labels = tuple(str(x).casefold() for x in labels)
-            roots = []
-            desktop = ua.GetRootControl()
-            for child in desktop.GetChildren():
-                try:
-                    cls = str(child.ClassName or "")
-                    typ = str(child.ControlTypeName or "")
-                    if (typ == "MenuControl" or cls == "#32768" or "Xaml" in cls
-                            or "PopupWindowSiteBridge" in cls):
-                        roots.append(child)
-                except Exception:
-                    continue
-            # Win32 popup menus may not appear as direct RootControl children
-            # while a XAML submenu is open; ask UIA for the known popup class
-            # explicitly as an additional root.
-            try:
-                popup = ua.WindowControl(ClassName="#32768")
-                if popup.Exists(0.2):
-                    roots.append(popup)
-            except Exception:
-                pass
-            queue = list(roots)
+            queue = list(self._shell_menu_roots())
             visited = 0
             while queue and visited < 2000:
                 control = queue.pop(0)
@@ -1273,6 +1500,12 @@ class Player:
     def _do_double_click(self, step):
         # 双击不走 pattern 链：桌面 ListItem 的 Invoke 会抛 COMError 且 Select 只是选中，
         # "假装成功"会掩盖未打开文件的失败。物理双击（UIA 定位坐标）最忠实可靠。
+        # 先定位并激活目标窗口（含最小化还原），再解析坐标
+        hwnd = None
+        if not self._is_desktop_action(step):
+            hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
+            if hwnd:
+                self._activate_target(hwnd)
         x, y = self._resolve_coords(step)
         if x is None or y is None:
             return self._fail("double_click", "no_coords")
@@ -1286,17 +1519,21 @@ class Player:
             # Preserve an open context-menu/submenu for the same reason as
             # ``_do_click`` above.
             return result
-        hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
         if not hwnd:
             if self._is_idempotent_missing_window(step):
                 log.info("  -> skip already-closed window: %r", step.get("window", ""))
                 return self._ok("skip_missing_window")
             return self._fail("double_click", "no_window")
-        self._activate_target(hwnd)
         log.info("  -> 双击 (%d,%d) -> %r", x, y, step.get("window", ""))
         return self._engine.double_click(hwnd, x, y)
 
     def _do_right_click(self, step):
+        # 同 _do_double_click：先激活目标窗口再解析坐标
+        hwnd = None
+        if not self._is_desktop_action(step):
+            hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
+            if hwnd:
+                self._activate_target(hwnd)
         x, y = self._resolve_coords(step)
         if x is None or y is None:
             return self._fail("right_click", "no_coords")
@@ -1309,10 +1546,8 @@ class Player:
             self._desktop_menu_open = True
             time.sleep(0.5)
             return self._ok("desktop_right_click")
-        hwnd = self._target_hwnd(step.get("window", ""), step.get("hwnd"))
         if not hwnd:
             return self._fail("right_click", "no_window")
-        self._activate_target(hwnd)
         log.info("  -> 右键 (%d,%d) -> %r", x, y, step.get("window", ""))
         return self._engine.right_click(hwnd, x, y)
 
