@@ -1135,7 +1135,7 @@ if __name__ == "__main__":
                                  "error": "视觉模型未配置（api_base/api_key）"}, 400)
         if va.running:
             return JSONResponse({"ok": False, "error": "已有视觉任务在运行"}, 409)
-        va.start(task, max_steps=int(max_steps))
+        va.start(task, max_steps=int(max_steps), window=str(body.get("window", "")))
         return {"ok": True, "running": True}
 
     @app.post("/visual/stop")

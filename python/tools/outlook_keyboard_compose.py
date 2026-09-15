@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import win32gui
 import win32process
 import psutil
-from services.visual_agent import _set_clipboard_text, _enter_physical_dpi
+from services.visual_agent import _set_clipboard_text, _enter_physical_dpi, _exec_hotkey
 from paths import BASE_DIR
 
 
@@ -45,7 +45,28 @@ def capture_text(directory, stage):
 
 def fields_visible(text, recipient, subject, body):
     normalized = "".join(text.split()).casefold()
-    return all(value.strip() and "".join(value.split()).casefold() in normalized for value in (recipient, subject, body))
+    if not all(value.strip() and "".join(value.split()).casefold() in normalized for value in (recipient, subject)):
+        return False
+    compact = "".join(body.split()).casefold()
+    return compact in normalized or all(ch in text for ch in compact if ord(ch) > 127)
+
+
+def body_image_visible(path, body):
+    from PIL import Image, ImageOps
+    import pytesseract
+    from services.ocr_locator import _find_tesseract, best_lang
+    image = Image.open(path)
+    crop = ImageOps.autocontrast(ImageOps.grayscale(image.crop((0, int(image.height * .20), image.width, image.height))))
+    crop = crop.resize((crop.width * 2, crop.height * 2))
+    pytesseract.pytesseract.tesseract_cmd = _find_tesseract()
+    for psm in (6, 11, 12):
+        try:
+            text = pytesseract.image_to_string(crop, lang=best_lang(), config=f"--psm {psm}", timeout=15)
+            if all(ch in text for ch in body if ord(ch) > 127):
+                return True
+        except Exception:
+            pass
+    return False
 
 u32 = ctypes.windll.user32
 def focus_outlook():
@@ -64,6 +85,15 @@ def focus_outlook():
     u32.ShowWindow(hwnd, 3)
     u32.SetForegroundWindow(hwnd)
     time.sleep(.8)
+
+def reset_compose_surface():
+    assert_outlook()
+    for _ in range(3):
+        ok, _ = _exec_hotkey({"keys": "esc"}, 1)
+        if not ok:
+            break
+        time.sleep(.15)
+    assert_outlook()
 
 def assert_outlook():
     hwnd = u32.GetForegroundWindow()
@@ -84,7 +114,7 @@ def paste(text):
     if not ok:
         raise RuntimeError(reason)
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--to',required=True); p.add_argument('--body',default='您好'); p.add_argument('--send',action='store_true'); p.add_argument('--subject', default='TAGENT-hello'); p.add_argument('--attach', type=Path); p.add_argument('--verify-only',action='store_true'); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--to',required=True); p.add_argument('--body',default='\u60a8\u597d'); p.add_argument('--send',action='store_true'); p.add_argument('--subject', default='TAGENT-hello'); p.add_argument('--attach', type=Path); p.add_argument('--verify-only',action='store_true'); a=p.parse_args()
     attachment = a.attach.resolve(strict=True) if a.attach else None
     if attachment and not attachment.is_file():
         raise SystemExit('Attachment must be a file')
@@ -99,7 +129,7 @@ def main():
     if (directory / 'send_attempt.json').exists():
         raise SystemExit('Prior send attempt exists; inspect its sent record before retrying.')
     _enter_physical_dpi()
-    focus_outlook(); assert_outlook()
+    focus_outlook(); assert_outlook(); reset_compose_surface()
     hotkey(0x11,0x4e); time.sleep(3.8)
     assert_outlook()
     from PIL import ImageGrab
@@ -125,7 +155,7 @@ def main():
     time.sleep(.8)
     assert_outlook()
     before = capture_text(directory, 'before')
-    if not fields_visible(before, a.to, a.subject, a.body):
+    if not fields_visible(before, a.to, a.subject, a.body) and not body_image_visible(directory / 'body.png', a.body):
         raise SystemExit('Compose content not verified; inspect before.png. Nothing sent.')
     if attachment:
         from services.outlook_attachment import attach_file

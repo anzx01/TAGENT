@@ -35,8 +35,11 @@ def visual_click(hwnd, target, double=False):
 
 
 def attach_file(path):
+    import ctypes
     import psutil
     import uiautomation as ua
+    # UIA 在非主线程使用前必须初始化 COM（重复调用返回 S_FALSE，无害）
+    ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
     import win32gui
     import win32process
     target = Path(path).resolve(strict=True)
@@ -46,6 +49,9 @@ def attach_file(path):
     _, pid = win32process.GetWindowThreadProcessId(hwnd)
     if psutil.Process(pid).name().lower() != "olk.exe":
         raise RuntimeError("Outlook must own the foreground window")
+    root = ua.ControlFromHandle(hwnd)
+    from services.visual_agent import _exec_hotkey
+    _exec_hotkey({"keys": "esc"}, 1)
     root = ua.ControlFromHandle(hwnd)
     attach = root.ButtonControl(RegexName=r"^(\u9644\u52a0\u6587\u4ef6|\u9644\u52a0|Attach file|Attach)$", searchDepth=20)
     if attach.Exists(1):
@@ -57,16 +63,26 @@ def attach_file(path):
     if browse.Exists(1):
         browse.Click()
     else:
-        visual_click(hwnd, "Browse this computer / \u6d4f\u89c8\u6b64\u8ba1\u7b97\u673a in the attachment menu")
-    deadline = time.monotonic() + 5
+        try:
+            visual_click(hwnd, "Browse this computer / \u6d4f\u89c8\u6b64\u8ba1\u7b97\u673a in the attachment menu")
+        except RuntimeError:
+            from services.visual_agent import _exec_hotkey
+            ok, reason = _exec_hotkey({"keys": "enter"}, 1)
+            if not ok:
+                raise RuntimeError(reason)
+    deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         dialog = win32gui.GetForegroundWindow()
         _, owner = win32process.GetWindowThreadProcessId(dialog)
-        if win32gui.GetClassName(dialog) == "#32770" and owner == pid:
+        owner_name = psutil.Process(owner).name().lower()
+        if win32gui.GetClassName(dialog) in ("#32770", "CabinetWClass", "ExploreWClass", "ApplicationFrameWindow") and owner_name in ("olk.exe", "explorer.exe"):
             native = ua.ControlFromHandle(dialog)
             filename = native.EditControl(AutomationId="1148", searchDepth=5)
             if not filename.Exists(.2):
-                raise RuntimeError("File picker filename field unavailable")
+                filename = native.EditControl(searchDepth=8)
+            if not filename.Exists(.2):
+                time.sleep(.2)
+                continue
             filename.GetValuePattern().SetValue(str(target))
             if filename.GetValuePattern().Value != str(target):
                 raise RuntimeError("Attachment path verification failed")

@@ -38,6 +38,8 @@ def verify_sent(recipient, subject, body, attachment, directory):
     hwnd = windows[0]
     win32gui.ShowWindow(hwnd, 3)
     _force_foreground(hwnd)
+    from services.visual_agent import _exec_hotkey
+    _exec_hotkey({"keys": "esc"}, 1)
     visual_click(hwnd, "the Sent Items / \u5df2\u53d1\u9001\u90ae\u4ef6 folder in the left navigation")
     time.sleep(2)
     visual_click(hwnd, "the message row with exact subject " + subject, double=True)

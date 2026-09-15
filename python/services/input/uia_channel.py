@@ -15,6 +15,8 @@ class UiaChannel:
         self._edit_cache = {}  # hwnd -> (runtime_id, control)
 
     def _root(self, hwnd: Optional[int]):
+        # UIA 在非主线程使用前必须初始化 COM（重复调用返回 S_FALSE，无害）
+        ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
         if hwnd and win32gui.IsWindow(hwnd):
             return ua.ControlFromHandle(hwnd)
         return ua.GetFocusedControl()

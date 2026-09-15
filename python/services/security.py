@@ -100,6 +100,8 @@ class Security:
             return cached[1]
         try:
             import uiautomation as ua
+            # 工作线程中首次使用 UIA 前必须初始化 COM（重复调用返回 S_FALSE，无害）
+            ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
             ctrl = ua.ControlFromHandle(hwnd)
             if ctrl is None:
                 self._pw_cache[hwnd] = (time.time(), False)

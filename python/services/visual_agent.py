@@ -34,6 +34,176 @@ log = get_logger("visual_agent")
 u32 = ctypes.windll.user32
 KEYEVENTF_KEYUP = 0x0002
 
+
+_TARGET_HWND = None     # 护栏目标窗口（进程内共享，执行线程写）
+_FRONT_KEYWORD = ""     # 目标窗口标题关键词（_mouse_click 前台断言用）
+
+
+def _find_window(keyword: str) -> int:
+    try:
+        import win32gui
+        hits = []
+
+        def cb(h, _):
+            if win32gui.IsWindowVisible(h):
+                t = win32gui.GetWindowText(h) or ""
+                if keyword.lower() in t.lower():
+                    hits.append(h)
+            return True
+
+        win32gui.EnumWindows(cb, None)
+        return hits[0] if hits else 0
+    except Exception:
+        return 0
+
+
+def _bring_window_front(keyword: str) -> bool:
+    """把标题含 keyword 的可见顶层窗口强制前台（AttachThreadInput + ALT trick）"""
+    try:
+        import win32gui
+        import win32process
+        global _TARGET_HWND, _FRONT_KEYWORD
+        hwnd = _find_window(keyword)
+        if not hwnd:
+            log.warning("目标窗口未找到: %r", keyword)
+            return False
+        _TARGET_HWND = hwnd
+        _FRONT_KEYWORD = keyword
+        fg = win32gui.GetForegroundWindow()
+        if fg == hwnd:
+            return True
+        _, a = win32process.GetWindowThreadProcessId(fg)
+        _, b = win32process.GetWindowThreadProcessId(hwnd)
+        u32.keybd_event(0x12, 0, 0, 0)          # ALT trick
+        u32.keybd_event(0x12, 0, 2, 0)
+        if a != b:
+            u32.AttachThreadInput(a, b, True)
+        # 仅最小化时才 SW_RESTORE——对最大化窗口用 9 会把它"还原"成小窗，
+        # 布局坐标全漂移（实测 Outlook 被还原成 220,220 起的浮动窗）
+        if win32gui.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, 9)             # SW_RESTORE
+        u32.BringWindowToTop(hwnd)
+        u32.SetForegroundWindow(hwnd)
+        if a != b:
+            u32.AttachThreadInput(a, b, False)
+        time.sleep(0.8)
+        ok = win32gui.GetForegroundWindow() == hwnd
+        log.info("视觉接管前置窗口 %r -> %s", keyword, ok)
+        return ok
+    except Exception:
+        log.exception("前置窗口失败: %r", keyword)
+        return False
+
+
+# 危险热键黑名单：win+d/m 最小化一切（破坏目标窗口前台状态）、
+# win+tab 任务视图、alt+f4 可能关掉目标窗口
+_HOTKEY_BLACKLIST = {"win+d", "win+m", "win+tab", "alt+f4"}
+
+
+def _guard_click(x: int, y: int) -> tuple:
+    """点击护栏：目标窗口存在时，坐标越界则钳制进窗口客户区。
+    防止模型坐标漂移点到窗口外（实测点到标题栏/桌面引发前台连锁灾难）"""
+    global _TARGET_HWND
+    if not _TARGET_HWND:
+        return x, y
+    try:
+        import win32gui
+        if not win32gui.IsWindow(_TARGET_HWND):
+            return x, y
+        l, t, r, b = win32gui.GetWindowRect(_TARGET_HWND)
+        cx = min(max(x, l + 8), r - 8)
+        cy = min(max(y, t + 8), b - 8)
+        if (cx, cy) != (x, y):
+            log.info("点击护栏: (%d,%d) 越界 -> 钳制 (%d,%d)", x, y, cx, cy)
+        return cx, cy
+    except Exception:
+        return x, y
+
+
+# 有未保存内容风险的对话框不自动关闭（误关会丢内容）；
+# 新邮件草稿窗是 owned 子窗口时也不能关（否则草稿丢失、循环重开）
+_DIALOG_KEEP_KEYWORDS = ("保存", "另存", "save as", "saving", "打印", "print",
+                         "新邮件", "new mail", "new message", "未命名", "untitled",
+                         "tagent", "测试邮件", "草稿", "draft")
+_MENU_TOOLTIP_CLASSES = ("#32768", "tooltips_class32")   # 菜单/悬浮提示勿动
+
+
+def _close_blocking_dialogs(owner_hwnd: int) -> int:
+    """弹窗护栏：自动关掉目标窗口名下的遮挡对话框（WM_CLOSE 比点击可靠）。
+    实测「添加所有电子邮件帐户」这类模态框会吃掉全部后续输入，模型连点
+    15 步关闭钮全落空。三条规则：
+      1) GW_OWNER 指向目标窗口的可见弹窗（进程内模态对话框）
+      2) 目标窗口被禁用（= 存在线程模态框）时，同线程的可见且可用顶层窗口
+         （线程模态框自身不会被禁用；被波及禁用的正常窗口自动跳过）
+      3) 目标被禁用且前台是标准对话框(#32770)时跨进程关闭
+    跳过标题含 保存/另存/打印 的对话框与菜单/悬浮提示。"""
+    try:
+        import win32gui
+        import win32process
+        closed = []
+
+        def _try_close(h, title):
+            t = (title or "").lower()
+            if any(k in t for k in _DIALOG_KEEP_KEYWORDS):
+                return
+            try:
+                win32gui.PostMessage(h, 0x0010, 0, 0)   # WM_CLOSE
+                closed.append(title or f"(无标题 {hex(h)})")
+            except Exception:
+                pass
+
+        _, target_tid = win32process.GetWindowThreadProcessId(owner_hwnd)
+        target_disabled = not u32.IsWindowEnabled(owner_hwnd)
+
+        def cb(h, _):
+            try:
+                if h == owner_hwnd or not win32gui.IsWindowVisible(h):
+                    return True
+                if win32gui.GetClassName(h) in _MENU_TOOLTIP_CLASSES:
+                    return True
+                if win32gui.GetWindow(h, 4) == owner_hwnd:   # GW_OWNER
+                    _try_close(h, win32gui.GetWindowText(h))
+                    return True
+                if target_disabled:
+                    _, tid = win32process.GetWindowThreadProcessId(h)
+                    if tid == target_tid and win32gui.IsWindowEnabled(h):
+                        _try_close(h, win32gui.GetWindowText(h))
+                    elif (win32gui.GetForegroundWindow() == h
+                          and win32gui.GetClassName(h) == "#32770"):
+                        _try_close(h, win32gui.GetWindowText(h))
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(cb, None)
+        if closed:
+            log.info("弹窗护栏: 已关闭 %d 个遮挡对话框: %s", len(closed), closed)
+            time.sleep(0.8)
+        return len(closed)
+    except Exception:
+        log.debug("弹窗护栏枚举失败", exc_info=True)
+        return 0
+
+
+def _draw_pixel_grid(img, step=160):
+    """在截图上叠加像素刻度网格：每 step px 一条细线，顶边标 x 值、左边标 y 值。
+    只在边缘标数字（不在网格交点），避免模型把标签误当坐标。"""
+    from PIL import ImageDraw
+    img = img.convert("RGB")
+    w, h = img.size
+    overlay = img.copy()
+    d = ImageDraw.Draw(overlay)
+    line = (255, 0, 0, 60)
+    text_color = (200, 30, 30)
+    for x in range(step, w, step):
+        d.line([(x, 0), (x, h)], fill=line, width=1)
+        d.text((x + 2, 2), str(x), fill=text_color)
+    for y in range(step, h, step):
+        d.line([(0, y), (w, y)], fill=line, width=1)
+        d.text((2, y + 2), str(y), fill=text_color)
+    from PIL import Image
+    return Image.blend(img, overlay, 0.85)
+
 # 线程级物理坐标系（Win10 1703+）。mss 截图永远是物理像素，而 DPI unaware
 # 进程的窗口/鼠标 API 是逻辑坐标（225% 缩放下差 2.25 倍，点击会全部飞掉）。
 # SetThreadDpiAwarenessContext 只影响当前线程、可运行中切换，没有
@@ -63,6 +233,7 @@ SYSTEM_PROMPT = """你是一个 Windows 桌面 GUI 自动化助手。你将看�
 {"action":"type","text":"要输入的内容"}        // 粘贴到当前焦点框（中文安全）
 {"action":"type","text":"内容","x":640,"y":320} // 先点击(x,y)再粘贴（推荐：点击+输入一步完成）
 {"action":"hotkey","keys":"ctrl+s"}           // 组合键，支持 ctrl/alt/shift/win 与单键组合
+{"action":"hotkey","keys":"ctrl+a","x":200,"y":220} // 先点击(x,y)聚焦再执行组合键（清空/操作指定输入框用）
 {"action":"scroll","dy":-3,"x":640,"y":320}   // dy 负=向上滚；x/y 可省略（原位置）
 {"action":"drag","from_x":100,"from_y":100,"to_x":500,"to_y":500}
 {"action":"wait","seconds":1.5}
@@ -115,8 +286,11 @@ class VisualAgent:
         self._stop.set()
 
     def start(self, task: str, max_steps: int = MAX_STEPS_DEFAULT,
-              on_update: Optional[Callable] = None) -> bool:
-        """启动后台执行线程；已在运行则拒绝"""
+              on_update: Optional[Callable] = None,
+              window: str = "") -> bool:
+        """启动后台执行线程；已在运行则拒绝。
+        window: 目标窗口标题关键词（如 "Outlook"）——启动前强制其前台，
+        避免纯截图驱动在错误的前台应用上盲操作（实测被日历/浏览器坑过）"""
         if self.running:
             return False
         if not self.configured():
@@ -124,21 +298,25 @@ class VisualAgent:
                                "（data/llm_config.json）")
         self._stop.clear()
         self.state = {"task": task, "status": "running", "steps": [],
-                      "error": None, "started_at": time.time()}
+                      "error": None, "started_at": time.time(),
+                      "window": window}
         self._thread = threading.Thread(
-            target=self._run, args=(task, max_steps, on_update),
+            target=self._run, args=(task, max_steps, on_update, window),
             daemon=True, name="visual-agent")
         self._thread.start()
         return True
 
     # ---------- 主循环 ----------
 
-    def _run(self, task: str, max_steps: int, on_update):
+    def _run(self, task: str, max_steps: int, on_update, window: str = ""):
+        global _TARGET_HWND
         # 本线程切换物理坐标系：截图(mss)是物理像素，点击/键入坐标必须同系
         if _enter_physical_dpi():
             log.info("视觉接管线程已切换 Per-Monitor-V2 物理坐标系")
         else:
             log.warning("线程 DPI 切换失败，坐标可能错位（旧系统？）")
+        if window:
+            _bring_window_front(window)
         history = []
         invalid_streak = 0
         try:
@@ -146,6 +324,17 @@ class VisualAgent:
                 if self._stop.is_set():
                     self.state["status"] = "stopped"
                     break
+                # 0) 每步前台守护：目标窗口被抢/最小化则立刻拉回
+                #    （实测模型一次误点可引发 Win+D 级连锁灾难）
+                if _TARGET_HWND:
+                    try:
+                        import win32gui
+                        if win32gui.GetForegroundWindow() != _TARGET_HWND:
+                            log.info("步骤 %d: 目标窗口失焦，重新前置", step)
+                            _bring_window_front(str(self.state.get("window", "")) or "Outlook")
+                        _close_blocking_dialogs(_TARGET_HWND)
+                    except Exception:
+                        pass
                 # 1) 截图（物理 -> 缩放）
                 if self.local_step is not None and self.local_step():
                     history.append({"step": step, "action": "local_save", "note": "Local save dialog submitted; verify the saved document."})
@@ -163,6 +352,13 @@ class VisualAgent:
                 else:
                     ratio = 1.0
                 view_w, view_h = img.size
+                # 叠加像素刻度网格（细线 + 顶边 x 值/左边 y 值刻度），
+                # 给模型提供坐标参照。注意不能在网格交点标数字——
+                # 早期用百分比标签 "10x10" 时模型直接把它当像素坐标抄
+                try:
+                    img = _draw_pixel_grid(img)
+                except Exception:
+                    log.debug("网格叠加失败，使用原始截图", exc_info=True)
 
                 # 2) 模型决策（缺 action/解析失败自动重试一次；
                 #    通用 VL 模型常返回只有 thought 的 JSON，不应一击致命）
@@ -212,8 +408,13 @@ class VisualAgent:
                                     "note": "unknown_action_skipped"})
                     continue
 
-                # 4) 执行（坐标从视图坐标映射回物理坐标）
-                ok, msg = _EXECUTORS[action](decision, ratio)
+                # 4) 执行（坐标从视图坐标映射回物理坐标）；单动作异常只记
+                #    失败不终止任务（模型下一步可从截图看到现状并纠正）
+                try:
+                    ok, msg = _EXECUTORS[action](decision, ratio)
+                except Exception as e:
+                    ok, msg = False, f"执行异常: {e}"
+                    log.warning("[视觉接管 %d] %s 执行异常: %s", step, action, e)
                 history.append({"step": step, "action": action,
                                 "thought": thought, "result": msg,
                                 "signature": json.dumps({k: v for k, v in decision.items() if k != "thought"}, sort_keys=True)})
@@ -226,6 +427,7 @@ class VisualAgent:
             self.state["error"] = str(e)
             log.exception("视觉接管异常")
         finally:
+            _TARGET_HWND = None
             self.state["finished_at"] = time.time()
             if on_update:
                 try:
@@ -250,7 +452,9 @@ class VisualAgent:
             f"{h.get('step')}. {h.get('action')} | {h.get('thought') or h.get('note', '')}"
             for h in history) or "（无，这是第一步）"
         user_text = (f"任务：{task}\n\n已执行动作历史：\n{hist_text}\n\n"
-                     f"当前截图尺寸 {view_w}x{view_h}（坐标按此截图给出）。"
+                     f"当前截图尺寸 {view_w}x{view_h}，坐标用像素给出。"
+                     f"截图上叠加了红色刻度网格：顶部边缘的红色数字是 x 像素值，"
+                     f"左边缘的红色数字是 y 像素值，请参照刻度给出精确坐标。"
                      f"请返回下一步动作 JSON。")
         if hint:
             user_text += "\n\n" + hint
@@ -301,12 +505,37 @@ class VisualAgent:
 # ---------- 动作执行（全局注入，坐标为视图坐标 * 1/ratio -> 物理） ----------
 
 def _map_xy(decision: dict, ratio: float) -> tuple[int, int]:
-    x = float(decision.get("x", 0))
-    y = float(decision.get("y", 0))
-    return int(round(x / ratio)), int(round(y / ratio))
+    # 模型偶尔把坐标给成 [200,220] 数组或字符串（qwen3-vl-235b 实测），
+    # 统一抽取为两个数值再映射
+    raw = [decision.get("x", 0), decision.get("y", 0)]
+    vals = []
+    for v in raw:
+        if isinstance(v, (list, tuple)):
+            vals.extend(v[:2])
+        else:
+            vals.append(v)
+    nums = []
+    for v in vals[:2]:
+        try:
+            nums.append(float(v))
+        except (TypeError, ValueError):
+            nums.append(0.0)
+    while len(nums) < 2:
+        nums.append(0.0)
+    return int(round(nums[0] / ratio)), int(round(nums[1] / ratio))
 
 
 def _mouse_click(x: int, y: int, double=False, right=False):
+    x, y = _guard_click(x, y)
+    # 点击前一刻断言前台：模型决策耗时数秒，期间前台可能被其他窗口抢占
+    # （实测 IDE 弹到前台后点击全部落进 IDE，坐标再准也没用）
+    if _TARGET_HWND:
+        try:
+            import win32gui
+            if win32gui.GetForegroundWindow() != _TARGET_HWND:
+                _bring_window_front(str(_FRONT_KEYWORD) or "Outlook")
+        except Exception:
+            pass
     u32.SetCursorPos(x, y)
     time.sleep(0.12)
     if right:
@@ -369,11 +598,17 @@ def _exec_type(decision, ratio):
     text = str(decision.get("text", ""))
     if not text:
         return False, "type: text 为空"
-    # 带坐标：先点击目标输入框再粘贴（一步完成，规避模型反复确认焦点）
+    # 带坐标：先点击目标输入框再粘贴（一步完成，规避模型反复确认焦点）。
+    # 点击「收件人」标签区会触发联系人选择器/「添加收件人」模态框（实测），
+    # 点击后先按 Esc 清弹层（不影响已获得的输入框焦点）再粘贴
     if decision.get("x") is not None and decision.get("y") is not None:
         x, y = _map_xy(decision, ratio)
         _mouse_click(x, y)
-        time.sleep(0.3)
+        time.sleep(0.2)
+        u32.keybd_event(0x1B, u32.MapVirtualKeyW(0x1B, 0), 0, 0)
+        time.sleep(0.05)
+        u32.keybd_event(0x1B, 0, KEYEVENTF_KEYUP, 0)
+        time.sleep(0.4)
     if not _set_clipboard_text(text):
         return False, "type: 剪贴板不可用"
     _paste()
@@ -382,9 +617,18 @@ def _exec_type(decision, ratio):
 
 def _exec_hotkey(decision, ratio):
     keys = str(decision.get("keys", "")).strip().lower()
+    if keys in _HOTKEY_BLACKLIST:
+        log.warning("热键护栏: 拒绝 %r（会破坏目标窗口状态）", keys)
+        return False, f"hotkey {keys} 被护栏拒绝（最小化/关闭类操作禁止）"
     vks = _parse_keys(keys)
     if not vks:
         return False, f"hotkey: 无法解析 {keys!r}"
+    # 带坐标：先点击目标控件（聚焦）再执行组合键——如点击输入框后 ctrl+a
+    # 全选清空（模型裸 ctrl+a 会全选整个页面，实测内容越清越乱）
+    if decision.get("x") is not None and decision.get("y") is not None:
+        x, y = _map_xy(decision, ratio)
+        _mouse_click(x, y)
+        time.sleep(0.3)
     # Win/右修饰键是扩展键：不带 KEYEVENTF_EXTENDEDKEY 会被系统丢弃（实测）
     EXTENDED = {0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
     for vk in vks:
@@ -506,8 +750,18 @@ def _parse_action_json(content: str) -> dict | None:
         obj = json.loads(text)
         return obj if isinstance(obj, dict) else None
     except Exception:
-        log.warning("模型输出无法解析: %.200s", content)
-        return None
+        # 键名缺引号/键丢失修复：qwen3-vl-235b 常产出残缺 JSON——
+        # {"x":148, y":976}（引号丢失）或 {"x":70,95}（"y": 键整个丢失）
+        try:
+            fixed = re.sub(r'([,{]\s*)([A-Za-z_]\w*)\s*":', r'\1"\2":', text)
+            fixed = re.sub(r'"x"\s*:\s*(\d+)\s*,\s*(\d+)\s*[\}\]]',
+                           r'"x":\1,"y":\2}', fixed)
+            obj = json.loads(fixed)
+            log.info("残缺 JSON 已修复: %.120s", fixed)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            log.warning("模型输出无法解析: %.200s", content)
+            return None
 
 
 _store: VisualAgent | None = None
