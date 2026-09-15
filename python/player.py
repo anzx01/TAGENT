@@ -137,7 +137,7 @@ class Player:
         expects_text_document = any(
             step.get("semantic") == "shell_create_text_document" for step in self.steps
         )
-        desktop_before = _desktop_text_files() if expects_text_document else set()
+        desktop_before = _desktop_text_files() if expects_text_document else {}
         if start_delay > 0:
             self._sleep_interruptible(start_delay)
         # 强制前台窗口获得焦点
@@ -280,7 +280,12 @@ class Player:
             deadline = time.monotonic() + 3.0
             created = set()
             while time.monotonic() < deadline:
-                created = _desktop_text_files() - desktop_before
+                now_files = _desktop_text_files()
+                # 同名重建（Shell 兜底会先删同名残留再新建）不算"新增"文件名，
+                # 以 mtime 变化识别本次回放实际写入的文件
+                created = {p for p in now_files
+                           if p not in desktop_before
+                           or desktop_before[p] != p.stat().st_mtime_ns}
                 if created:
                     break
                 time.sleep(0.2)
@@ -774,7 +779,9 @@ class Player:
                 if not isinstance(ctrl_type, int):
                     ctrl_type = _control_type_by_name(target_type)
 
-            # 组合搜索：最严格的全属性组合优先，其次名称+类型，最后自动化ID/类名单独查
+            # 组合搜索：最严格的全属性组合优先，其次名称+类型、自动化ID。
+            # 不做裸类名匹配——同窗口内同类控件遍地（如所有 Button），
+            # 会命中树里第一个同类的无关控件并误触发
             candidates = []
             strict = {}
             if ctrl_type is not None:
@@ -796,8 +803,6 @@ class Player:
                 candidates.append(kw)
             if target_auto_id:
                 candidates.append(dict(AutomationId=target_auto_id))
-            if target_class:
-                candidates.append(dict(ClassName=target_class))
 
             windows = self._find_top_window(ua, loc)
             if not windows:
@@ -1207,20 +1212,20 @@ class Player:
                     log.info("  -> 菜单点按坐标命中 (%d,%d)", x0, y0)
                     return self._ok("uia_shell_menu_point")
                 # UI 菜单路径全部失败：该语义的结果可确定性达成（桌面出现新 txt），
-                # 直接 Shell 新建等价文件，比盲点菜单坐标可靠得多
-                if self._create_desktop_text_document():
+                # 直接 Shell 新建等价文件，比盲点菜单坐标可靠得多。
+                # 文件名用后续步骤引用的录制名（编号与桌面残留无关，重放幂等）
+                recorded_base = self._recorded_text_doc_name(step.get("index", -1))
+                if self._create_desktop_text_document(recorded_base):
                     self._close_shell_menu()
                     self._desktop_menu_open = False
                     # 等新文件的桌面图标在 UIA 树中物化（Explorer 刷新有延迟），
                     # 后续步骤会按名称定位该图标，过早执行会退回陈旧的原始坐标
+                    wait_name = recorded_base
                     deadline = time.time() + 6.0
-                    while time.time() < deadline and not self._stopped:
-                        for loc in step.get("locator", []):
-                            if loc.get("type") == "uia":
-                                lx, ly = self._try_locator(loc)
-                                if lx is not None and ly is not None:
-                                    log.info("  -> 新建文件图标已可见")
-                                    return self._ok("shell_create_text_document_fallback")
+                    while wait_name and time.time() < deadline and not self._stopped:
+                        if self._desktop_icon_visible(wait_name):
+                            log.info("  -> 新建文件图标已可见")
+                            break
                         time.sleep(0.5)
                     return self._ok("shell_create_text_document_fallback")
             elif menu_name and self._invoke_shell_menu_label((menu_name,), prefer_physical=True):
@@ -1306,21 +1311,66 @@ class Player:
             pass
         return roots
 
-    def _create_desktop_text_document(self):
-        """按 Explorer 规则在桌面新建文本文档（新建 文本文档.txt / (2) / (3)…）。
-        用于 shell_create_text_document 语义的确定性兜底。"""
+    @staticmethod
+    def _desktop_icon_visible(name):
+        """桌面列表里是否存在指定名称的图标（Progman/WorkerW 均查）"""
+        try:
+            import uiautomation as ua
+            for cls in ("Progman", "WorkerW"):
+                h = win32gui.FindWindow(cls, None)
+                if not h:
+                    continue
+                root = ua.ControlFromHandle(h)
+                if root is None:
+                    continue
+                item = root.ListItemControl(Name=name, searchDepth=8)
+                if item.Exists(0.5):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _recorded_text_doc_name(self, after_index):
+        """从后续步骤中提取录制时新建文本文件的名字（如 '新建 文本文档 (3)'）。
+        桌面右键新建的文件名取决于当时桌面已有多少同类文件，重放环境的残留
+        文件会让 Explorer 编号漂移；按录制引用名精确创建才能保证后续步骤
+        （双击图标/切换记事本窗口标题）全部对得上。"""
+        import re
+        pat = re.compile(r"新建 文本文档(?: \(\d+\))?")
+        for s in self.steps:
+            if s.get("index", -1) <= after_index:
+                continue
+            m = pat.search(str(s.get("window", "")))
+            if m:
+                return m.group(0)
+            for loc in s.get("locator", []):
+                if loc.get("type") == "uia":
+                    m = pat.search(str(loc.get("name", "")))
+                    if m:
+                        return m.group(0)
+        return None
+
+    def _create_desktop_text_document(self, target_base=None):
+        """在桌面新建文本文档。target_base 提供时精确使用该名字（同名旧文件
+        先删除，保证重放幂等）；否则按 Explorer 规则取下一个空位编号。"""
         try:
             from win32com.shell import shell, shellcon
             desktop = Path(shell.SHGetFolderPath(0, shellcon.CSIDL_DESKTOP, None, 0))
         except Exception:
             desktop = Path.home() / "Desktop"
-        base = desktop / "新建 文本文档.txt"
-        stem, suffix = base.stem, base.suffix
-        target, n = base, 2
-        while target.exists():
-            target = desktop / f"{stem} ({n}){suffix}"
-            n += 1
+        if target_base:
+            base = target_base[:-4] if target_base.endswith(".txt") else target_base
+            target = desktop / f"{base}.txt"
+        else:
+            base_path = desktop / "新建 文本文档.txt"
+            stem, suffix = base_path.stem, base_path.suffix
+            target, n = base_path, 2
+            while target.exists():
+                target = desktop / f"{stem} ({n}){suffix}"
+                n += 1
         try:
+            if target.exists():
+                target.unlink()  # 清掉上次回放的残留，保证后续步骤引用的就是本次新建
             target.write_text("", encoding="utf-8")
             # 通知 Shell 刷新，桌面图标尽快出现（后续步骤会按名称定位）
             try:
@@ -1563,6 +1613,19 @@ class Player:
             log.info("  -> 网页输入 (CDP) %r", text[:30])
             return res
         hwnd = self._target_hwnd(win, step.get("hwnd"))
+        # 拼音上屏模式（纯字母+结尾空格，如 'tielu ' -> 铁路）：
+        # 切换步的指示器读数可能因前台竞态失真，键入前一刻目标窗口
+        # 已被激活，此时读取/校正输入法模式最可靠
+        stripped = text.rstrip(" ")
+        if text.endswith(" ") and stripped and stripped.isascii() and stripped.isalpha():
+            try:
+                self._activate_target(hwnd)
+                time.sleep(0.2)
+                if self._engine.ime_mode_english() is True:
+                    self._engine.ime_toggle(hwnd, to_english=False)
+                    log.info("  -> 键入前 IME 校正为中文模式")
+            except Exception as e:
+                log.debug("IME 键入前校正失败: %s", e)
         if step.get("window") == "Program Manager" and any(
                 s.get("semantic") == "shell_create_text_document" for s in self.steps):
             # After Shell creates a document the rename edit is a transient
@@ -1593,7 +1656,7 @@ class Player:
                         if not is_text_item and control.ControlTypeName == "ListItemControl":
                             try:
                                 current = _desktop_text_files()
-                                is_text_item = bool(current - desktop_before)
+                                is_text_item = bool(set(current) - set(desktop_before))
                             except Exception:
                                 pass
                         if is_text_item:
@@ -1692,7 +1755,14 @@ class Player:
                 except Exception:
                     pass
             return self._engine.fg.type_text(hwnd, text)
-        return self._engine.type_text(hwnd, text)
+        # 录制流程含 IME 切换时，全部文本都走真实键入：
+        # - SetValue/PostMessage 通道绕过输入法，拼音串只会是字面量
+        # - 数字/ASCII 与拼音混排时若通道不一致，段落会散落在不同元素里丢失
+        ime_flow = any(str(s.get("key", "")).strip().lower()
+                       in self._engine._IME_TOGGLE_COMBOS for s in self.steps)
+        return self._engine.type_text(hwnd, text, keystroke_only=ime_flow or
+                                      (text.endswith(" ") and text.rstrip(" ").isascii()
+                                       and text.rstrip(" ").isalpha()))
 
     def _ok(self, method):
         from services.input.common import StepResult
@@ -1740,7 +1810,34 @@ class Player:
         if not hwnd:
             return self._fail("key_press", "no_window")
         log.info("  按键: %r -> %r", key, win32gui.GetWindowText(hwnd)[:40])
+        # IME 切换键是翻转语义，回放起点的输入法状态不可控：
+        # 按下一步文本的意图决定目标模式，仅在与当前不符时才切换
+        if key.strip().lower() in self._engine._IME_TOGGLE_COMBOS:
+            to_english = not self._next_step_wants_chinese(step)
+            log.info("  IME 切换 -> %s模式", "英" if to_english else "中")
+            return self._engine.ime_toggle(hwnd, to_english)
         return self._engine.key_press(hwnd, key)
+
+    def _next_step_wants_chinese(self, step) -> bool:
+        """录制里 ctrl+space 的意图几乎都是"切到中文输拼音"。
+        判定：下一个 input_text 的文本含 CJK，或是"纯字母+结尾空格"
+        （拼音串以空格上屏，如 'tielu ' -> 铁路）。"""
+        idx = step.get("index", -1)
+        for s in self.steps:
+            if s.get("index", -1) <= idx:
+                continue
+            if s.get("action") != "input_text":
+                if s.get("action") in ("wait", "switch_window"):
+                    continue
+                break
+            text = str(s.get("text", ""))
+            if any('\u4e00' <= ch <= '\u9fff' for ch in text):
+                return True
+            letters = text.rstrip(" ")
+            if letters.isascii() and letters.isalpha() and text.endswith(" "):
+                return True
+            return False
+        return False
 
     def _do_scroll(self, step):
         x, y = self._resolve_coords(step)
@@ -1770,10 +1867,10 @@ def _desktop_text_files():
         import os
         desktop = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
     try:
-        return {path.resolve() for path in desktop.iterdir()
+        return {path.resolve(): path.stat().st_mtime_ns for path in desktop.iterdir()
                 if path.is_file() and path.suffix.casefold() == ".txt"}
     except Exception:
-        return set()
+        return {}
 
 def _web_failure_hint(step) -> str:
     """浏览器步骤注入失败时给出网页通道提示（避免盲目等待人工）"""
