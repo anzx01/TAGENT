@@ -156,10 +156,60 @@ class Player:
         for i, step in enumerate(self.steps[from_step:], start=from_step):
             if not self._wait_if_paused() or self._stopped:
                 break
+            if step.get("action") == "verify_capability":
+                from services.capability_verifier import verify_current_screen
+                condition = step.get("postcondition") or {}
+                passed, detail = verify_current_screen(condition)
+                verification = "passed" if passed else "failed"
+                while not passed and not self._stopped:
+                    self._pause_reasons.append({"step": i, "reason": f"能力完成条件未通过: {detail}"})
+                    action = self._pause_for_human(i, detail)
+                    if action == "skip" and not self._stopped:
+                        verification = "human_confirmed"
+                        break
+                    if action != "retry" or self._stopped:
+                        break
+                    passed, detail = verify_current_screen(condition)
+                    if passed:
+                        verification = "passed"
+                        break
+                status = "ok" if passed or verification == "human_confirmed" else "failed"
+                self._step_results.append({"step": i, "action": "verify_capability",
+                                           "status": status, "detail": detail,
+                                           "verification": verification,
+                                           "capability": step.get("capability"),
+                                           "postcondition": condition,
+                                           "ts": time.strftime("%H:%M:%S")})
+                done = i + 1
+                if status == "failed" or self._stopped:
+                    break
+                self._save_checkpoint(i + 1)
+                continue
             if step.get("action") == "wait":
-                self._do_wait(step, prev_t)
+                wait_ok = self._do_wait(step, prev_t)
+                human_confirmed = False
+                if not wait_ok and not self._stopped:
+                    detail = f"等待目标窗口未出现: {step.get('window', '')}"
+                    self._pause_reasons.append({"step": i, "reason": detail})
+                    action_after_pause = self._pause_for_human(i, detail)
+                    if action_after_pause == "retry" and not self._stopped:
+                        wait_ok = self._do_wait(step, prev_t)
+                    elif action_after_pause == "skip" and not self._stopped:
+                        wait_ok = True
+                        human_confirmed = True
+                self._step_results.append({
+                    "step": i, "action": "wait",
+                    "status": "ok" if wait_ok else "failed",
+                    "detail": "人工确认目标已就绪" if human_confirmed else
+                              "等待目标已出现" if wait_ok else "等待目标超时或已中断",
+                    "verification": "human_confirmed" if human_confirmed else None,
+                    "ts": time.strftime("%H:%M:%S"),
+                })
                 prev_t = step.get("t", 0)
                 done = i + 1
+                if not wait_ok:
+                    break
+                self._save_checkpoint(i + 1)
                 continue
             wait = max(0.0, step.get("t", 0) - prev_t)
             if not self._sleep_interruptible(min(wait, max_wait)):
@@ -178,6 +228,7 @@ class Player:
             step_ok = True
             step_detail = ""
             step_method = ""
+            human_confirmed = False
             # 阶段4 安全效果标签：破坏性操作暂停确认
             if step.get("effect") == "destructive":
                 self._pause_reasons.append({"step": i, "reason": f"破坏性操作需确认: {action} {text[:20]}"})
@@ -199,7 +250,13 @@ class Player:
                             self._pause_reasons.append({
                                 "step": i, "reason": "已批准纠错动作执行失败"
                             })
-                            self._pause_for_human(i, step_detail)
+                            action_after_pause = self._pause_for_human(i, step_detail)
+                            if action_after_pause == "skip" and not self._stopped:
+                                step_ok = True
+                                locator_failed = False
+                                step_already_executed = True
+                                human_confirmed = True
+                                step_detail = "人工确认已完成纠错步骤"
                             if self._stopped:
                                 break
                     else:
@@ -221,6 +278,12 @@ class Player:
                                     step_already_executed = True
                                     step_method = retry_result.method
                                     step_detail = f"重试成功 ({retry_result.method})"
+                            elif action_after_pause == "skip" and not self._stopped:
+                                step_ok = True
+                                locator_failed = False
+                                step_already_executed = True
+                                human_confirmed = True
+                                step_detail = "人工确认已完成当前步骤"
                             if self._stopped:
                                 break
             if step_ok and not locator_failed and not step_already_executed:
@@ -238,7 +301,16 @@ class Player:
                             "step": i,
                             "reason": f"执行失败: {action} ({step_detail})",
                         })
-                        self._pause_for_human(i, step_detail)
+                        action_after_pause = self._pause_for_human(i, step_detail)
+                        if action_after_pause == "skip" and not self._stopped:
+                            step_ok = True
+                            human_confirmed = True
+                            step_detail = "人工确认已完成当前步骤"
+                        elif action_after_pause == "retry" and not self._stopped:
+                            retry_result = self._play_step(step)
+                            step_ok = bool(retry_result.ok)
+                            step_method = retry_result.method
+                            step_detail = "重试成功" if step_ok else (retry_result.reason or "重试失败")
                 else:
                     step_ok = self._last_correction_success
                     step_detail = "纠错库命中" if step_ok else "纠错动作失败"
@@ -258,8 +330,10 @@ class Player:
                 "step": i, "action": action, "text": text[:50],
                 "status": "ok" if step_ok else "paused", "detail": step_detail,
                 "method": step_method,
+                "verification": "human_confirmed" if human_confirmed else None,
                 "effect": step.get("effect", "readonly"),
                 "window": step.get("window", ""),
+                "capability": step.get("capability"),
                 "evidence": {
                     "locator_types": [
                         str(loc.get("type")) for loc in step.get("locator", [])
@@ -269,6 +343,8 @@ class Player:
                 "ts": time.strftime("%H:%M:%S")
             })
             done = i + 1
+            if not step_ok:
+                break
             self._save_checkpoint(i + 1)
             prev_t = step.get("t", 0)
             if not self._sleep_interruptible(step_delay):
@@ -387,9 +463,12 @@ class Player:
         if not self.checkpoint_path:
             return
         try:
-            self.checkpoint_path.write_text(json.dumps(
-                {"next_step": next_idx, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}),
-                encoding="utf-8")
+            checkpoint = {"next_step": next_idx, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+            if self._run_context is not None:
+                checkpoint["source_hash"] = self._run_context.source_hash
+            tmp = self.checkpoint_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(checkpoint), encoding="utf-8")
+            tmp.replace(self.checkpoint_path)
         except Exception:
             pass
 
@@ -581,7 +660,7 @@ class Player:
         return None
 
     def _do_wait(self, step, prev_t):
-        """等待步骤：等待目标窗口出现（阶段2.3），超时则继续"""
+        """等待目标窗口；超时返回失败，防止后续动作落到错误窗口。"""
         try:
             duration = min(max(0.0, float(step.get("duration", 2.0))), WAIT_HARD_TIMEOUT)
         except (TypeError, ValueError):
@@ -590,13 +669,15 @@ class Player:
         deadline = time.time() + duration
         while time.time() < deadline:
             if self._stopped:
-                return
+                return False
             if target and _window_exists(target):
                 log.info("  等待结束：窗口已出现 %r", target)
-                return
+                return True
             time.sleep(0.3)
         if target:
             log.info("  等待超时：窗口未出现 %r", target)
+            return False
+        return not self._stopped
 
     def _play_step(self, step):
         action = step.get("action")
@@ -619,7 +700,8 @@ class Player:
             ok = self._do_switch_window(step)
             if not ok:
                 return self._fail("switch_window", "no_window")
-        return StepResult(True, "unknown_ok")
+            return StepResult(True, "switch_window")
+        return StepResult(False, str(action or ""), "unsupported_action")
 
     def _play_step_with_retry(self, step):
         """Retry transient window/page availability before handing off.
@@ -1602,7 +1684,10 @@ class Player:
         return self._engine.right_click(hwnd, x, y)
 
     def _do_input_text(self, step):
+        import re
         text = self._render_text(step.get("text", ""))
+        if re.search(r"\{\{\s*\w+\s*\}\}", text):
+            return self._fail("input_text", "missing_variable")
         if not text:
             return self._ok("skip")
         # 网页输入通道（仅当页内已点入目标）

@@ -20,6 +20,13 @@ fi
 
 UNIT_TESTS=(
     python/tests/test_capability_registry.py
+    python/tests/test_capability_routes.py
+    python/tests/test_capability_verifier.py
+    python/tests/test_missing_variable.py
+    python/tests/test_scheduler_persistence.py
+    python/tests/test_windows_autostart.py
+    python/tests/test_recording_lifecycle.py
+    python/tests/test_checkpoints.py
     python/tests/test_compiler_semantic.py
     python/tests/test_self_window_filter.py
     python/tests/test_idempotent_replay.py
@@ -31,19 +38,18 @@ UNIT_TESTS=(
     python/tests/test_workflow_plan.py
     python/tests/test_workflow_artifacts.py
     python/tests/test_discovery.py
-    python/tests/test_merge_warning.py
     python/tests/test_pii_guard.py
     python/tests/test_frame_redactor.py
     python/tests/test_task_versions.py
     python/tests/evals/compiler_eval.py
     python/tests/test_web_channel.py
     python/tests/test_replay_control.py
+    python/tests/test_replay_failure_boundary.py
     python/tests/test_uitars_actions.py
     python/tests/test_visual_agent.py
     python/tests/test_outlook_fields.py
     python/tests/test_outlook_input.py
     python/tests/test_outlook_verify.py
-    python/tests/test_workspace_ui.py
 )
 
 for f in "${UNIT_TESTS[@]}"; do

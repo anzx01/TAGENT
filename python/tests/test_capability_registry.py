@@ -18,6 +18,9 @@ def test_crud():
         reg2 = CapabilityRegistry(path)
         assert reg2.list()[0]["source_task"] == "20260816_090104"
         assert reg2.list()[0]["step_range"] == [3, 9]
+        reg.detach_source("20260816_090104", {"steps": [{"action": "click"}] * 9})
+        assert reg2.list()[0]["source_task"] == ""
+        assert len(reg2.list()[0]["steps"]) == 6
         # 校验必填
         for bad in (("", "t", [0, 1]), ("n", "", [0, 1]), ("n", "t", [0])):
             try:

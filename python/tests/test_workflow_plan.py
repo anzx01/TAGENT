@@ -21,6 +21,9 @@ def main() -> int:
     assert plan["approval_required"]
     assert plan["open_questions"][0]["step"] == 1
     assert len(plan["source_hash"]) == 16
+    assert build_plan({"steps": [{"index": 0, "action": "verify_capability"}]})["steps"][0]["verification_mode"] == "human"
+    assert build_plan({"steps": [{"index": 0, "action": "verify_capability",
+                                   "postcondition": {"type": "text", "value": "完成"}}]})["steps"][0]["verification_mode"] == "automatic"
     print("workflow_plan PASS")
     return 0
 

@@ -18,6 +18,11 @@ class CapabilityEntry:
     name: str
     step_range: list[int]     # task.json 步骤区间 [start, end)
     description: str = ""
+    source_hash: str = ""
+    postcondition: dict = field(default_factory=dict)
+    steps: list[dict] = field(default_factory=list)
+    var_sources: dict = field(default_factory=dict)
+    session_steps: list[int] = field(default_factory=list)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
     runs: int = 0
     last_used: str = ""
@@ -44,21 +49,32 @@ class CapabilityRegistry:
             [e.__dict__ for e in self._entries], ensure_ascii=False, indent=2),
             encoding="utf-8")
 
+    def _refresh(self) -> None:
+        self._entries = self._load()
+
     def list(self) -> List[dict]:
+        self._refresh()
         return [e.__dict__ for e in self._entries]
 
     def register(self, name: str, source_task: str,
-                 step_range: List[int], description: str = "") -> CapabilityEntry:
+                 step_range: List[int], description: str = "", source_hash: str = "",
+                 postcondition: dict | None = None, steps: List[dict] | None = None,
+                 var_sources: dict | None = None, session_steps: List[int] | None = None) -> CapabilityEntry:
+        self._refresh()
         name = name.strip()
         if not name or not source_task or len(step_range) != 2:
             raise ValueError("name/source_task/step_range[start,end) 必填")
         entry = CapabilityEntry(name=name, source_task=source_task,
-                                step_range=step_range, description=description)
+                                step_range=step_range, description=description,
+                                source_hash=source_hash, postcondition=postcondition or {},
+                                steps=steps or [], var_sources=var_sources or {},
+                                session_steps=session_steps or [])
         self._entries.append(entry)
         self._save()
         return entry
 
     def delete(self, cap_id: str) -> bool:
+        self._refresh()
         before = len(self._entries)
         self._entries = [e for e in self._entries if e.id != cap_id]
         if len(self._entries) != before:
@@ -67,6 +83,7 @@ class CapabilityRegistry:
         return False
 
     def mark_used(self, cap_id: str) -> bool:
+        self._refresh()
         for e in self._entries:
             if e.id == cap_id:
                 e.runs += 1
@@ -74,6 +91,23 @@ class CapabilityRegistry:
                 self._save()
                 return True
         return False
+
+    def detach_source(self, source_task: str, task: dict | None = None,
+                      meta: dict | None = None) -> None:
+        """Keep capabilities usable after their source recording is removed."""
+        self._refresh()
+        for entry in self._entries:
+            if entry.source_task == source_task:
+                if not entry.steps and task:
+                    start, end = entry.step_range
+                    entry.steps = task.get("steps", [])[start:end]
+                    entry.var_sources = (meta or {}).get("var_sources", {})
+                    entry.session_steps = [index - start for index in
+                                           (meta or {}).get("session_steps", [])
+                                           if start <= index < end]
+                entry.source_task = ""
+                entry.step_range = [0, len(entry.steps)]
+        self._save()
 
 
 if __name__ == "__main__":

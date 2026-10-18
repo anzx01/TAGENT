@@ -1,7 +1,9 @@
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use tauri::Manager;
 
@@ -14,14 +16,59 @@ fn backend_running() -> bool {
     TcpStream::connect(("127.0.0.1", BACKEND_PORT)).is_ok()
 }
 
+fn backend_has_scheduled_jobs() -> Option<bool> {
+    let mut stream = TcpStream::connect(("127.0.0.1", BACKEND_PORT)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let request = format!(
+        "GET /lifecycle HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        BACKEND_PORT
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return None;
+    }
+    let mut response = Vec::new();
+    if stream.read_to_end(&mut response).is_err() {
+        return None;
+    }
+    let Some(body_start) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return None;
+    };
+    scheduled_jobs_in_status_value(&response[body_start + 4..])
+}
+
+fn scheduled_jobs_in_status_value(body: &[u8]) -> Option<bool> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["schedules"].as_object().map(|jobs| !jobs.is_empty()))
+}
+
+fn request_backend_shutdown() {
+    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", BACKEND_PORT)) {
+        let request = format!(
+            "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            BACKEND_PORT
+        );
+        let _ = stream.write_all(request.as_bytes());
+    }
+}
+
 /// 启动 Python 后端 sidecar；已在运行则跳过
 fn project_root(resource_dir: Option<PathBuf>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(path) = resource_dir {
-        candidates.push(path);
-    }
-    if let Ok(path) = std::env::current_dir() {
-        candidates.push(path);
+    if cfg!(debug_assertions) {
+        if let Ok(path) = std::env::current_dir() {
+            candidates.push(path);
+        }
+        if let Some(path) = resource_dir {
+            candidates.push(path);
+        }
+    } else {
+        if let Some(path) = resource_dir {
+            candidates.push(path);
+        }
+        if let Ok(path) = std::env::current_dir() {
+            candidates.push(path);
+        }
     }
     if let Ok(path) = std::env::current_exe() {
         if let Some(parent) = path.parent() {
@@ -42,9 +89,8 @@ fn spawn_backend(resource_dir: Option<PathBuf>) -> Option<Child> {
     if backend_running() {
         return None;
     }
-    let root = project_root(resource_dir).unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
+    let root = project_root(resource_dir)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let data_dir = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .map(|p| p.join("TAGENT"));
@@ -52,7 +98,11 @@ fn spawn_backend(resource_dir: Option<PathBuf>) -> Option<Child> {
     // 否则工作区里残留的旧 dist/tagent-server.exe 会掩盖最新修复。
     let packaged_sidecar = root.join("tagent-server.exe");
     let development_sidecar = root.join("dist/tagent-server.exe");
-    let sidecar = if packaged_sidecar.exists() { packaged_sidecar } else { development_sidecar };
+    let sidecar = if packaged_sidecar.exists() {
+        packaged_sidecar
+    } else {
+        development_sidecar
+    };
     if !cfg!(debug_assertions) && sidecar.exists() {
         let mut command = Command::new(sidecar);
         command.current_dir(&root);
@@ -67,7 +117,9 @@ fn spawn_backend(resource_dir: Option<PathBuf>) -> Option<Child> {
     let venv_py = root.join(".venv/Scripts/python.exe");
     let server = root.join("python/server.py");
     let venv_ok = venv_py.exists()
-        && Command::new(&venv_py).arg("--version").output()
+        && Command::new(&venv_py)
+            .arg("--version")
+            .output()
             .map(|output| output.status.success())
             .unwrap_or(false);
     let mut cmd = if venv_ok {
@@ -117,13 +169,41 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            if let Some(state) = app_handle.try_state::<BackendState>() {
-                if let Some(mut child) = state.0.lock().unwrap().take() {
-                    let _ = child.kill();
+            match backend_has_scheduled_jobs() {
+                Some(false) => {
+                    request_backend_shutdown();
+                    if let Some(state) = app_handle.try_state::<BackendState>() {
+                        if let Some(mut child) = state.0.lock().unwrap().take() {
+                            let _ = child.kill();
+                        }
+                    }
                 }
+                Some(true) => log::info!(
+                    "Scheduled tasks remain; leaving the backend running after UI exit"
+                ),
+                None => log::warn!(
+                    "Could not read backend schedules; leaving it running to avoid interrupting work"
+                ),
             }
-            // 兜底：主动通知后端退出（独立启动的后端也能被清理）
-            let _ = TcpStream::connect(("127.0.0.1", BACKEND_PORT));
+            if let Some(state) = app_handle.try_state::<BackendState>() {
+                state.0.lock().unwrap().take();
+            }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scheduled_jobs_keep_backend_alive() {
+        assert_eq!(
+            super::scheduled_jobs_in_status_value(br#"{"schedules":{"task-1":{"kind":"daily"}}}"#),
+            Some(true)
+        );
+        assert_eq!(
+            super::scheduled_jobs_in_status_value(br#"{"schedules":{}}"#),
+            Some(false)
+        );
+        assert_eq!(super::scheduled_jobs_in_status_value(b"invalid"), None);
+    }
 }

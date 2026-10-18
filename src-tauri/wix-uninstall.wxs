@@ -1,0 +1,13 @@
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <CustomAction Id="RemoveTagentScheduledBackend"
+                  Directory="SystemFolder"
+                  ExeCommand="schtasks.exe /Delete /TN &quot;TAGENT Scheduled Backend&quot; /F"
+                  Execute="deferred"
+                  Impersonate="yes"
+                  Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="RemoveTagentScheduledBackend" After="InstallInitialize">REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

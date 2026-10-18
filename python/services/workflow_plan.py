@@ -35,6 +35,8 @@ def _step_mode(step: dict[str, Any], session_steps: set[int]) -> tuple[str, str 
         return "human_required", "登录/验证或破坏性操作需要人工确认"
     if action in {"wait", "switch_window"}:
         return "deterministic", None
+    if action == "verify_capability":
+        return "deterministic", None
     if not locators:
         # Text/keyboard steps can still be deterministic when their target
         # window is known; otherwise the plan must ask the user to clarify it.
@@ -72,6 +74,11 @@ def build_plan(task: dict[str, Any], *, session_steps: list[int] | None = None,
                 for loc in step.get("locator", []) if isinstance(loc, dict)
             ],
             "text_preview": str(step.get("text", step.get("key", "")))[:80],
+            "capability": step.get("capability"),
+            "postcondition": step.get("postcondition"),
+            "verification_mode": ("automatic" if step.get("postcondition") else "human")
+                                 if step.get("action") == "verify_capability" else None,
+            "capability_end": bool(step.get("capability_end")),
         }
         steps.append(item)
         for name in re.findall(r"\{\{\s*(\w+)\s*\}\}", str(step.get("text", ""))):
@@ -85,6 +92,9 @@ def build_plan(task: dict[str, Any], *, session_steps: list[int] | None = None,
             })
         if question:
             questions.append({"step": item["index"], "question": question})
+        if item["action"] == "verify_capability" and not step.get("postcondition"):
+            questions.append({"step": item["index"],
+                              "question": "此能力没有自动完成条件；运行到这里时需要人工核实结果"})
     source_hash = plan_source_hash(task)
     return {
         "version": 1,

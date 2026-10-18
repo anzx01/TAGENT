@@ -23,6 +23,9 @@ from compiler import Compiler
 from logger import get_logger
 from routes_tasks import build_router
 from services.scheduler import Scheduler
+from services.windows_autostart import sync as sync_windows_autostart
+from services.recording_lifecycle import delete_recording as remove_recording
+from services.capability_registry import CapabilityRegistry
 from services.security import get_security, BLACKLIST
 
 log = get_logger("server")
@@ -94,16 +97,25 @@ def _scheduled_run(rec_id: str):
         with _player_lock:
             if _player:
                 log.warning("[定时] 有回放进行中，跳过 %s", rec_id)
-                return
-        _launch_replay(rec_id, None, trigger="schedule")
+                return False
+        return bool(_launch_replay(rec_id, None, trigger="schedule"))
     except Exception:
         log.exception("[定时] 启动失败 %s", rec_id)
+        return False
 
 
 # 任务库路由 + 定时调度器（模块级初始化，确保 uvicorn 启动时也注册）
 _scheduler = Scheduler(TASKS_DB, _scheduled_run)
+if os.name == "nt":
+    try:
+        sync_windows_autostart(BASE_DIR, bool(_scheduler.list_jobs()))
+    except Exception:
+        log.exception("无法同步 Windows 登录后台任务")
 _scheduler.start()
-app.include_router(build_router(DATA_DIR, _scheduler))
+app.include_router(build_router(
+    DATA_DIR, _scheduler,
+    (lambda enabled: sync_windows_autostart(BASE_DIR, enabled)) if os.name == "nt" else None,
+))
 
 # 预热安全单例（密钥初始化/UIA 缓存），避免录制主循环中首次调用阻塞
 from services.security import get_security  # noqa: E402
@@ -345,6 +357,18 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0,
         var_sources = _ts.get_var_sources(rec_id)  # 阶段2.1：变量来源
     except Exception:
         var_sources = {}
+    if trigger == "schedule":
+        if not run_context.review_approved:
+            log.warning("拒绝未批准方案的定时回放: %s", rec_id)
+            return None
+        import re as _re
+        required = {name for step in run_context.steps for name in _re.findall(
+            r"\{\{\s*(\w+)\s*\}\}", str(step.get("text", "")))}
+        missing = [name for name in required if not isinstance(var_sources.get(name), dict)
+                   or var_sources[name].get("type") not in {"clipboard", "ui"}]
+        if missing:
+            log.warning("拒绝缺少变量来源的定时回放 %s: %s", rec_id, missing)
+            return None
 
     # 阶段3.3：纠错库（自愈），回放时优先尝试人工纠正动作
     from services.corrections import CorrectionStore
@@ -410,8 +434,9 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0,
                     # against the same suffix rather than the full task.
                     result.setdefault("from_step", from_step)
                 log.info("回放完成: %s", path)
-                # 只有自然完成才删除断点；中断结果保留断点供用户续跑。
-                if not player._stopped:
+                # Only a verified successful run consumes the checkpoint.
+                # Failed or interrupted work must remain resumable.
+                if isinstance(result, dict) and result.get("success") is True:
                     ckpt_file.unlink(missing_ok=True)
             if result is None:
                 result = {"summary": "回放未产生结果", "steps": [],
@@ -476,6 +501,10 @@ def _write_report(rec_id: str, result, run_context=None):
             report = {"rec_id": rec_id, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
             report.update(result)
         report.setdefault("side_effects", [])
+        failed_step = next((s for s in report.get("steps", [])
+                            if s.get("status") not in {"ok", "skipped"}), None)
+        if failed_step and failed_step.get("capability"):
+            report["failed_capability"] = failed_step["capability"]
         report.setdefault("human_takeovers", report.get("pause_reasons", []))
         report.setdefault("agent_suggestions", [])
         report["finished_at"] = time.time()
@@ -548,6 +577,7 @@ class ReplayRequest(BaseModel):
     recording_id: str | None = None
     variables: dict[str, str] | None = None
     from_step: int = 0
+    resume_checkpoint: bool = False
     trigger: str = "manual"
 
 
@@ -593,6 +623,12 @@ def status():
             "blacklist": sorted(BLACKLIST),
         },
     }
+
+
+@app.get("/lifecycle")
+def lifecycle_status():
+    """Small local status endpoint used by the desktop shell on exit."""
+    return {"schedules": _scheduler.list_jobs() if _scheduler else {}}
 
 
 @app.post("/record/start")
@@ -680,6 +716,14 @@ def start_replay(req: ReplayRequest):
         step_count = 0
     if step_count == 0:
         return {"ok": False, "msg": "该录制没有捕获任何步骤，请重新录制后再回放"}
+    if req.resume_checkpoint:
+        from services.checkpoints import resume_step
+        try:
+            task = json.loads(task_file.read_text(encoding="utf-8"))
+            if not resume_step(BASE_DIR / "data" / f"ckpt_{rec_dir.name}.json", task, req.from_step):
+                return {"ok": False, "msg": "断点已失效，请从头运行任务"}
+        except (OSError, ValueError, TypeError, KeyError):
+            return {"ok": False, "msg": "断点已失效，请从头运行任务"}
     if _launch_replay(rec_dir.name, req.variables or {}, req.from_step, req.trigger):
         return {"ok": True, "recording_id": rec_dir.name}
     return {"ok": False, "msg": "没有可回放的内容"}
@@ -763,7 +807,10 @@ def replay_status():
         step = player.steps[current]
         action = step.get("action", "")
         text = step.get("text", step.get("key", ""))
-        step_desc = f"{action} {text}".strip()[:40]
+        if action == "verify_capability":
+            step_desc = f"核实「{(step.get('capability') or {}).get('name', '能力')}」是否完成"
+        else:
+            step_desc = f"{action} {text}".strip()[:40]
     # 检查最近步骤是否有错误
     if player._step_results:
         last = player._step_results[-1]
@@ -825,13 +872,21 @@ def rerecord_step():
 @app.get("/replay/checkpoint/{rec_id}")
 def get_checkpoint(rec_id: str):
     """阶段5.1：查询断点位置（上次中断处）"""
-    if _resolve_rec_dir(rec_id) is None:
+    rec_dir = _resolve_rec_dir(rec_id)
+    if rec_dir is None:
         return {"ok": False, "msg": "找不到任务"}
     ckpt = BASE_DIR / "data" / f"ckpt_{rec_id}.json"
     if not ckpt.exists():
         return {"ok": True, "checkpoint": None}
-    import json as _json
-    return {"ok": True, "checkpoint": _json.loads(ckpt.read_text(encoding="utf-8"))}
+    try:
+        task = json.loads((rec_dir / "task.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"ok": False, "msg": "任务内容不可用"}
+    from services.checkpoints import read_checkpoint
+    saved = read_checkpoint(ckpt, task)
+    if saved is None:
+        return {"ok": False, "msg": "断点不可用"}
+    return {"ok": True, "checkpoint": saved}
 
 
 @app.get("/recordings")
@@ -880,8 +935,17 @@ def delete_recording(rec_id: str):
     rec_dir = _resolve_rec_dir(rec_id)
     if rec_dir is None:
         return {"ok": False, "msg": "找不到录制"}
-    shutil.rmtree(rec_dir)
-    return {"ok": True}
+    sync = (lambda enabled: sync_windows_autostart(BASE_DIR, enabled)) if os.name == "nt" else None
+    registry = CapabilityRegistry(DATA_DIR / "capabilities.json")
+    try:
+        task_file = rec_dir / "task.json"
+        task = json.loads(task_file.read_text(encoding="utf-8")) if task_file.exists() else {}
+        meta_file = rec_dir / "meta.json"
+        meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
+        registry.detach_source(rec_id, task, meta)
+    except (OSError, ValueError):
+        return {"ok": False, "msg": "无法固化关联能力，录制未删除"}
+    return remove_recording(rec_id, rec_dir, _scheduler, sync)
 
 
 def _merge_warning(base: list[dict], extra: list[dict]) -> str | None:

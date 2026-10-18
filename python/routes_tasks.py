@@ -7,10 +7,12 @@
 - 密码框安全暂停
 """
 import json
+import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
+from typing import Literal
 
 from logger import get_logger
 from services.capability_registry import CapabilityRegistry
@@ -20,16 +22,25 @@ from services.task_store import TaskStore
 from services.workflow_plan import build_plan, plan_source_hash
 from services.workflow_artifacts import export_artifact
 from services.discovery import rank_candidates
+from services.capability_compose import compose_task
 from services.security import get_security
+from services.checkpoints import read_checkpoint
 
 log = get_logger("routes")
 
 
+def _run_succeeded(report: dict) -> bool:
+    if "success" in report:
+        return bool(report["success"])
+    steps = report.get("steps", [])
+    return bool(steps) and all(step.get("status") == "ok" for step in steps)
+
+
 class ScheduleBody(BaseModel):
-    kind: str = "interval"
-    hour: int = 9
-    minute: int = 0
-    minutes: int = 60
+    kind: Literal["interval", "daily"] = "interval"
+    hour: int = Field(default=9, ge=0, le=23)
+    minute: int = Field(default=0, ge=0, le=59)
+    minutes: int = Field(default=60, ge=1)
 
 
 class CorrectBody(BaseModel):
@@ -42,6 +53,12 @@ class CapRegisterBody(BaseModel):
     source_task: str
     step_range: list[int] = [0, 0]
     description: str = ""
+    postcondition: dict = Field(default_factory=dict)
+
+
+class ComposeBody(BaseModel):
+    name: str
+    capability_ids: list[str]
 
 
 class ExportBody(BaseModel):
@@ -57,7 +74,7 @@ class ReviewBody(BaseModel):
     answers: dict[str, str] = Field(default_factory=dict)
 
 
-def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
+def build_router(data_dir: Path, scheduler: Scheduler, autostart_sync=None) -> APIRouter:
     """路由工厂：注入录制目录与调度器，避免全局状态循环依赖。"""
     router = APIRouter(prefix="/tasks", tags=["tasks"])
     store = TaskStore(data_dir)
@@ -69,6 +86,28 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
             return None
         d = data_dir / rec_id
         return d if d.is_dir() else None
+
+    def _disable_schedule(rec_id: str) -> None:
+        previous = scheduler.list_jobs().get(rec_id)
+        configured = store.schedule(rec_id)
+        if previous is None and configured is None:
+            return
+        try:
+            if previous is not None:
+                scheduler.set_job(rec_id, None)
+            if autostart_sync and previous is not None:
+                autostart_sync(bool(scheduler.list_jobs()))
+            if configured is not None:
+                store.set_schedule(rec_id, None)
+        except Exception:
+            if previous is not None:
+                scheduler.set_job(rec_id, previous)
+            try:
+                if autostart_sync:
+                    autostart_sync(bool(scheduler.list_jobs()))
+            except Exception:
+                log.exception("回滚 Windows 登录后台任务失败")
+            raise
 
     @router.get("")
     def list_tasks():
@@ -90,10 +129,22 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
             # events. Compilation may merge several text events into one task
             # step, so prefer task.json when it is available.
             tf = d / "task.json"
+            task_data = None
             if tf.exists():
                 try:
-                    count = len(json.loads(tf.read_text(encoding="utf-8")).get("steps", []))
+                    task_data = json.loads(tf.read_text(encoding="utf-8"))
+                    count = len(task_data.get("steps", []))
                 except Exception:
+                    pass
+            checkpoint = None
+            checkpoint_file = data_dir.parent / "data" / f"ckpt_{rec_id}.json"
+            if task_data is not None and checkpoint_file.exists():
+                saved = read_checkpoint(checkpoint_file, task_data)
+                try:
+                    next_step = int(saved.get("next_step", 0)) if saved and not saved["stale"] else 0
+                    if 0 < next_step < count:
+                        checkpoint = {"next_step": next_step, "total": count}
+                except (TypeError, ValueError):
                     pass
             corr_n = 0
             cf = d / "corrections.json"
@@ -114,6 +165,7 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
                 "vars": len(store.variables(rec_id)),
                 "corrections": corr_n,
                 "replayable": count > 0,
+                "checkpoint": checkpoint,
                 "runs": run_count,
             })
         return {"ok": True, "tasks": items}
@@ -161,7 +213,7 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
                         continue
                     steps = report.get("steps", [])
                     runs_by_task.setdefault(rec_id, []).append({
-                        "success": bool(steps) and all(s.get("status") == "ok" for s in steps),
+                        "success": _run_succeeded(report),
                         "pause_count": len(report.get("pause_reasons", [])),
                     })
                 except (OSError, ValueError):
@@ -204,9 +256,10 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
                         "plan_revision": report.get("plan_revision"),
                         "source_hash": report.get("source_hash"),
                         "summary": report.get("summary", ""),
-                        "success": bool(steps) and all(s.get("status") == "ok" for s in steps),
+                        "success": _run_succeeded(report),
                         "step_count": len(steps),
                         "pause_count": len(report.get("pause_reasons", [])),
+                        "failed_capability": report.get("failed_capability"),
                         "eval": report.get("eval"),
                     })
                 except (OSError, ValueError):
@@ -320,6 +373,11 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
         if _resolve(rec_id) is None:
             return {"ok": False, "msg": "找不到任务"}
         if store.set_variable(rec_id, step_index, var):
+            try:
+                _disable_schedule(rec_id)
+            except Exception as exc:
+                log.exception("计划变更后停用定时任务失败: %s", rec_id)
+                return {"ok": False, "msg": f"变量已保存，但停用旧定时任务失败: {exc}"}
             return {"ok": True, "vars": store.variables(rec_id)}
         return {"ok": False, "msg": "步骤无效或非输入步骤"}
 
@@ -335,7 +393,34 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
     def set_var_source(rec_id: str, var_name: str, body: dict = None):
         if _resolve(rec_id) is None:
             return {"ok": False, "msg": "找不到任务"}
+        if body is not None and (body.get("type") not in {"clipboard", "ui"}
+                                 or (body.get("type") == "ui"
+                                     and not str(body.get("control_name", "")).strip())):
+            return {"ok": False, "msg": "变量来源无效"}
+        if store.get_var_sources(rec_id).get(var_name) == body:
+            return {"ok": True, "sources": store.get_var_sources(rec_id)}
         store.set_var_source(rec_id, var_name, body)
+        try:
+            _disable_schedule(rec_id)
+        except Exception as exc:
+            log.exception("变量来源变更后停用定时任务失败: %s", rec_id)
+            return {"ok": False, "msg": f"变量来源已保存，但停用旧定时任务失败: {exc}"}
+        review_path = data_dir / rec_id / "review.json"
+        if review_path.exists():
+            try:
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+                if review.get("approved"):
+                    review["approved"] = False
+                    review["updated_at"] = __import__("time").time()
+                    review.setdefault("history", []).append({
+                        "action": "revoke", "reason": "variable_source_changed",
+                        "ts": review["updated_at"],
+                    })
+                    tmp = review_path.with_suffix(".json.tmp")
+                    tmp.write_text(json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8")
+                    tmp.replace(review_path)
+            except (OSError, ValueError) as exc:
+                return {"ok": False, "msg": f"变量来源已保存，但撤销旧审批失败: {exc}"}
         return {"ok": True, "sources": store.get_var_sources(rec_id)}
 
     # ---------- 阶段2.4 会话步骤 ----------
@@ -345,20 +430,70 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
         if _resolve(rec_id) is None:
             return {"ok": False, "msg": "找不到任务"}
         store.set_session_step(rec_id, step_index, on)
+        try:
+            _disable_schedule(rec_id)
+        except Exception as exc:
+            log.exception("会话步骤变更后停用定时任务失败: %s", rec_id)
+            return {"ok": False, "msg": f"会话步骤已保存，但停用旧定时任务失败: {exc}"}
         return {"ok": True}
 
     # ---------- 阶段4.2 定时调度 ----------
 
     @router.put("/{rec_id}/schedule")
     def set_schedule(rec_id: str, body: ScheduleBody):
-        if _resolve(rec_id) is None:
+        root = _resolve(rec_id)
+        if root is None:
             return {"ok": False, "msg": "找不到任务"}
-        scheduler.set_job(rec_id, body.model_dump())
+        try:
+            task = json.loads((root / "task.json").read_text(encoding="utf-8"))
+            plan_path = root / "plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8")) if plan_path.exists() else task.get("plan", {})
+            review_path = root / "review.json"
+            review = json.loads(review_path.read_text(encoding="utf-8")) if review_path.exists() else {}
+            from services.run_context import build_run_context
+            context = build_run_context(rec_id, task, plan, trigger="schedule", review=review)
+        except (OSError, ValueError, TypeError) as exc:
+            return {"ok": False, "msg": f"无法验证当前任务方案: {exc}"}
+        if not context.review_approved:
+            return {"ok": False, "msg": "请先审阅并批准当前方案，再启用定时执行"}
+        sources = store.get_var_sources(rec_id)
+        missing = [name for name in store.variables(rec_id)
+                   if not isinstance(sources.get(name), dict)
+                   or sources[name].get("type") not in {"clipboard", "ui"}]
+        if missing:
+            return {"ok": False, "msg": f"定时执行缺少变量来源: {', '.join(missing)}"}
+        previous = scheduler.list_jobs().get(rec_id)
+        try:
+            scheduler.set_job(rec_id, body.model_dump())
+            if autostart_sync:
+                autostart_sync(bool(scheduler.list_jobs()))
+            store.set_schedule(rec_id, body.model_dump())
+        except Exception as exc:
+            scheduler.set_job(rec_id, previous)
+            try:
+                if autostart_sync:
+                    autostart_sync(bool(scheduler.list_jobs()))
+            except Exception:
+                log.exception("回滚 Windows 登录后台任务失败")
+            return {"ok": False, "msg": f"无法保存定时任务或注册登录启动: {exc}"}
         return {"ok": True}
 
     @router.delete("/{rec_id}/schedule")
     def delete_schedule(rec_id: str):
+        previous = scheduler.list_jobs().get(rec_id)
         scheduler.set_job(rec_id, None)
+        try:
+            if autostart_sync:
+                autostart_sync(bool(scheduler.list_jobs()))
+            store.set_schedule(rec_id, None)
+        except Exception as exc:
+            scheduler.set_job(rec_id, previous)
+            try:
+                if autostart_sync:
+                    autostart_sync(bool(scheduler.list_jobs()))
+            except Exception:
+                log.exception("回滚 Windows 登录后台任务失败")
+            return {"ok": False, "msg": f"无法注销登录启动任务: {exc}"}
         return {"ok": True}
 
     # ---------- 阶段3 纠错库 ----------
@@ -415,24 +550,68 @@ def build_router(data_dir: Path, scheduler: Scheduler) -> APIRouter:
     def list_capabilities():
         return {"ok": True, "capabilities": cap_registry.list()}
 
+    @router.post("/capabilities/compose")
+    def compose_capabilities(body: ComposeBody):
+        try:
+            task = compose_task(data_dir, cap_registry.list(), body.capability_ids, body.name)
+        except ValueError as ex:
+            return {"ok": False, "msg": str(ex)}
+        from datetime import datetime, timedelta
+        stamp = datetime.now()
+        rec_id = stamp.strftime("%Y%m%d_%H%M%S")
+        while (data_dir / rec_id).exists():
+            stamp += timedelta(seconds=1)
+            rec_id = stamp.strftime("%Y%m%d_%H%M%S")
+        task["source"] = rec_id
+        meta = task.pop("composed_meta", {})
+        task["plan"] = build_plan(task, session_steps=meta.get("session_steps", []))
+        plan = task["plan"]
+        meta.update({"name": body.name.strip(), "created_by": "capability_compose"})
+        from services.task_versions import TaskVersions
+        try:
+            with tempfile.TemporaryDirectory(dir=data_dir.parent) as staging:
+                target = Path(staging) / rec_id
+                target.mkdir()
+                (target / "task.json").write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+                (target / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+                (target / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                TaskVersions(target).snapshot(task, "capability_composed")
+                target.replace(data_dir / rec_id)
+        except OSError as ex:
+            log.error("组合任务保存失败: %s", ex)
+            return {"ok": False, "msg": "组合任务保存失败"}
+        for cap_id in body.capability_ids:
+            cap_registry.mark_used(cap_id)
+        return {"ok": True, "task": {"id": rec_id, "name": body.name.strip(), "steps": len(task["steps"])}}
+
     @router.post("/capabilities")
     def register_capability(body: CapRegisterBody):
+        if body.postcondition and (body.postcondition.get("type") not in {"window", "text"}
+                                   or not str(body.postcondition.get("value", "")).strip()):
+            return {"ok": False, "msg": "完成条件须为窗口标题或屏幕文字，并填写目标文本"}
         d = _resolve(body.source_task)
         if d is None:
             return {"ok": False, "msg": "找不到源任务"}
         tf = d / "task.json"
         if tf.exists():
             try:
-                total = len(json.loads(tf.read_text(encoding="utf-8")))
+                source_task = json.loads(tf.read_text(encoding="utf-8"))
+                total = len(source_task.get("steps", []))
             except Exception:
                 total = 0
         else:
             total = 0
         start, end = body.step_range
-        if not (0 <= start < end <= max(total, 1)):
+        if not (0 <= start < end <= total):
             return {"ok": False, "msg": f"步骤区间越界（共 {total} 步）"}
         try:
-            entry = cap_registry.register(body.name, body.source_task, [start, end], body.description)
+            meta = store.load_meta(body.source_task)
+            entry = cap_registry.register(
+                body.name, body.source_task, [start, end], body.description,
+                plan_source_hash(source_task), body.postcondition,
+                source_task["steps"][start:end], meta.get("var_sources", {}),
+                [index - start for index in meta.get("session_steps", [])
+                 if start <= index < end])
         except ValueError as ex:
             return {"ok": False, "msg": str(ex)}
         return {"ok": True, "capability": entry.__dict__}
