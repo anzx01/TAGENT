@@ -63,16 +63,31 @@ def _paths(data_dir: Path) -> tuple[Path, Path]:
     return root / "start.vbs", root / "task.xml"
 
 
+def _schtasks(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """argv 已含 schtasks.exe 本身。schtasks 本地化输出(GBK 等)不能按 UTF-8
+    严格解码,否则 reader 线程抛 UnicodeDecodeError 使 stdout/stderr 变成 None;
+    mbcs+replace 保证必有可读字符串。"""
+    return subprocess.run(argv, capture_output=True, text=True,
+                          encoding="mbcs", errors="replace")
+
+
+def _task_exists(runner, task_name: str) -> bool:
+    return runner(["schtasks.exe", "/Query", "/TN", task_name],
+                  capture_output=True, text=True).returncode == 0
+
+
 def sync(data_dir: Path, enabled: bool, executable: Path | None = None,
-         args: list[str] | None = None, runner=subprocess.run,
+         args: list[str] | None = None, runner=_schtasks,
          task_name: str = TASK_NAME) -> None:
     """Reconcile this user's logon task; raise on registration errors."""
     vbs_path, xml_path = _paths(data_dir)
     if not enabled:
         result = runner(["schtasks.exe", "/Delete", "/TN", task_name, "/F"],
                         capture_output=True, text=True)
-        if result.returncode and "cannot find" not in (result.stdout + result.stderr).lower():
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+        # 删除失败但任务已不存在(输出是本地化文本,不能按字面匹配)视为成功
+        if result.returncode and _task_exists(runner, task_name):
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip()
+                               or "schtasks delete failed")
         vbs_path.unlink(missing_ok=True)
         xml_path.unlink(missing_ok=True)
         try:
