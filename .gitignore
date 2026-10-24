@@ -41,3 +41,4 @@ desktop.ini
 # Build artifacts (local only)
 build/
 dist/
+python/tests/evals/results/
