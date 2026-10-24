@@ -66,13 +66,20 @@ def _skill_markdown(task: dict[str, Any], plan: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _automation(task: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+def _automation(task: dict[str, Any], plan: dict[str, Any], schedule: dict | None = None) -> dict[str, Any]:
+    trigger = {"type": "manual"}
+    if schedule and schedule.get("kind") == "daily":
+        trigger = {"type": "schedule", "kind": "daily",
+                   "hour": schedule["hour"], "minute": schedule["minute"]}
+    elif schedule and schedule.get("kind") == "interval":
+        trigger = {"type": "schedule", "kind": "interval",
+                   "minutes": schedule["minutes"]}
     return {
         "version": 1,
         "name": _label(task),
         "source_task": task.get("source", ""),
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "trigger": {"type": "manual"},
+        "trigger": trigger,
         "execution_policy": plan.get("execution_policy", "deterministic_first_bounded_assist"),
         "plan_revision": plan.get("revision", 1),
         "source_hash": plan.get("source_hash", ""),
@@ -113,7 +120,9 @@ def export_artifact(recording_dir: str | Path, kind: str) -> Path:
         path.write_text(_skill_markdown(task, plan), encoding="utf-8")
     elif kind == "automation":
         path = root / "automation.json"
-        path.write_text(json.dumps(_automation(task, plan), ensure_ascii=False, indent=2), encoding="utf-8")
+        meta_path = root / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        path.write_text(json.dumps(_automation(task, plan, meta.get("schedule")), ensure_ascii=False, indent=2), encoding="utf-8")
     else:
         raise ValueError("kind must be skill or automation")
     return path

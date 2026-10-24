@@ -41,6 +41,14 @@ def main() -> int:
         payload = json.loads(automation.read_text(encoding="utf-8"))
         assert payload["trigger"]["type"] == "manual"
         assert payload["steps"][0]["text"] == "{{ order_id }}"
+        (root / "meta.json").write_text(json.dumps({"schedule": {
+            "kind": "daily", "hour": 9, "minute": 30}}), encoding="utf-8")
+        payload = json.loads(export_artifact(root, "automation").read_text(encoding="utf-8"))
+        assert payload["trigger"] == {"type": "schedule", "kind": "daily", "hour": 9, "minute": 30}
+        (root / "meta.json").write_text(json.dumps({"schedule": {
+            "kind": "interval", "minutes": 15, "next_run_at": 123}}), encoding="utf-8")
+        payload = json.loads(export_artifact(root, "automation").read_text(encoding="utf-8"))
+        assert payload["trigger"] == {"type": "schedule", "kind": "interval", "minutes": 15}
     print("workflow_artifacts PASS")
     return 0
 

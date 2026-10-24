@@ -60,12 +60,22 @@ def main():
         checkpoint_file.unlink()
         run_dir = root.parent / "runs"
         run_dir.mkdir()
-        (run_dir / f"1781760000000-{task_dir.name}_{task_dir.name}.json").write_text(json.dumps({
+        run_file = run_dir / f"1781760000000-{task_dir.name}_{task_dir.name}.json"
+        run_file.write_text(json.dumps({
             "rec_id": task_dir.name, "trigger": "schedule", "success": False,
-            "steps": [{"status": "ok"}], "summary": "已中断",
+            "steps": [{"step": 0, "action": "click", "status": "failed",
+                       "detail": "窗口未找到: secret text", "verification": "failed"}],
+            "pause_reasons": [{"step": 0, "reason": "等待目标窗口未出现: secret text"}],
+            "summary": "已中断", "plan_revision": 3,
         }), encoding="utf-8")
         history = client.get(f"/tasks/{task_dir.name}/runs").json()["runs"]
         assert len(history) == 1 and not history[0]["success"] and history[0]["trigger"] == "schedule"
+        detail = client.get(f"/tasks/{task_dir.name}/runs/{run_file.stem}").json()
+        assert "secret text" not in json.dumps(detail, ensure_ascii=False)
+        assert detail["report"]["pause_reasons"][0]["reason"] == "等待目标窗口未出现"
+        assert detail["report"]["plan_revision"] == 3
+        assert not client.get(f"/tasks/{task_dir.name}/runs/invalid.id").json()["ok"]
+        assert not client.get(f"/tasks/{empty_dir.name}/runs/{run_file.stem}").json()["ok"]
         discovery = client.get("/tasks/discovery").json()["candidates"]
         assert next(item for item in discovery if item["task_id"] == task_dir.name)["success_rate"] == 0
         url = "/tasks/capabilities"
@@ -111,6 +121,17 @@ def main():
         assert client.put(schedule_url, json={"kind": "daily", "hour": 25}).status_code == 422
         assert client.put(schedule_url, json={"kind": "daily", "hour": 9}).json()["ok"]
         assert autostart_events[-1] is True
+        with patch("routes_tasks.TaskStore.set_schedule", side_effect=OSError("disk full")):
+            failed_revoke = client.put(review_url, json={"approved": False}).json()
+        assert not failed_revoke["ok"]
+        assert client.get(review_url).json()["review"]["approved"] is True
+        assert scheduler.list_jobs()[composed["task"]["id"]]["kind"] == "daily"
+        assert client.put(review_url, json={"approved": False}).json()["ok"]
+        assert composed["task"]["id"] not in scheduler.list_jobs()
+        assert next(item for item in client.get("/tasks").json()["tasks"]
+                    if item["id"] == composed["task"]["id"])["schedule"] is None
+        assert client.put(review_url, json={"approved": True}).json()["ok"]
+        assert client.put(schedule_url, json={"kind": "daily", "hour": 9}).json()["ok"]
         with patch("routes_tasks.TaskStore.set_schedule", side_effect=OSError("disk full")):
             failed_delete = client.delete(schedule_url).json()
         assert not failed_delete["ok"]

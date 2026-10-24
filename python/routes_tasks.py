@@ -222,7 +222,7 @@ def build_router(data_dir: Path, scheduler: Scheduler, autostart_sync=None) -> A
 
     @router.get("/{rec_id}/runs")
     def list_runs(rec_id: str):
-        """Run History: return summaries only; raw screenshots stay local."""
+        """Return run summaries; individual reports can be opened on demand."""
         if _resolve(rec_id) is None:
             return {"ok": False, "msg": "找不到任务"}
         run_dir = data_dir.parent / "runs"
@@ -265,6 +265,40 @@ def build_router(data_dir: Path, scheduler: Scheduler, autostart_sync=None) -> A
                 except (OSError, ValueError):
                     continue
         return {"ok": True, "runs": out}
+
+    @router.get("/{rec_id}/runs/{run_id}")
+    def get_run(rec_id: str, run_id: str):
+        if _resolve(rec_id) is None:
+            return {"ok": False, "msg": "找不到任务"}
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+            return {"ok": False, "msg": "运行记录编号无效"}
+        report_file = data_dir.parent / "runs" / f"{run_id}.json"
+        try:
+            report = json.loads(report_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"ok": False, "msg": "找不到运行记录"}
+        if report.get("rec_id") != rec_id:
+            return {"ok": False, "msg": "找不到运行记录"}
+        steps = report.get("steps", [])
+        from services.replay_diagnostics import pause_category
+        safe_reasons = []
+        for item in report.get("pause_reasons", []):
+            if not isinstance(item, dict):
+                continue
+            reason = str(item.get("reason", ""))
+            safe_reasons.append({"step": item.get("step"), "reason": pause_category(reason)})
+        return {"ok": True, "report": {
+            "summary": report.get("summary", ""),
+            "plan_revision": report.get("plan_revision"),
+            "source_hash": report.get("source_hash"),
+            "pause_reasons": safe_reasons,
+            "steps": [{key: step.get(key) for key in
+                       ("step", "action", "status", "verification", "capability")
+                       if key in step} | ({"detail": "步骤失败，请检查本机运行报告"}
+                                          if step.get("status") not in {"ok", "skipped"} else {})
+                      for step in steps if isinstance(step, dict)],
+        }}
 
     @router.post("/{rec_id}/export")
     def export_task_artifact(rec_id: str, body: ExportBody):
@@ -315,6 +349,11 @@ def build_router(data_dir: Path, scheduler: Scheduler, autostart_sync=None) -> A
         ]
         if body.approved and unresolved:
             return {"ok": False, "msg": "仍有开放问题，不能批准", "open_questions": unresolved}
+        if not body.approved:
+            try:
+                _disable_schedule(rec_id)
+            except Exception as exc:
+                return {"ok": False, "msg": f"无法停用定时任务，方案审批未更改: {exc}"}
         now = __import__("time").time()
         prior = dict(current)
         current.update({

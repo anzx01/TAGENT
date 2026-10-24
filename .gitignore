@@ -37,3 +37,7 @@ logs/
 # OS
 Thumbs.db
 desktop.ini
+
+# Build artifacts (local only)
+build/
+dist/

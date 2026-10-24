@@ -19,6 +19,7 @@ def run_case(steps, action_result=None, wait_result=None, pause_action="skip"):
         task.write_text(json.dumps({"steps": steps}), encoding="utf-8")
         player = Player(task)
         player.checkpoint_path = root / "checkpoint.json"
+        player.checkpoint_path.write_text(json.dumps({"next_step": 1}), encoding="utf-8")
         def pause(*_):
             if pause_action == "stop":
                 player._stopped = True
@@ -38,12 +39,33 @@ def run_case(steps, action_result=None, wait_result=None, pause_action="skip"):
 
 
 def main():
+    verifier = Player.__new__(Player)
+    verifier._try_locator = lambda loc, raw: (None, None)
+    assert verifier._verify_step({"action": "input_text", "locator": [
+        {"type": "ocr", "text": "Search"}]}) is False
+    assert verifier._verify_step({"action": "click", "locator": [
+        {"type": "ocr", "text": "Open"}]}) is None
+
     executor = Player.__new__(Player)
     executor._do_drag = lambda step: StepResult(True, step["action"])
     for gesture in ("swipe", "drag"):
         assert executor._play_step({"action": gesture}).ok
     unknown = executor._play_step({"action": "mystery_action"})
     assert not unknown.ok and unknown.reason == "unsupported_action"
+
+    with tempfile.TemporaryDirectory() as td:
+        task = Path(td) / "task.json"
+        task.write_text(json.dumps({"steps": [{
+            "action": "click", "text": "secret order number", "effect": "destructive"
+        }]}), encoding="utf-8")
+        player = Player(task)
+        player._pause_for_human = lambda *_: "stop"
+        player._capture_step_screenshot = lambda *_: None
+        with patch("player._check_foreground"), patch("player._release_keys"), \
+             patch("player.win32gui.GetForegroundWindow", return_value=0):
+            player.play(step_delay=0, start_delay=0, max_wait=0)
+        assert all("secret order number" not in item["reason"]
+                   for item in player._pause_reasons)
 
     failed = StepResult(False, "input", "missing_variable")
     result, checkpoint, played = run_case([
@@ -58,6 +80,37 @@ def main():
     ], action_result=StepResult(True, "input"), wait_result=False, pause_action="stop")
     assert not result["success"] and not played and checkpoint is None
     assert result["steps"][0]["status"] == "failed"
+
+    with tempfile.TemporaryDirectory() as td:
+        task = Path(td) / "task.json"
+        task.write_text(json.dumps({"steps": [{
+            "action": "click", "locator": [{"type": "uia", "name": "Missing"}]
+        }]}), encoding="utf-8")
+        player = Player(task)
+        player.checkpoint_path = Path(td) / "checkpoint.json"
+        player._check_locator_retry = lambda *_: False
+        player._try_correction = lambda *_: False
+        player._try_llm_heal = lambda *_: {"action": "click"}
+        player._play_step = lambda *_: (_ for _ in ()).throw(AssertionError("proposal executed"))
+        player._capture_step_screenshot = lambda *_: None
+        player._pause_for_human = lambda *_: "stop"
+        with patch("player._check_foreground"), patch("player._release_keys"), \
+             patch("player.win32gui.GetForegroundWindow", return_value=0):
+            result = player.play(step_delay=0, start_delay=0, max_wait=0)
+        assert not result["success"] and not player.checkpoint_path.exists()
+
+    with tempfile.TemporaryDirectory() as td:
+        task = Path(td) / "task.json"
+        task.write_text(json.dumps({"steps": [{"action": "key_press", "key": "enter"}]}), encoding="utf-8")
+        player = Player(task)
+        player.checkpoint_path = Path(td) / "checkpoint.json"
+        player._capture_step_screenshot = lambda *_: None
+        player._play_step_with_retry = lambda *_: StepResult(True, "test")
+        with patch("pathlib.Path.replace", side_effect=OSError("disk full")), \
+             patch("player._check_foreground"), patch("player._release_keys"), \
+             patch("player.win32gui.GetForegroundWindow", return_value=0):
+            result = player.play(step_delay=0, start_delay=0, max_wait=0)
+        assert result["success"] and result["checkpoint_warning"]
 
     result, checkpoint, played = run_case([
         {"action": "input_text", "window": "Notepad", "text": "x"},

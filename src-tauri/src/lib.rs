@@ -16,7 +16,7 @@ fn backend_running() -> bool {
     TcpStream::connect(("127.0.0.1", BACKEND_PORT)).is_ok()
 }
 
-fn backend_has_scheduled_jobs() -> Option<bool> {
+fn backend_should_stay_running() -> Option<bool> {
     let mut stream = TcpStream::connect(("127.0.0.1", BACKEND_PORT)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let request = format!(
@@ -33,20 +33,26 @@ fn backend_has_scheduled_jobs() -> Option<bool> {
     let Some(body_start) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
         return None;
     };
-    scheduled_jobs_in_status_value(&response[body_start + 4..])
+    should_stay_running_in_status_value(&response[body_start + 4..])
 }
 
-fn scheduled_jobs_in_status_value(body: &[u8]) -> Option<bool> {
+fn should_stay_running_in_status_value(body: &[u8]) -> Option<bool> {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
-        .and_then(|value| value["schedules"].as_object().map(|jobs| !jobs.is_empty()))
+        .and_then(|value| {
+            let schedules = value["schedules"].as_object()?;
+            Some(!schedules.is_empty()
+                || value["startup_enabled"].as_bool() == Some(true)
+                || value["recording"].as_bool() == Some(true)
+                || value["replaying"].as_bool() == Some(true))
+        })
 }
 
-fn request_backend_shutdown() {
+fn request_backend_lifecycle(action: &str) {
     if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", BACKEND_PORT)) {
         let request = format!(
-            "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            BACKEND_PORT
+            "POST /lifecycle/{action} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            BACKEND_PORT,
         );
         let _ = stream.write_all(request.as_bytes());
     }
@@ -87,6 +93,7 @@ fn project_root(resource_dir: Option<PathBuf>) -> Option<PathBuf> {
 
 fn spawn_backend(resource_dir: Option<PathBuf>) -> Option<Child> {
     if backend_running() {
+        request_backend_lifecycle("attach");
         return None;
     }
     let root = project_root(resource_dir)
@@ -169,18 +176,14 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            match backend_has_scheduled_jobs() {
+            match backend_should_stay_running() {
                 Some(false) => {
-                    request_backend_shutdown();
-                    if let Some(state) = app_handle.try_state::<BackendState>() {
-                        if let Some(mut child) = state.0.lock().unwrap().take() {
-                            let _ = child.kill();
-                        }
-                    }
+                    request_backend_lifecycle("detach");
                 }
-                Some(true) => log::info!(
-                    "Scheduled tasks remain; leaving the backend running after UI exit"
-                ),
+                Some(true) => {
+                    request_backend_lifecycle("detach");
+                    log::info!("Persistent or active background work remains after UI exit");
+                }
                 None => log::warn!(
                     "Could not read backend schedules; leaving it running to avoid interrupting work"
                 ),
@@ -195,15 +198,23 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn scheduled_jobs_keep_backend_alive() {
+    fn startup_schedules_and_active_work_keep_backend_alive() {
         assert_eq!(
-            super::scheduled_jobs_in_status_value(br#"{"schedules":{"task-1":{"kind":"daily"}}}"#),
+            super::should_stay_running_in_status_value(br#"{"schedules":{"task-1":{"kind":"daily"}},"startup_enabled":false}"#),
             Some(true)
         );
         assert_eq!(
-            super::scheduled_jobs_in_status_value(br#"{"schedules":{}}"#),
+            super::should_stay_running_in_status_value(br#"{"schedules":{},"startup_enabled":true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            super::should_stay_running_in_status_value(br#"{"schedules":{},"startup_enabled":false}"#),
             Some(false)
         );
-        assert_eq!(super::scheduled_jobs_in_status_value(b"invalid"), None);
+        assert_eq!(
+            super::should_stay_running_in_status_value(br#"{"schedules":{},"startup_enabled":false,"replaying":true}"#),
+            Some(true)
+        );
+        assert_eq!(super::should_stay_running_in_status_value(b"invalid"), None);
     }
 }

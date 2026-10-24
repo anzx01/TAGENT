@@ -13,7 +13,7 @@ def main() -> int:
         page.goto("http://127.0.0.1:18899/ui/", wait_until="domcontentloaded")
         page.click("#btnList")
         tabs = page.locator(".workspace-tab")
-        assert tabs.count() == 3
+        assert tabs.count() == 4
         page.locator('[data-tab="tasks"]').click()
         cards = page.locator(".task-card").filter(has=page.locator(".mini.play"))
         cards.first.wait_for(state="visible", timeout=10000)

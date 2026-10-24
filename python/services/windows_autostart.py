@@ -1,5 +1,6 @@
-"""Register the hidden backend at user logon while scheduled work exists."""
+"""Register the hidden backend at user logon when explicitly enabled."""
 import os
+import json
 import subprocess
 import sys
 import urllib.request
@@ -7,6 +8,22 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 TASK_NAME = "TAGENT Scheduled Backend"
+
+
+def preference(data_dir: Path) -> bool:
+    """User opt-in; missing or invalid settings mean no logon startup."""
+    try:
+        return json.loads((data_dir / "data" / "startup.json").read_text(encoding="utf-8")).get("enabled") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def set_preference(data_dir: Path, enabled: bool) -> None:
+    path = data_dir / "data" / "startup.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"enabled": enabled}), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _vbs(executable: Path, args: list[str], script_path: Path, task_name: str) -> str:

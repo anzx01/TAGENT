@@ -12,6 +12,11 @@ from services import windows_autostart as autostart
 def main():
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
+        assert not autostart.preference(root)
+        autostart.set_preference(root, True)
+        assert autostart.preference(root)
+        autostart.set_preference(root, False)
+        assert not autostart.preference(root)
         calls = []
 
         def ok(command, **kwargs):

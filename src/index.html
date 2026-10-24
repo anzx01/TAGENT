@@ -175,7 +175,7 @@
     <button class="btn btn-replay-stop" id="btnReplayStop" disabled>停回放</button>
     <button class="btn btn-list" id="btnList">任务库</button>
     <span class="status" id="status">就绪</span>
-    <button class="btn btn-close" id="btnClose" title="关闭窗口，已启用的定时任务继续运行">✕</button>
+    <button class="btn btn-close" id="btnClose" title="关闭窗口；进行中的任务会继续完成">✕</button>
   </div>
   <div class="panel" id="panel">
     <h3>任务库 <span id="confBadge" style="font-size:11px;color:#888;"></span></h3>
@@ -183,6 +183,7 @@
       <button class="workspace-tab active" data-tab="scout">Scout</button>
       <button class="workspace-tab" data-tab="tasks">Teach / Tasks</button>
       <button class="workspace-tab" data-tab="history">Run History</button>
+      <button class="workspace-tab" data-tab="settings">设置</button>
     </div>
     <div id="scoutView">
       <p class="workspace-copy">发现重复工作，先看证据与重复程度，再决定要优化哪个流程。</p>
@@ -190,6 +191,10 @@
       <div id="scoutCandidates" class="history-empty">加载重复工作候选…</div>
     </div>
     <div id="historyView" style="display:none"><p class="workspace-copy">每次运行都保留结果、暂停原因和评测，不上传原始截图。</p><div id="historyList"></div></div>
+    <div id="settingsView" style="display:none">
+      <label class="workspace-copy" style="display:flex;align-items:center;gap:7px"><input id="startupEnabled" type="checkbox" style="width:auto">开机启动 TAGENT 后台</label>
+      <p class="workspace-copy">默认关闭。关闭时，定时任务仅在 TAGENT 正在运行时执行。</p>
+    </div>
     <div id="taskView">
     <div id="scoutSummary" style="padding:8px;background:rgba(22,160,133,.12);border-radius:6px;margin-bottom:8px;font-size:11px;color:#b8e8dc"></div>
     <button class="mini" onclick="composeCapabilities()">组合能力</button>
@@ -210,7 +215,7 @@
     const btnClose = $("btnClose");
     const statusEl = $("status"), panel = $("panel"), taskList = $("taskList");
     const stepList = $("stepList"), mask = $("modalMask"), modalBox = $("modalBox");
-    const scoutView = $("scoutView"), taskView = $("taskView"), historyView = $("historyView");
+    const scoutView = $("scoutView"), taskView = $("taskView"), historyView = $("historyView"), settingsView = $("settingsView");
     let workspaceTab = "scout";
     let currentTask = null;
     let pollTimer = null;   // 回放状态轮询
@@ -323,10 +328,36 @@
         scoutView.style.display = workspaceTab === "scout" ? "block" : "none";
         taskView.style.display = workspaceTab === "tasks" ? "block" : "none";
         historyView.style.display = workspaceTab === "history" ? "block" : "none";
+        settingsView.style.display = workspaceTab === "settings" ? "block" : "none";
         if (workspaceTab === "scout") refreshDiscovery();
         if (workspaceTab === "tasks") refreshTasks();
         if (workspaceTab === "history") refreshHistory();
+        if (workspaceTab === "settings") refreshStartupSetting();
       });
+    });
+
+    async function refreshStartupSetting() {
+      const toggle = $("startupEnabled");
+      try {
+        const setting = await apiJson("/settings/startup");
+        toggle.checked = setting.enabled === true;
+        toggle.disabled = !setting.supported;
+      } catch (err) { setStatus(apiErrorMessage(err, "读取开机启动设置失败"), "error"); }
+    }
+    $("startupEnabled").addEventListener("change", async (event) => {
+      const toggle = event.target;
+      toggle.disabled = true;
+      try {
+        const result = await apiJson("/settings/startup", {
+          method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: toggle.checked }),
+        });
+        if (!result.ok) throw new Error(result.msg || "保存失败");
+        setStatus(toggle.checked ? "已开启开机启动" : "已关闭开机启动");
+      } catch (err) {
+        toggle.checked = !toggle.checked;
+        setStatus(apiErrorMessage(err, "开机启动设置失败"), "error");
+      } finally { toggle.disabled = false; }
     });
 
     btnRecord.addEventListener("click", async () => {
@@ -385,8 +416,8 @@
     });
 
     // ---------- 退出应用（右上角 ✕）----------
-    async function shutdown() {
-      try { await fetch(API + "/shutdown", { method: "POST" }); } catch (_) { /* 后端可能已退出 */ }
+    async function detachBackend() {
+      try { await fetch(API + "/lifecycle/detach", { method: "POST" }); } catch (_) { /* 后端可能已退出 */ }
     }
     btnClose.addEventListener("click", async () => {
       try {
@@ -396,9 +427,8 @@
           return;
         }
       } catch (_) { /* fallthrough */ }
-      // 非 Tauri（纯浏览器）环境：直接关后端
-      await shutdown();
-      setStatus("已退出，请关闭窗口");
+      await detachBackend();
+      setStatus("窗口可关闭；进行中的任务会在后台完成");
     });
 
     // ---------- 回放状态轮询（状态小窗 + 暂停接管） ----------
@@ -424,8 +454,8 @@
         setReplaying(false);
         setStatus(fromStartup ? "就绪" :
           d && d.state === "failed" ? (d.error || "回放失败") :
-          d && d.state === "stopped" ? "回放已停止" : "回放完成",
-          d && d.state === "failed" ? "error" : "");
+          d && d.state === "stopped" ? "回放已停止" : (d.summary || "回放完成"),
+          d && (d.state === "failed" || String(d.summary || "").includes("断点保存失败")) ? "error" : "");
         refreshTasks();
         return false;
       }
@@ -707,12 +737,23 @@
         const runs = [];
         for (const task of tasks.slice(0, 30)) {
           const result = await apiJson(`/tasks/${task.id}/runs`, {}, 5000).catch(() => null);
-          for (const run of (result && result.runs) || []) runs.push({ ...run, task: task.name || task.id });
+          for (const run of (result && result.runs) || []) runs.push({ ...run, task: task.name || task.id, taskId: task.id });
         }
         runs.sort((a, b) => String(b.ts || "").localeCompare(String(a.ts || "")));
         list.innerHTML = runs.length ? runs.slice(0, 20).map((run) =>
-          `<div class="history-row"><span>${escapeHtml(run.task)} · ${escapeHtml(run.ts || "")}</span><span class="ok">${run.success ? "成功" : "需关注"}</span><br/><span style="color:#858b9b">${run.trigger === "schedule" ? "定时" : "手动"} · ${run.step_count} 步 · 暂停 ${run.pause_count} 次${run.failed_capability ? ` · 失败能力：${escapeHtml(run.failed_capability.name || "")}` : ""}</span></div>`
+          `<div class="history-row"><span>${escapeHtml(run.task)} · ${escapeHtml(run.ts || "")}</span><span class="ok">${run.success ? "成功" : "需关注"}</span><br/><span style="color:#858b9b">${run.trigger === "schedule" ? "定时" : "手动"} · ${run.step_count} 步 · 暂停 ${run.pause_count} 次${run.failed_capability ? ` · 失败能力：${escapeHtml(run.failed_capability.name || "")}` : ""} · 方案 ${run.plan_revision || "—"}</span><br/><button class="mini plan" data-run-id="${escapeHtml(run.run_id)}" data-task-id="${escapeHtml(run.taskId || "")}">查看详情</button><div class="run-detail" hidden></div></div>`
         ).join("") : "<div class='history-empty'>还没有运行记录。</div>";
+        for (const button of list.querySelectorAll("[data-run-id]")) {
+          button.onclick = async () => {
+            const detail = button.parentElement.querySelector(".run-detail");
+            if (!detail.hidden) { detail.hidden = true; return; }
+            try {
+              const report = await apiJson(`/tasks/${button.dataset.taskId}/runs/${button.dataset.runId}`);
+              detail.textContent = report.ok ? `${report.report.summary || ""} · ${report.report.steps.filter(s => s.status !== "ok").map(s => `${Number(s.step) + 1}: ${s.detail || s.status}`).join("；") || "无失败步骤"}` : report.msg;
+            } catch (err) { detail.textContent = apiErrorMessage(err, "详情读取失败"); }
+            detail.hidden = false;
+          };
+        }
       } catch (err) {
         list.innerHTML = `<div class='history-empty'>${escapeHtml(apiErrorMessage(err, "运行记录加载失败"))}</div>`;
       }
@@ -891,7 +932,7 @@
           body: JSON.stringify({ kind }),
         });
         if (!data.ok) { setStatus(data.msg || "导出失败", "error"); return; }
-        hideModal();
+        showModal(`<h4>文件已生成</h4><p class="hint">保存在本机：</p><code style="display:block;overflow-wrap:anywhere;user-select:text">${escapeHtml(data.path || "")}</code><button class="cancel" onclick="hideModal()">关闭</button>`);
         setStatus(`${kind === "skill" ? "Skill.md" : "automation.json"} 已生成`, "replaying");
       } catch (err) { setStatus(apiErrorMessage(err, "导出失败"), "error"); }
     }

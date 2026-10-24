@@ -72,6 +72,8 @@ class Player:
                 # A malformed context must not make old callers unusable.
                 log.warning("invalid run context; using task file snapshot")
         self._step_results = []  # 阶段5.2：逐步结果
+        self._from_step = 0
+        self._checkpoint_error = ""
         self._pause_reasons = []  # 阶段5.2：暂停原因
         self._agent_suggestions = []  # bounded suggestions; never executed in-run
         self._last_correction_id = ""
@@ -115,6 +117,10 @@ class Player:
         """逐步回放。单步最长等待 max_wait 秒，防止录制长停顿导致回放卡死。
         from_step: 阶段5.1 断点续跑，从指定步骤继续。
         返回 dict: {summary, steps, pause_reasons}。"""
+        self._from_step = from_step
+        if from_step == 0 and self.checkpoint_path:
+            # A fresh attempt must not inherit an earlier run's progress.
+            self.checkpoint_path.unlink(missing_ok=True)
         # 回放线程内初始化 COM（UIA/剪贴板等需要），确保与主线程隔离
         import pythoncom
         _com_inited = False
@@ -133,6 +139,7 @@ class Player:
         self._waiting_step = None
         self._pause_reason = ""
         self._last_pause_reason = ""
+        self._checkpoint_error = ""
         self._desktop_menu_open = False
         expects_text_document = any(
             step.get("semantic") == "shell_create_text_document" for step in self.steps
@@ -163,7 +170,7 @@ class Player:
                 verification = "passed" if passed else "failed"
                 while not passed and not self._stopped:
                     self._pause_reasons.append({"step": i, "reason": f"能力完成条件未通过: {detail}"})
-                    action = self._pause_for_human(i, detail)
+                    action = self._pause_for_human(i, f"能力完成条件未通过: {detail}")
                     if action == "skip" and not self._stopped:
                         verification = "human_confirmed"
                         break
@@ -191,7 +198,8 @@ class Player:
                 if not wait_ok and not self._stopped:
                     detail = f"等待目标窗口未出现: {step.get('window', '')}"
                     self._pause_reasons.append({"step": i, "reason": detail})
-                    action_after_pause = self._pause_for_human(i, detail)
+                    action_after_pause = self._pause_for_human(
+                        i, f"等待目标窗口未出现: {step.get('window', '')}: {detail}")
                     if action_after_pause == "retry" and not self._stopped:
                         wait_ok = self._do_wait(step, prev_t)
                     elif action_after_pause == "skip" and not self._stopped:
@@ -224,14 +232,16 @@ class Player:
                 break
             action = step.get("action", "?")
             text = step.get("text", step.get("key", ""))
-            log.info("[回放 %d/%d] %s %s", i + 1, len(self.steps), action, text)
+            log.info("[回放 %d/%d] %s (%d chars)", i + 1, len(self.steps), action, len(str(text)))
             step_ok = True
             step_detail = ""
             step_method = ""
             human_confirmed = False
             # 阶段4 安全效果标签：破坏性操作暂停确认
             if step.get("effect") == "destructive":
-                self._pause_reasons.append({"step": i, "reason": f"破坏性操作需确认: {action} {text[:20]}"})
+                # Keep run diagnostics useful without copying user-entered text
+                # into the report returned by Run History.
+                self._pause_reasons.append({"step": i, "reason": f"破坏性操作需确认: {action}"})
                 log.warning("  步骤 %d 破坏性操作，暂停确认", i)
                 self._pause_for_human(i)
                 if self._stopped:
@@ -250,7 +260,7 @@ class Player:
                             self._pause_reasons.append({
                                 "step": i, "reason": "已批准纠错动作执行失败"
                             })
-                            action_after_pause = self._pause_for_human(i, step_detail)
+                            action_after_pause = self._pause_for_human(i, f"执行操作失败: {step_detail}")
                             if action_after_pause == "skip" and not self._stopped:
                                 step_ok = True
                                 locator_failed = False
@@ -260,32 +270,28 @@ class Player:
                             if self._stopped:
                                 break
                     else:
-                        llm_step = self._try_llm_heal(i, step, "定位失败")
-                        if llm_step:
-                            self._play_step(llm_step)
-                            step_detail = "LLM自愈成功"
-                        else:
-                            step_ok = False
-                            step_detail = "定位失败"
-                            self._pause_reasons.append({"step": i, "reason": f"定位失败: {action}"})
-                            log.warning("  步骤 %d 定位失败，暂停等待人工", i)
-                            action_after_pause = self._pause_for_human(i, step_detail)
-                            if action_after_pause == "retry" and not self._stopped:
-                                retry_result = self._play_step(step)
-                                if retry_result.ok:
-                                    step_ok = True
-                                    locator_failed = False
-                                    step_already_executed = True
-                                    step_method = retry_result.method
-                                    step_detail = f"重试成功 ({retry_result.method})"
-                            elif action_after_pause == "skip" and not self._stopped:
+                        self._try_llm_heal(i, step, "定位失败")
+                        step_ok = False
+                        step_detail = "定位失败"
+                        self._pause_reasons.append({"step": i, "reason": f"定位失败: {action}"})
+                        log.warning("  步骤 %d 定位失败，暂停等待人工", i)
+                        action_after_pause = self._pause_for_human(i, f"定位失败: {step_detail}")
+                        if action_after_pause == "retry" and not self._stopped:
+                            retry_result = self._play_step(step)
+                            if retry_result.ok:
                                 step_ok = True
                                 locator_failed = False
                                 step_already_executed = True
-                                human_confirmed = True
-                                step_detail = "人工确认已完成当前步骤"
-                            if self._stopped:
-                                break
+                                step_method = retry_result.method
+                                step_detail = f"重试成功 ({retry_result.method})"
+                        elif action_after_pause == "skip" and not self._stopped:
+                            step_ok = True
+                            locator_failed = False
+                            step_already_executed = True
+                            human_confirmed = True
+                            step_detail = "人工确认已完成当前步骤"
+                        if self._stopped:
+                            break
             if step_ok and not locator_failed and not step_already_executed:
                 if not self._try_correction(i):
                     result = self._play_step_with_retry(step)
@@ -301,7 +307,7 @@ class Player:
                             "step": i,
                             "reason": f"执行失败: {action} ({step_detail})",
                         })
-                        action_after_pause = self._pause_for_human(i, step_detail)
+                        action_after_pause = self._pause_for_human(i, f"执行操作失败: {step_detail}")
                         if action_after_pause == "skip" and not self._stopped:
                             step_ok = True
                             human_confirmed = True
@@ -386,6 +392,8 @@ class Player:
         summary = f"完成 {done}/{len(self.steps)} 步" + (" (已中断)" if interrupted else "")
         if not artifact_ok:
             summary += "；失败：未生成新的文本文件"
+        if self._checkpoint_error:
+            summary += f"；{self._checkpoint_error}"
         try:
             if _com_inited:
                 pythoncom.CoUninitialize()
@@ -406,6 +414,7 @@ class Player:
             "agent_suggestions": list(self._agent_suggestions),
             "artifacts": artifacts,
             "success": success,
+            "checkpoint_warning": self._checkpoint_error or None,
         }
 
     def _wait_if_paused(self):
@@ -469,8 +478,10 @@ class Player:
             tmp = self.checkpoint_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(checkpoint), encoding="utf-8")
             tmp.replace(self.checkpoint_path)
+            self._checkpoint_error = ""
         except Exception:
-            pass
+            self._checkpoint_error = "断点保存失败，当前运行不可保证续跑"
+            log.warning("checkpoint 保存失败，当前运行不可保证续跑", exc_info=True)
 
     def _sort_locators(self):
         """移植：openskills selectors.ts - 定位策略按置信度降序回退（无 confidence 保序）"""
@@ -514,7 +525,7 @@ class Player:
                 if step.get("action") in ("click", "double_click", "right_click"):
                     return None  # 目标被点击消耗，属正常
                 return False
-            if loc.get("type") == "ocr" and loc.get("name"):
+            if loc.get("type") == "ocr" and (loc.get("text") or loc.get("name")):
                 x, y = self._try_locator(loc, raw)
                 if x is None:
                     if step.get("action") in ("click", "double_click", "right_click"):
@@ -1337,7 +1348,7 @@ class Player:
         if dom_loc:
             res = web.maybe_click(step.get("window", ""), dom_loc)
             if res is not None:
-                log.info("  -> 网页点击 (CDP) %r", dom_loc.get("text", ""))
+                log.info("  -> 网页点击 (CDP)")
                 return res
         # 非桌面动作：先定位并激活目标窗口（含最小化还原），再解析坐标，
         # 这样窗口内百分比定位器才能基于还原后的窗口矩形换算
@@ -1695,7 +1706,7 @@ class Player:
         win = step.get("window", "")
         res = web.maybe_type(win, text)
         if res is not None:
-            log.info("  -> 网页输入 (CDP) %r", text[:30])
+            log.info("  -> 网页输入 (CDP, %d chars)", len(text))
             return res
         hwnd = self._target_hwnd(win, step.get("hwnd"))
         # 拼音上屏模式（纯字母+结尾空格，如 'tielu ' -> 铁路）：
@@ -1781,7 +1792,7 @@ class Player:
         if not hwnd:
             return self._fail("input_text", "no_window")
         self._activate_target(hwnd)
-        log.info("  输入: %r -> %r", text[:50], win32gui.GetWindowText(hwnd)[:40])
+        log.info("  输入: %d chars", len(text))
         # Replace the captured field value so replay remains repeatable when
         # the target contains data from an earlier run.
         if step.get("replace", True):

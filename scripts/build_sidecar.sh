@@ -6,8 +6,12 @@ set -e
 cd "$(dirname "$0")/.."
 
 PYTHON_BIN=""
+PYTHON_ARGS=()
 if [ -x .venv/Scripts/python.exe ] && .venv/Scripts/python.exe --version >/dev/null 2>&1; then
     PYTHON_BIN=".venv/Scripts/python.exe"
+elif command -v py.exe >/dev/null 2>&1 && py.exe -3 --version >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v py.exe)"
+    PYTHON_ARGS=(-3)
 elif command -v python >/dev/null 2>&1 && python --version >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python)"
 elif command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
@@ -19,15 +23,15 @@ fi
 echo "使用 Python: $PYTHON_BIN"
 
 # 构建依赖（仅打包含 pyinstaller，未装则提示）
-"$PYTHON_BIN" -c "import PyInstaller" 2>/dev/null || {
+"$PYTHON_BIN" "${PYTHON_ARGS[@]}" -c "import PyInstaller" 2>/dev/null || {
     echo "安装 pyinstaller ..."
-    "$PYTHON_BIN" -m pip install pyinstaller
+    "$PYTHON_BIN" "${PYTHON_ARGS[@]}" -m pip install pyinstaller
 }
 
 mkdir -p dist
 
 # 排除无需打包的大模块可后续按需调优；--collect-all 收集 win32api/uiautomation 的隐藏依赖
-"$PYTHON_BIN" -m PyInstaller --clean --noconfirm tagent-server.spec
+"$PYTHON_BIN" "${PYTHON_ARGS[@]}" -m PyInstaller --clean --noconfirm tagent-server.spec
 
 echo "完成: dist/tagent-server.exe"
 echo "运行: dist/tagent-server.exe  (监听 127.0.0.1:18899)"

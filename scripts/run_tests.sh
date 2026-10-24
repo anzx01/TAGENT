@@ -25,6 +25,7 @@ UNIT_TESTS=(
     python/tests/test_missing_variable.py
     python/tests/test_scheduler_persistence.py
     python/tests/test_windows_autostart.py
+    python/tests/test_backend_lifecycle.py
     python/tests/test_recording_lifecycle.py
     python/tests/test_checkpoints.py
     python/tests/test_compiler_semantic.py
@@ -44,6 +45,7 @@ UNIT_TESTS=(
     python/tests/evals/compiler_eval.py
     python/tests/test_web_channel.py
     python/tests/test_replay_control.py
+    python/tests/test_replay_diagnostics.py
     python/tests/test_replay_failure_boundary.py
     python/tests/test_uitars_actions.py
     python/tests/test_visual_agent.py

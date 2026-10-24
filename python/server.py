@@ -23,7 +23,7 @@ from compiler import Compiler
 from logger import get_logger
 from routes_tasks import build_router
 from services.scheduler import Scheduler
-from services.windows_autostart import sync as sync_windows_autostart
+from services.windows_autostart import sync as sync_windows_autostart, preference as startup_preference, set_preference as set_startup_preference
 from services.recording_lifecycle import delete_recording as remove_recording
 from services.capability_registry import CapabilityRegistry
 from services.security import get_security, BLACKLIST
@@ -86,6 +86,8 @@ _replay_state: dict = {
     "summary": None,
     "error": None,
 }
+_lifecycle_detached = threading.Event()
+_lifecycle_generation = 0
 
 _scheduler: Scheduler | None = None
 
@@ -106,16 +108,47 @@ def _scheduled_run(rec_id: str):
 
 # 任务库路由 + 定时调度器（模块级初始化，确保 uvicorn 启动时也注册）
 _scheduler = Scheduler(TASKS_DB, _scheduled_run)
+def _sync_startup(_scheduled=False):
+    if os.name == "nt":
+        sync_windows_autostart(BASE_DIR, startup_preference(BASE_DIR))
+
+
 if os.name == "nt":
     try:
-        sync_windows_autostart(BASE_DIR, bool(_scheduler.list_jobs()))
+        _sync_startup()
     except Exception:
         log.exception("无法同步 Windows 登录后台任务")
 _scheduler.start()
 app.include_router(build_router(
     DATA_DIR, _scheduler,
-    (lambda enabled: sync_windows_autostart(BASE_DIR, enabled)) if os.name == "nt" else None,
+    _sync_startup if os.name == "nt" else None,
 ))
+
+
+class StartupSetting(BaseModel):
+    enabled: bool
+
+
+@app.get("/settings/startup")
+def get_startup_setting():
+    return {"ok": True, "enabled": startup_preference(BASE_DIR), "supported": os.name == "nt"}
+
+
+@app.put("/settings/startup")
+def update_startup_setting(body: StartupSetting):
+    if os.name != "nt":
+        return {"ok": False, "msg": "仅 Windows 支持开机启动"}
+    previous = startup_preference(BASE_DIR)
+    try:
+        sync_windows_autostart(BASE_DIR, body.enabled)
+        set_startup_preference(BASE_DIR, body.enabled)
+    except Exception as exc:
+        try:
+            sync_windows_autostart(BASE_DIR, previous)
+        except Exception:
+            log.exception("回滚 Windows 开机启动失败")
+        return {"ok": False, "msg": f"开机启动设置失败: {exc}"}
+    return {"ok": True, "enabled": body.enabled}
 
 # 预热安全单例（密钥初始化/UIA 缓存），避免录制主循环中首次调用阻塞
 from services.security import get_security  # noqa: E402
@@ -390,6 +423,7 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0,
                         var_sources=var_sources,
                         run_context=run_context)
         player.checkpoint_path = ckpt_file
+        player._from_step = from_step
         player._rec_id = rec_id
         # 阶段1.2：回放截图目录
         ss_dir = BASE_DIR / "runs" / "screenshots" / rec_id
@@ -466,6 +500,7 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0,
                     _player = None
                     _player_thread = None
                 log.info("回放实例已释放")
+            _exit_if_detached_and_idle()
 
     t = threading.Thread(target=_run, name=f"tagent-replay-{rec_id}", daemon=True)
     with _player_lock:
@@ -607,6 +642,52 @@ def shutdown():
     return {"ok": True}
 
 
+@app.post("/lifecycle/detach")
+def detach_lifecycle():
+    """Keep active desktop work alive after the window closes."""
+    _lifecycle_detached.set()
+    _exit_if_detached_and_idle()
+    return {"ok": True}
+
+
+@app.post("/lifecycle/attach")
+def attach_lifecycle():
+    global _lifecycle_generation
+    _lifecycle_generation += 1
+    _lifecycle_detached.clear()
+    return {"ok": True}
+
+
+def _exit_if_detached_and_idle():
+    if not _lifecycle_detached.is_set():
+        return
+    if startup_preference(BASE_DIR) or (_scheduler and _scheduler.list_jobs()):
+        return
+    with _recorder_lock:
+        recording = bool(_recorder and _recorder.recording)
+    with _player_lock:
+        replaying = _player is not None
+    if not recording and not replaying:
+        generation = _lifecycle_generation
+        threading.Thread(target=_delayed_exit, args=(generation,), daemon=True).start()
+
+
+def _delayed_exit(generation: int):
+    import time as _t
+    _t.sleep(0.3)
+    if generation != _lifecycle_generation or not _lifecycle_detached.is_set():
+        return
+    if startup_preference(BASE_DIR) or (_scheduler and _scheduler.list_jobs()):
+        return
+    with _recorder_lock:
+        if _recorder and _recorder.recording:
+            return
+    with _player_lock:
+        if _player is not None:
+            return
+    os._exit(0)
+
+
 def _exit_server():
     import time as _t
     _t.sleep(0.3)
@@ -628,7 +709,10 @@ def status():
 @app.get("/lifecycle")
 def lifecycle_status():
     """Small local status endpoint used by the desktop shell on exit."""
-    return {"schedules": _scheduler.list_jobs() if _scheduler else {}}
+    return {"schedules": _scheduler.list_jobs() if _scheduler else {},
+            "recording": bool(_recorder and _recorder.recording),
+            "replaying": _player is not None,
+            "startup_enabled": startup_preference(BASE_DIR)}
 
 
 @app.post("/record/start")
@@ -665,11 +749,13 @@ def stop_recording():
         except Exception as e:
             task_path = None
             log.exception("编译失败: %s", e)
-        return {"ok": True, "recording_id": _recorder.output_dir.name,
-                "events_path": path, "event_count": step_count,
-                "task_path": task_path,
-                "replayable": step_count > 0,
-                "warning": "未捕获到任何操作，请确认目标窗口处于前台后重新录制" if step_count == 0 else None}
+        result = {"ok": True, "recording_id": _recorder.output_dir.name,
+                  "events_path": path, "event_count": step_count,
+                  "task_path": task_path,
+                  "replayable": step_count > 0,
+                  "warning": "未捕获到任何操作，请确认目标窗口处于前台后重新录制" if step_count == 0 else None}
+    _exit_if_detached_and_idle()
+    return result
 
 
 @app.post("/replay/start")
@@ -787,6 +873,7 @@ def retry_replay_step():
 @app.get("/replay/status")
 def replay_status():
     """回放状态（阶段4 状态小窗：步骤简述 + 暂停/错误态）"""
+    from services.replay_diagnostics import pause_category
     with _player_lock:
         player = _player
         state = dict(_replay_state)
@@ -800,17 +887,19 @@ def replay_status():
             "summary": state.get("summary"),
             "error": state.get("error"),
         }
-    current = len(player._step_results)
+    current = getattr(player, "_waiting_step", None)
+    if current is None:
+        current = (player._step_results[-1]["step"] + 1 if player._step_results
+                   else getattr(player, "_from_step", 0))
     step_desc = ""
     step_error = False
     if current < len(player.steps):
         step = player.steps[current]
         action = step.get("action", "")
-        text = step.get("text", step.get("key", ""))
         if action == "verify_capability":
-            step_desc = f"核实「{(step.get('capability') or {}).get('name', '能力')}」是否完成"
+            step_desc = "核实能力完成条件"
         else:
-            step_desc = f"{action} {text}".strip()[:40]
+            step_desc = str(action)[:40]
     # 检查最近步骤是否有错误
     if player._step_results:
         last = player._step_results[-1]
@@ -827,7 +916,7 @@ def replay_status():
         "step_desc": step_desc,
         "error": step_error,
         "waiting_step": getattr(player, "_waiting_step", None),
-        "pause_reason": getattr(player, "_pause_reason", ""),
+        "pause_reason": pause_category(getattr(player, "_pause_reason", "")),
     }
 
 
@@ -840,7 +929,10 @@ def rerecord_step():
     if not player:
         return {"ok": False, "msg": "没有进行中的回放"}
     # 记录当前步骤索引
-    current_step = len(player._step_results)
+    current_step = getattr(player, "_waiting_step", None)
+    if current_step is None:
+        current_step = (player._step_results[-1]["step"] + 1 if player._step_results
+                        else getattr(player, "_from_step", 0))
     rec_id = getattr(player, '_rec_id', '')
     # 停止回放
     player.stop()
@@ -935,7 +1027,7 @@ def delete_recording(rec_id: str):
     rec_dir = _resolve_rec_dir(rec_id)
     if rec_dir is None:
         return {"ok": False, "msg": "找不到录制"}
-    sync = (lambda enabled: sync_windows_autostart(BASE_DIR, enabled)) if os.name == "nt" else None
+    sync = _sync_startup if os.name == "nt" else None
     registry = CapabilityRegistry(DATA_DIR / "capabilities.json")
     try:
         task_file = rec_dir / "task.json"
