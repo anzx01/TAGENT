@@ -19,10 +19,12 @@ def title_parts(title):
     return norm, pref, suf
 
 
-def _name_matches(a: str, b: str, min_sim: float, min_sim_len: int) -> bool:
+def name_matches(a: str, b: str, min_sim: float, min_sim_len: int) -> bool:
     """短语级名称比对：相等/前缀追加(状态标记、扩展名)/高相似(长名小幅修改)。
     difflib 对短中文串不可靠（"演示程序 [增强模式]" vs "演示程序" 仅 0.53），
     前缀包含才是状态标记追加的正确语义。"""
+    if not a or not b:
+        return False
     if a == b:
         return True
     shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
@@ -43,13 +45,13 @@ def score_parts(rec_parts, w_parts):
         return 0.0
     if rec_suf and w_suf:
         # 应用后缀不同直接拒绝（同文档不同应用），状态标记追加除外
-        if not _name_matches(rec_suf, w_suf, min_sim=0.6, min_sim_len=4):
+        if not name_matches(rec_suf, w_suf, min_sim=0.6, min_sim_len=4):
             return 0.0
         if not rec_pref or not w_pref:
             return 0.0
         # 文档名：前缀追加（扩展名/状态尾巴）或长名（≥6字）小幅修改；
         # 短名（<6字）单字差异（报告A/报告B）必须拒绝，避免同应用切错文档
-        if not _name_matches(rec_pref, w_pref, min_sim=0.8, min_sim_len=6):
+        if not name_matches(rec_pref, w_pref, min_sim=0.8, min_sim_len=6):
             return 0.0
         return 1.5
     return 1.5 if full >= 0.75 else 0.0

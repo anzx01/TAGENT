@@ -53,6 +53,12 @@ def main() -> int:
         rect = player.win32gui.GetWindowRect(hwnd)
         assert rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3], (x, y, rect)
 
+        # 2.5 同应用唯一窗口兜底（WPS 标签页模式：文档在既有窗口打开、标题不变）
+        ok = p._do_switch_window({"action": "switch_window",
+                                  "window": "不存在文档X - 演示程序"})
+        assert ok, "同应用唯一窗口兜底失败"
+        assert player.win32gui.GetForegroundWindow() == hwnd, "前台不是固件窗口"
+
         # 3. 暂停诊断：目标不存在 → 报前台；目标漂移存在 → 报相似窗口
         with tempfile.TemporaryDirectory() as td:
             task = Path(td) / "task.json"

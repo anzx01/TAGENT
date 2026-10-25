@@ -25,6 +25,7 @@ class _FakeDesktop:
             ("EnumWindows", lambda cb, arg: [cb(w, arg)
                                              for w, _t in list(self.windows) + list(self.dialogs.items())]),
             ("IsWindowVisible", lambda w: True),
+            ("IsWindowEnabled", lambda w: True),
             ("GetWindowText", lambda w: allwin.get(w, "")),
             ("GetForegroundWindow", lambda: self.foreground),
             ("IsIconic", lambda w: False),
@@ -114,6 +115,30 @@ def main():
     # 长文档名小幅修改（≥6字且相似度≥0.8）接受
     assert player.titles_similar(
         "项目验收意见汇总表2026 - WPS Office", "项目验收意见汇总表2025 - WPS Office")
+
+    # 12. 同应用唯一窗口兜底（WPS 标签页模式：文档在既有窗口打开、标题不变）
+    with _FakeDesktop([(801, "各种用户名和密码20250901（维多利亚）.docx - WPS Office")]):
+        got = player._find_sole_app_window("新建 DOCX 文档.docx - WPS Office")
+        assert got == 801, got
+        # 标题本就匹配的窗口不算"唯一兜底"目标
+        got = player._find_sole_app_window("各种用户名和密码20250901（维多利亚）.docx - WPS Office")
+        assert got is None, got
+    # 多个同应用窗口：拒绝猜测
+    with _FakeDesktop([(811, "文档A - 演示应用"), (812, "文档B - 演示应用")]):
+        assert player._find_sole_app_window("文档C - 演示应用") is None
+    # 无后缀标题不识别应用
+    with _FakeDesktop([(821, "微信")]):
+        assert player._find_sole_app_window("文件传输助手") is None
+    # 普查文案：0 个 / N 个
+    with _FakeDesktop([(801, "微信")]):
+        d = player._pause_detail_text(
+            {"action": "switch_window", "window": "新建 DOCX 文档.docx - WPS Office"}, "")
+        assert "未发现「WPS Office」应用窗口" in d, d
+    with _FakeDesktop(
+            [(811, "文档A - 演示应用"), (812, "文档B - 演示应用"), (813, "微信")]):
+        d = player._pause_detail_text(
+            {"action": "switch_window", "window": "文档C - 演示应用"}, "")
+        assert "「演示应用」有 2 个窗口但标题均不符" in d, d
 
     print("window_match PASS")
 

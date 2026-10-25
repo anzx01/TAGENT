@@ -15,6 +15,7 @@ from services.input.web_channel import get_web_channel
 from services.title_match import title_parts as _title_parts
 from services.title_match import score_parts as _fuzzy_title_score
 from services.title_match import titles_similar
+from services.title_match import name_matches
 
 log = get_logger("player")
 
@@ -1143,6 +1144,17 @@ class Player:
                 return True
         except Exception:
             pass
+
+        # ---- 策略3.5: 同应用唯一窗口兜底 ----
+        # WPS/Office 标签页(单实例)模式：回放时文档在既有窗口以新标签打开，
+        # 窗口标题仍是旧文档，按标题匹配永远失败。按标题后缀(应用名)识别同应用
+        # 窗口，恰好一个时切过去(唯一性保证不切错)；多个则不猜，照旧暂停。
+        h = _find_sole_app_window(title)
+        if h and _force_foreground(h):
+            log.info("  同应用唯一窗口兜底: %r -> %r (hwnd=%s)",
+                     title, win32gui.GetWindowText(h), h)
+            time.sleep(0.3)
+            return True
 
         # ---- 策略4: 前台窗口兜底（照抄 SikuliX 思想：弹窗可能已是前台）----
         fg = win32gui.GetForegroundWindow()
@@ -2360,6 +2372,52 @@ def _find_dialog(title=None):
     return found[0] if found else None
 
 
+def _same_app_windows(title):
+    """按标题后缀(应用名)找同应用的可见顶层窗口。返回 [(hwnd, title)]。
+    录制标题无后缀（如"微信"）时不识别，返回空。"""
+    suf = _title_parts(title)[2]
+    if not suf:
+        return []
+    out = []
+
+    def _cb(w, _):
+        try:
+            if win32gui.IsWindowVisible(w) and win32gui.IsWindowEnabled(w):
+                t = win32gui.GetWindowText(w)
+                if t and name_matches(suf, _title_parts(t)[2], min_sim=0.6, min_sim_len=3):
+                    out.append((w, t))
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        return []
+    return out
+
+
+def _find_sole_app_window(title):
+    """同应用恰好一个可见窗口时返回其句柄，否则 None（不猜测）。"""
+    try:
+        cands = [(w, t) for w, t in _same_app_windows(title)
+                 if not _title_similar_strict(title, t)]
+        if len(cands) == 1:
+            return cands[0][0]
+    except Exception:
+        pass
+    return None
+
+
+def _title_similar_strict(a, b):
+    """精确/去星/包含/漂移任一命中即算同窗口（避免兜底切到本来就匹配的窗口）。"""
+    a = str(a).lstrip("*")
+    b = str(b).lstrip("*")
+    if not a or not b:
+        return False
+    return a in b or b in a or titles_similar(a, b)
+
+
 def _visible_dialog_titles(limit=2):
     """当前可见的标准对话框标题（#32770），供接管弹窗诊断提示。"""
     out = []
@@ -2407,6 +2465,15 @@ def _pause_detail_text(step, reason=""):
         win32gui.EnumWindows(_cb, None)
         if similar:
             bits.append(f"发现相似窗口「{similar[0]}」（标题有变化，可核对）")
+        elif " - " in target.lstrip("*"):
+            # 无相似窗口时普查同应用窗口，直接告诉用户应用开没开
+            # （后缀取原文，显示 "WPS Office" 而非 casefold 后的小写）
+            app = target.lstrip("*").rsplit(" - ", 1)[-1].strip()
+            n = len(_same_app_windows(target))
+            if n == 0:
+                bits.append(f"未发现「{app}」应用窗口，应用可能未打开")
+            else:
+                bits.append(f"「{app}」有 {n} 个窗口但标题均不符，已暂停避免切错")
         dialogs = _visible_dialog_titles()
         if dialogs:
             bits.append("检测到弹窗 " + "、".join(f"「{t}」" for t in dialogs) + "，可能挡住了操作")
