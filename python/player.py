@@ -3,6 +3,7 @@
 定位优先级：UIA 锚点 > 坐标百分比 > 原始屏幕坐标
 """
 import ctypes
+import difflib
 import json
 import time
 from pathlib import Path
@@ -1131,7 +1132,8 @@ class Player:
         fg = win32gui.GetForegroundWindow()
         if fg:
             fg_title = win32gui.GetWindowText(fg)
-            if title and title not in fg_title:
+            if title and title not in fg_title and (
+                    _fuzzy_title_score(_title_parts(title), _title_parts(fg_title)) <= 0):
                 log.warning("  切换窗口失败：未找到 %r，当前前台是 %r", title, fg_title)
                 return False
             log.info("  前台兜底: %r (hwnd=%s)（目标 %r 已匹配前台）",
@@ -2196,9 +2198,47 @@ def _window_exists(title):
     return bool(_find_window_by_title(title))
 
 
+def _title_parts(title):
+    """归一化标题并拆成 "主内容 - 应用后缀" 两段，供模糊匹配用。"""
+    norm = " ".join(title.strip().lstrip("*").split()).casefold()
+    if " - " in norm:
+        pref, suf = norm.rsplit(" - ", 1)
+    else:
+        pref, suf = norm, ""
+    return norm, pref, suf
+
+
+def _fuzzy_title_score(rec_parts, w_parts):
+    """录制标题与实际标题的相似度评分，0 表示不认。
+    覆盖标题漂移场景：回放时应用状态后缀消失或变化
+    （Everything 的 [管理员模式]、WPS 的 [只读]/扩展名显隐等），
+    录制标题比实际标题"多字"，单向包含失效。
+    防误判：后缀（应用名）不同直接拒绝；文档名过短（<4字）时
+    只在几乎全等时才认，避免同应用切错文档。"""
+    rec_norm, rec_pref, rec_suf = rec_parts
+    w_norm, w_pref, w_suf = w_parts
+    if len(rec_norm) < 6 or len(w_norm) < 6:
+        return 0.0
+    full = difflib.SequenceMatcher(None, rec_norm, w_norm).ratio()
+    if full < 0.6:
+        return 0.0
+    if rec_suf and w_suf:
+        if difflib.SequenceMatcher(None, rec_suf, w_suf).ratio() < 0.6:
+            return 0.0
+        if not rec_pref or not w_pref:
+            return 0.0
+        pref = difflib.SequenceMatcher(None, rec_pref, w_pref).ratio()
+        # 文档名过短（<4字）时后缀占全串大头、全串相似度失真，
+        # 必须要求文档名本身几乎全等，避免同应用切错文档
+        if len(rec_pref) < 4 or len(w_pref) < 4:
+            return 1.5 if pref >= 0.9 else 0.0
+        return 1.5 if pref >= 0.6 else 0.0
+    return 1.5 if full >= 0.75 else 0.0
+
+
 def _find_window_by_title(title):
     """查找窗口（照抄 AHK SetTitleMatchMode + winappCli fail-fast 精神）。
-    匹配优先级：精确 > 去星精确 > 单向包含 > 类名+进程名（兜底）。
+    匹配优先级：精确 > 去星精确 > 单向包含 > 标题相似 > 类名+进程名（兜底）。
     类名兜底命中多个窗口时拒绝猜测（返回 None），避免打错窗口。"""
     if not title:
         return None
@@ -2249,6 +2289,11 @@ def _find_window_by_title(title):
                 l.append((2, w))
                 return True
 
+            # 2.5 标题相似匹配（标题漂移：录制比实际多/少了状态后缀）
+            if _fuzzy_title_score(_title_parts(title), _title_parts(wtext)) > 0:
+                l.append((1.5, w))
+                return True
+
             # 3. 类名 + 进程名匹配（AHK ahk_class + ahk_exe 组合，兜底）
             if hint_class:
                 cls = win32gui.GetClassName(w)
@@ -2276,9 +2321,6 @@ def _find_window_by_title(title):
         return None
     best = max(lv for lv, _ in found)
     cands = [w for lv, w in found if lv == best]
-    # Multiple same-class windows are resolved by z-order below.
-    if len(cands) == 1:
-        return cands[0]
     # 同级多个匹配：Z 序最前的优先（前台 > 可见 > 最小化）
     def z_order(hwnd):
         try:
@@ -2290,6 +2332,9 @@ def _find_window_by_title(title):
         except:
             return 3
     cands.sort(key=z_order)
+    if best < 2:
+        log.info("  标题漂移模糊匹配: %r -> %r (hwnd=%s)",
+                 title, win32gui.GetWindowText(cands[0]), cands[0])
     return cands[0]
 
 
