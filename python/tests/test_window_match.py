@@ -105,6 +105,16 @@ def main():
         assert player._pause_detail_text({"action": "wait"}, "") == ""
         assert player._visible_dialog_titles() == ["是否保存更改?"]
 
+    # 11. 前缀追加语义：短应用名+状态标记（difflib 相似度失真的实机案例）
+    assert player.titles_similar("漂移测试 - 演示程序 [增强模式]", "漂移测试 - 演示程序")
+    # 扩展名追加
+    assert player.titles_similar("报告 - WPS Office", "报告.txt - WPS Office")
+    # 长文档名单字差异（非前缀、<0.8）拒绝——同应用不同文档
+    assert not player.titles_similar("月度报告A - WPS Office", "月度报告B - WPS Office")
+    # 长文档名小幅修改（≥6字且相似度≥0.8）接受
+    assert player.titles_similar(
+        "项目验收意见汇总表2026 - WPS Office", "项目验收意见汇总表2025 - WPS Office")
+
     print("window_match PASS")
 
 

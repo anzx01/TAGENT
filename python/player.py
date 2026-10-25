@@ -472,6 +472,9 @@ class Player:
         self._pause_detail = _pause_detail_text(step, reason)
         if self._pause_detail:
             log.info("接管诊断: %s", self._pause_detail)
+            # 落进运行报告，事后排查(suggestions 挖掘)可见具体现场
+            if self._pause_reasons and self._pause_reasons[-1].get("step") == step_index:
+                self._pause_reasons[-1]["detail"] = self._pause_detail
         # CALL_USER 语义(移植 mano 终态机):带原因的暂停=失败后求人工;无原因=确认流程
         self._pause_kind = "call_user" if reason else "confirm"
         try:
@@ -1034,7 +1037,9 @@ class Player:
         client_pct_y = loc.get("client_pct_y")
         window_title = loc.get("window", "")
         if client_pct_x is not None and client_pct_y is not None and window_title:
-            hwnd = win32gui.FindWindow(None, window_title)
+            # 用统一找窗链（含标题漂移容忍），精确 FindWindow 在后缀漂移时会
+            # 静默降级到更脆的屏幕百分比定位
+            hwnd = _find_window_by_title(window_title)
             if hwnd:
                 try:
                     # 最小化窗口的 WindowRect 是 (-32000,-32000) 附近的占位值，
