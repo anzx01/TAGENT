@@ -188,12 +188,31 @@
     <div id="scoutView">
       <p class="workspace-copy">发现重复工作，先看证据与重复程度，再决定要优化哪个流程。</p>
       <div class="scout-grid"><div class="scout-metric"><strong id="scoutTaskCount">0</strong><span>流程</span></div><div class="scout-metric"><strong id="scoutStepCount">0</strong><span>步骤</span></div><div class="scout-metric"><strong id="scoutRunCount">0</strong><span>运行</span></div></div>
+      <div id="suggestionBlock" style="margin-bottom:8px"></div>
       <div id="scoutCandidates" class="history-empty">加载重复工作候选…</div>
     </div>
     <div id="historyView" style="display:none"><p class="workspace-copy">每次运行都保留结果、暂停原因和评测，不上传原始截图。</p><div id="historyList"></div></div>
     <div id="settingsView" style="display:none">
       <label class="workspace-copy" style="display:flex;align-items:center;gap:7px"><input id="startupEnabled" type="checkbox" style="width:auto">开机启动 TAGENT 后台</label>
       <p class="workspace-copy">默认关闭。关闭时，定时任务仅在 TAGENT 正在运行时执行。</p>
+      <hr style="border-color:#333;margin:10px 0">
+      <div class="workspace-copy">CALL_USER 通知推送（Bark/Server酱/企业微信 webhook，可含 {title}/{body} 占位）</div>
+      <div style="display:flex;gap:6px;margin:6px 0">
+        <input id="notifyUrl" placeholder="https://api.day.app/你的Key/{title}/{body}" style="flex:1">
+        <button class="mini" id="notifySave">保存并测试</button>
+      </div>
+      <div class="workspace-copy">连接器权限（readonly=只读，act=可代操作）</div>
+      <div style="display:flex;gap:8px;margin:6px 0" id="connectorRow"></div>
+      <label class="workspace-copy" style="display:flex;align-items:center;gap:7px;margin-top:6px"><input id="whitelistToggle" type="checkbox" style="width:auto">网络白名单（除本机与已配主机外禁止外联）</label>
+      <hr style="border-color:#333;margin:10px 0">
+      <div class="workspace-copy">用户记忆（最多 100 条，喂给自愈与泛化；可单条遗忘）</div>
+      <div style="display:flex;gap:6px;margin:6px 0">
+        <input id="memoryInput" placeholder="例如：下单前必须勾选发票" style="flex:1">
+        <button class="mini" id="memoryAdd">记住</button>
+      </div>
+      <div id="memoryList" style="max-height:120px;overflow:auto"></div>
+      <hr style="border-color:#333;margin:10px 0">
+      <div class="workspace-copy" id="auditCard">审计摘要加载中…</div>
     </div>
     <div id="taskView">
     <div id="scoutSummary" style="padding:8px;background:rgba(22,160,133,.12);border-radius:6px;margin-bottom:8px;font-size:11px;color:#b8e8dc"></div>
@@ -329,13 +348,21 @@
         taskView.style.display = workspaceTab === "tasks" ? "block" : "none";
         historyView.style.display = workspaceTab === "history" ? "block" : "none";
         settingsView.style.display = workspaceTab === "settings" ? "block" : "none";
-        if (workspaceTab === "scout") refreshDiscovery();
+        if (workspaceTab === "scout") { refreshDiscovery(); refreshSuggestions(); }
         if (workspaceTab === "tasks") refreshTasks();
         if (workspaceTab === "history") refreshHistory();
         if (workspaceTab === "settings") refreshStartupSetting();
       });
     });
 
+    async function refreshSuggestions() {
+      try {
+        const s = await apiJson("/suggestions");
+        $("suggestionBlock").innerHTML = (s.items || []).map(it =>
+          `<div class="history-row"><span>建议 · ${escapeHtml(it.rec_id)}：${escapeHtml(it.message)}</span></div>`).join("")
+          || "<div class='history-empty'>暂无失败模式建议。</div>";
+      } catch (_) { $("suggestionBlock").innerHTML = ""; }
+    }
     async function refreshStartupSetting() {
       const toggle = $("startupEnabled");
       try {
@@ -343,7 +370,60 @@
         toggle.checked = setting.enabled === true;
         toggle.disabled = !setting.supported;
       } catch (err) { setStatus(apiErrorMessage(err, "读取开机启动设置失败"), "error"); }
+      try {
+        const n = await apiJson("/notify");
+        $("notifyUrl").value = (n.config && n.config.url) || "";
+      } catch (_) {}
+      try {
+        const c = await apiJson("/connectors");
+        const row = $("connectorRow");
+        row.innerHTML = "";
+        for (const name of c.connectors) {
+          const sel = el("select", "", "");
+          for (const lv of ["readonly", "act"]) sel.append(new Option(lv, lv));
+          sel.value = c.permissions[name];
+          sel.onchange = async () => {
+            const r = await apiJson("/connectors/" + name, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ level: sel.value }) });
+            setStatus(r.ok ? "连接器 " + name + " → " + sel.value : (r.msg || "失败"), r.ok ? "" : "error");
+          };
+          row.append(el("span", "workspace-copy", name + ":"), sel);
+        }
+        const guard = await apiJson("/network-guard");
+        $("whitelistToggle").checked = !!(guard.config && guard.config.enabled);
+      } catch (_) {}
+      try { await refreshMemory(); } catch (_) {}
+      try {
+        const a = await apiJson("/audit/summary");
+        const s = a.summary || {};
+        $("auditCard").textContent = "审计：共 " + s.total_runs + " 次运行（近期成功率 " + Math.round((s.recent_success_rate || 0) * 100) + "%）· 定时 " + s.scheduled_jobs + " · 盯守 " + s.watchers + " · 记忆 " + s.memory_rules + " 条 · 导出 Skill " + s.exported_skills + " 份" + (s.notify_enabled ? " · 推送已配置" : "") + (s.network_whitelist ? " · 白名单开启" : "");
+      } catch (_) { $("auditCard").textContent = "审计摘要不可用"; }
     }
+    async function refreshMemory() {
+      const m = await apiJson("/memory");
+      const list = $("memoryList");
+      list.innerHTML = (m.rules || []).map(r => "<div style='display:flex;gap:6px;align-items:center'><span class='workspace-copy'>" + escapeHtml(r.text) + "</span><button class='mini del' data-mid='" + r.id + "'>遗忘</button></div>").join("") || "<span class='workspace-copy'>暂无记忆</span>";
+      for (const b of list.querySelectorAll("[data-mid]")) b.onclick = async () => { await apiJson("/memory/" + b.dataset.mid, { method: "DELETE" }); refreshMemory(); };
+    }
+    $("notifySave").onclick = async () => {
+      try {
+        const r = await apiJson("/notify", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: $("notifyUrl").value.trim(), enabled: true }) });
+        setStatus(r.ok ? (r.test_sent ? "推送已配置并测试成功" : "推送已配置（测试未发出，检查 url）") : (r.msg || "失败"), r.ok ? "" : "error");
+        if (r.ok) refreshStartupSetting();
+      } catch (err) { setStatus(apiErrorMessage(err, "推送配置失败"), "error"); }
+    };
+    $("whitelistToggle").onchange = async () => {
+      const enabled = $("whitelistToggle").checked;
+      const allow = [];
+      try { const n = await apiJson("/notify"); if (n.config && n.config.url) allow.push(new URL(n.config.url).hostname); } catch (_) {}
+      const r = await apiJson("/network-guard", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled, allow_hosts: allow }) });
+      setStatus(r.ok ? (enabled ? "白名单已开启（允许：" + (allow.join(",") || "仅本机") + "）" : "白名单已关闭") : (r.msg || "失败"), r.ok ? "" : "error");
+    };
+    $("memoryAdd").onclick = async () => {
+      const text = $("memoryInput").value.trim();
+      if (!text) return;
+      const r = await apiJson("/memory", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+      if (r.ok) { $("memoryInput").value = ""; refreshMemory(); setStatus("已记住"); } else setStatus(r.msg || "失败", "error");
+    };
     $("startupEnabled").addEventListener("change", async (event) => {
       const toggle = event.target;
       toggle.disabled = true;
@@ -810,6 +890,8 @@
         showSteps(task.id, d.steps || []);
       });
       const appd = aBtn("追加", "mini sched", () => appendTask(task));
+      const watch = aBtn("盯守", "mini var", () => watchModal(task));
+      const chain = aBtn("联动", "mini var", () => chainModal(task));
       const del = aBtn("删除", "mini del", async () => {
         if (confirm("删除该任务？")) {
           try {
@@ -824,7 +906,7 @@
       btns.appendChild(run);
       if (resume) btns.appendChild(resume);
       btns.appendChild(plan); btns.appendChild(intent); btns.appendChild(exportBtn); btns.appendChild(reuse); btns.appendChild(sch); btns.appendChild(vars);
-      btns.appendChild(appd); btns.appendChild(del);
+      btns.appendChild(appd); btns.appendChild(watch); btns.appendChild(chain); btns.appendChild(del);
       card.appendChild(btns);
       return card;
     }
@@ -1054,6 +1136,69 @@
       runTaskWithVars(id, vars, fromStep);
     }
 
+    async function watchModal(task) {
+      try {
+        const w = await apiJson("/watchers");
+        const mine = (w.watchers || []).find(x => x.rec_id === task.id) || {};
+        const c = mine.condition || { kind: "file_exists", value: "" };
+        showModal(`
+          <h4>盯守 - ${escapeHtml(task.name || task.id)}</h4>
+          <div class="hint">条件成立时自动运行该任务（冷却 ${mine.cooldown_min || 10} 分钟，每 20 秒检查）</div>
+          <select id="watchKind">
+            <option value="file_exists" ${c.kind === "file_exists" ? "selected" : ""}>文件出现</option>
+            <option value="window_appears" ${c.kind === "window_appears" ? "selected" : ""}>窗口出现</option>
+          </select>
+          <input id="watchValue" placeholder="${c.kind === "window_appears" ? "窗口标题包含…" : "文件路径或 glob"}" value="${escapeHtml(c.value || "")}" />
+          <button class="primary" onclick="saveWatch('${task.id}')">保存盯守</button>
+          <button class="cancel" onclick="delWatch('${task.id}')">关闭盯守</button>
+          <button class="cancel" onclick="hideModal()">取消</button>
+        `);
+      } catch (err) { setStatus(apiErrorMessage(err, "读取盯守失败"), "error"); }
+    }
+    async function saveWatch(id) {
+      const kind = $("watchKind").value, value = $("watchValue").value.trim();
+      const r = await apiJson("/watchers", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ rec_id: id, condition: { kind, value } }) });
+      setStatus(r.ok ? "盯守已保存" : (r.msg || "失败"), r.ok ? "" : "error");
+      if (r.ok) hideModal();
+    }
+    async function delWatch(id) {
+      await apiJson("/watchers?rec_id=" + encodeURIComponent(id), { method: "DELETE" });
+      setStatus("盯守已关闭"); hideModal();
+    }
+    async function chainModal(task) {
+      try {
+        const p = await apiJson("/tasks/" + task.id + "/pipeline");
+        const t = await apiJson("/tasks", {}, 8000);
+        const others = (t.tasks || []).filter(x => x.id !== task.id).slice(0, 30);
+        const cur = (p.pipeline && p.pipeline.steps) || [];
+        window.__chainOthers = others;
+        showModal(`
+          <h4>联动 - ${escapeHtml(task.name || task.id)}</h4>
+          <div class="hint">本任务结束后自动运行下一个（success=成功时 / fail=失败时 / always=总是）</div>
+          <div id="chainRows">
+            ${cur.map(s => chainRow(others, s)).join("") || "<div class='hint'>尚未配置联动</div>"}
+          </div>
+          <button class="mini" onclick="addChainRow()">添加一环</button>
+          <button class="primary" onclick="saveChain('${task.id}')">保存联动</button>
+          <button class="cancel" onclick="hideModal()">取消</button>
+        `);
+      } catch (err) { setStatus(apiErrorMessage(err, "读取联动失败"), "error"); }
+    }
+    function chainRow(others, cur) {
+      cur = cur || { rec_id: "", on: "success" };
+      const opts = others.map(o => `<option value="${o.id}" ${o.id === cur.rec_id ? "selected" : ""}>${escapeHtml(o.name || o.id)}</option>`).join("");
+      return `<div style="display:flex;gap:6px;margin:4px 0"><select style="flex:1" data-chain-task>${cur.rec_id ? "" : "<option value=''>选择任务…</option>"}${opts}</select><select data-chain-on>${["success", "fail", "always"].map(k => `<option ${k === cur.on ? "selected" : ""}>${k}</option>`).join("")}</select><button class="mini del" onclick="this.parentElement.remove()">删</button></div>`;
+    }
+    function addChainRow() { $("chainRows").insertAdjacentHTML("beforeend", chainRow(window.__chainOthers || [])); }
+    async function saveChain(id) {
+      const steps = [...document.querySelectorAll("#chainRows > div")].map(row => ({
+        rec_id: row.querySelector("[data-chain-task]").value,
+        on: row.querySelector("[data-chain-on]").value,
+      })).filter(s => s.rec_id);
+      const r = await apiJson("/tasks/" + id + "/pipeline", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ steps }) });
+      setStatus(r.ok ? "联动已保存" : (r.msg || "失败"), r.ok ? "" : "error");
+      if (r.ok) hideModal();
+    }
     async function schedModal(task) {
       window.__scheduleTask = task;
       showModal(`

@@ -463,6 +463,12 @@ class Player:
         self._pause_reason = reason or "需要人工接管"
         # CALL_USER 语义(移植 mano 终态机):带原因的暂停=失败后求人工;无原因=确认流程
         self._pause_kind = "call_user" if reason else "confirm"
+        try:
+            callback = self.on_pause
+            if reason and callback:
+                callback(step_index, reason)  # 服务器侧挂通知推送
+        except Exception:
+            pass
         self._last_pause_reason = self._pause_reason
         self._resume_action = None
         log.info("会话步骤 %d：等待人工登录/验证", step_index)

@@ -92,15 +92,82 @@ _lifecycle_generation = 0
 _scheduler: Scheduler | None = None
 
 
+_replay_queue = __import__("collections").deque()
+_replay_queue_lock = threading.Lock()
+QUEUE_CAP = 10
+
+
+def _start_or_enqueue(rec_id: str, variables: dict | None, from_step: int = 0,
+                      trigger: str = "manual", depth: int = 0) -> str:
+    """直接启动回放;有回放进行中则入队串行,返回 started/queued/failed。"""
+    if _launch_replay(rec_id, variables, from_step, trigger, depth):
+        return "started"
+    with _player_lock:
+        busy = _player is not None
+    if not busy:
+        return "failed"  # 非忙却启动失败:任务本身不可回放,不重试
+    with _replay_queue_lock:
+        if len(_replay_queue) >= QUEUE_CAP:
+            log.warning("回放队列已满,丢弃: %s", rec_id)
+            return "failed"
+        _replay_queue.append({"rec_id": rec_id, "variables": variables,
+                              "from_step": from_step, "trigger": trigger, "depth": depth})
+        log.info("回放入队: %s (trigger=%s, 队列 %d)", rec_id, trigger, len(_replay_queue))
+        return "queued"
+
+
+def _pump_replay_queue():
+    """当前回放结束后取下一条;失败任务跳过继续。"""
+    while True:
+        with _replay_queue_lock:
+            if not _replay_queue:
+                return
+            job = _replay_queue.popleft()
+        state = _start_or_enqueue(job["rec_id"], job["variables"], job["from_step"],
+                                  job["trigger"], job["depth"])
+        if state == "failed":
+            log.warning("出队任务不可回放,跳过: %s", job["rec_id"])
+            continue
+        return
+
+
+def _maybe_chain(rec_id: str, result, depth: int):
+    """任务依赖链:按 meta.pipeline 在成功/失败/总是时联动下一个任务。"""
+    if depth >= 5:
+        log.warning("联动链深度超限,截断: %s", rec_id)
+        return
+    try:
+        meta = json.loads((BASE_DIR / "recordings" / rec_id / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    success = bool(isinstance(result, dict) and result.get("success"))
+    for step in (meta.get("pipeline") or {}).get("steps", []):
+        wanted = step.get("on", "success")
+        if wanted not in ("always", "success" if success else "fail"):
+            continue
+        nxt = str(step.get("rec_id") or "")
+        if not nxt or not (BASE_DIR / "recordings" / nxt).is_dir():
+            continue
+        state = _start_or_enqueue(nxt, None, 0, f"pipeline:{rec_id}", depth + 1)
+        log.info("联动 %s -> %s (on=%s, %s)", rec_id, nxt, wanted, state)
+
+
+def _notify_call_user(rec_id: str, step_index: int, reason: str):
+    from services import notifier
+    from services.replay_diagnostics import pause_category
+    notifier.notify("TAGENT 需要人工接管",
+                    f"{rec_id} 第 {step_index + 1} 步: {pause_category(reason)}", BASE_DIR)
+
+
 def _scheduled_run(rec_id: str):
-    """定时触发：后台回放任务（阶段4.2）"""
+    """定时触发：后台回放任务（阶段4.2）；忙时入队而非丢弃。"""
     log.info("[定时] 执行任务 %s", rec_id)
     try:
-        with _player_lock:
-            if _player:
-                log.warning("[定时] 有回放进行中，跳过 %s", rec_id)
-                return False
-        return bool(_launch_replay(rec_id, None, trigger="schedule"))
+        state = _start_or_enqueue(rec_id, None, trigger="schedule")
+        if state == "failed":
+            from services import notifier
+            notifier.notify("TAGENT 定时任务启动失败", rec_id, BASE_DIR)
+        return state != "failed"
     except Exception:
         log.exception("[定时] 启动失败 %s", rec_id)
         return False
@@ -119,6 +186,30 @@ if os.name == "nt":
     except Exception:
         log.exception("无法同步 Windows 登录后台任务")
 _scheduler.start()
+
+
+def _watcher_loop():
+    while True:
+        time.sleep(20)
+        try:
+            from services import watchers as _w
+            from services import notifier as _n
+            for item in _w.load(BASE_DIR):
+                if not item.get("enabled") or not _w.due(item):
+                    continue
+                if not _w.evaluate(item.get("condition") or {}):
+                    continue
+                _w.mark_fired(BASE_DIR, item["id"])
+                log.info("[盯守] 触发 %s -> %s", item.get("condition", {}).get("kind"), item.get("rec_id"))
+                _n.notify("TAGENT 盯守触发",
+                          f"{item.get('rec_id')} 因 {item.get('condition', {}).get('kind')} 条件成立而启动",
+                          BASE_DIR)
+                _start_or_enqueue(item["rec_id"], None, trigger="watcher")
+        except Exception:
+            log.exception("盯守轮询异常")
+
+
+threading.Thread(target=_watcher_loop, name="tagent-watchers", daemon=True).start()
 app.include_router(build_router(
     DATA_DIR, _scheduler,
     _sync_startup if os.name == "nt" else None,
@@ -289,7 +380,7 @@ def _attach_input_desktop() -> bool:
 
 
 def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0,
-                   trigger: str = "manual"):
+                   trigger: str = "manual", depth: int = 0):
     """准备并启动回放。
 
     Player 必须在返回成功前登记到全局状态。旧实现在线程函数内部才赋值，
@@ -425,6 +516,7 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0,
         player.checkpoint_path = ckpt_file
         player._from_step = from_step
         player._rec_id = rec_id
+        player.on_pause = lambda step_index, reason: _notify_call_user(rec_id, step_index, reason)
         # 阶段1.2：回放截图目录
         ss_dir = BASE_DIR / "runs" / "screenshots" / rec_id
         player.screenshot_dir = str(ss_dir)
@@ -500,7 +592,12 @@ def _launch_replay(rec_id: str, variables: dict | None, from_step: int = 0,
                     _player = None
                     _player_thread = None
                 log.info("回放实例已释放")
+            try:
+                _maybe_chain(rec_id, result, depth)
+            except Exception:
+                log.exception("联动处理失败: %s", rec_id)
             _exit_if_detached_and_idle()
+            _pump_replay_queue()
 
     t = threading.Thread(target=_run, name=f"tagent-replay-{rec_id}", daemon=True)
     with _player_lock:
@@ -731,6 +828,141 @@ def lifecycle_status():
             "startup_enabled": startup_preference(BASE_DIR)}
 
 
+@app.get("/notify")
+def get_notify():
+    from services import notifier
+    return {"ok": True, "config": notifier.load_config(BASE_DIR)}
+
+
+@app.put("/notify")
+def set_notify(body: dict):
+    from services import notifier
+    url = str(body.get("url", "")).strip()
+    if url and not (url.startswith("http://") or url.startswith("https://")):
+        return {"ok": False, "msg": "url 必须以 http(s):// 开头"}
+    config = {"url": url, "enabled": bool(body.get("enabled", True))}
+    notifier.save_config(BASE_DIR, config)
+    sent = notifier.notify("TAGENT 通知测试", "配置成功", BASE_DIR) if url else False
+    return {"ok": True, "config": config, "test_sent": sent}
+
+
+@app.get("/suggestions")
+def get_suggestions():
+    from services import suggestions
+    return {"ok": True, "items": suggestions.mine(BASE_DIR / "runs")}
+
+
+@app.get("/watchers")
+def list_watchers():
+    from services import watchers
+    return {"ok": True, "watchers": watchers.load(BASE_DIR)}
+
+
+@app.put("/watchers")
+def put_watcher(body: dict):
+    from services import watchers
+    condition = body.get("condition") or {}
+    if condition.get("kind") not in ("file_exists", "window_appears") or not str(condition.get("value", "")).strip():
+        return {"ok": False, "msg": "condition 需为 file_exists/window_appears 且带 value"}
+    if not str(body.get("rec_id", "")).strip():
+        return {"ok": False, "msg": "rec_id 必填"}
+    item = watchers.upsert(BASE_DIR, body["rec_id"], condition, body.get("cooldown_min", 10))
+    return {"ok": True, "watcher": item}
+
+
+@app.delete("/watchers")
+def delete_watcher(rec_id: str):
+    from services import watchers
+    return {"ok": watchers.remove(BASE_DIR, rec_id)}
+
+
+@app.get("/memory")
+def get_memory():
+    from services import memory_store
+    return {"ok": True, "rules": memory_store.load(BASE_DIR),
+            "context": memory_store.context(BASE_DIR)}
+
+
+@app.put("/memory")
+def add_memory(body: dict):
+    from services import memory_store
+    try:
+        rule = memory_store.add(BASE_DIR, body.get("text", ""))
+    except ValueError as exc:
+        return {"ok": False, "msg": str(exc)}
+    return {"ok": True, "rule": rule, "count": len(memory_store.load(BASE_DIR))}
+
+
+@app.delete("/memory/{rule_id}")
+def forget_memory(rule_id: str):
+    from services import memory_store
+    return {"ok": memory_store.forget(BASE_DIR, rule_id)}
+
+
+@app.get("/connectors")
+def get_connectors():
+    from services import connector_permissions as cp
+    return {"ok": True, "permissions": cp.load(BASE_DIR), "connectors": cp.CONNECTORS}
+
+
+@app.put("/connectors/{name}")
+def set_connector(name: str, body: dict):
+    from services import connector_permissions as cp
+    if not cp.set_permission(BASE_DIR, name, str(body.get("level", ""))):
+        return {"ok": False, "msg": "连接器或档位无效"}
+    return {"ok": True, "permissions": cp.load(BASE_DIR)}
+
+
+@app.get("/network-guard")
+def get_network_guard():
+    from services import network_guard
+    return {"ok": True, "config": network_guard.load(BASE_DIR)}
+
+
+@app.put("/network-guard")
+def set_network_guard(body: dict):
+    from services import network_guard
+    allow = body.get("allow_hosts", [])
+    if not isinstance(allow, list):
+        return {"ok": False, "msg": "allow_hosts 须为列表"}
+    config = {"enabled": bool(body.get("enabled")), "allow_hosts": [str(h) for h in allow]}
+    network_guard.save(BASE_DIR, config)
+    return {"ok": True, "config": config}
+
+
+@app.get("/audit/summary")
+def audit_summary():
+    from services import connector_permissions as cp
+    from services import memory_store
+    from services import network_guard
+    from services import notifier
+    from services import suggestions
+    from services import watchers
+    runs_dir = BASE_DIR / "runs"
+    reports = [p for p in runs_dir.glob("*.json") if not p.name.endswith(".context.json")]
+    successes = 0
+    for path in reports[-200:]:
+        try:
+            if json.loads(path.read_text(encoding="utf-8")).get("success"):
+                successes += 1
+        except (OSError, ValueError):
+            pass
+    recent = reports[-200:] or [1]
+    exports = len(list((BASE_DIR / "recordings").glob("*/skill.md")))
+    return {"ok": True, "summary": {
+        "total_runs": len(reports),
+        "recent_success_rate": round(successes / max(1, len(recent)), 3),
+        "scheduled_jobs": len(_scheduler.list_jobs()) if _scheduler else 0,
+        "watchers": len(watchers.load(BASE_DIR)),
+        "suggestions": suggestions.mine(runs_dir)[:3],
+        "memory_rules": len(memory_store.load(BASE_DIR)),
+        "connector_permissions": cp.load(BASE_DIR),
+        "notify_enabled": bool(notifier.load_config(BASE_DIR).get("enabled")),
+        "network_whitelist": network_guard.load(BASE_DIR).get("enabled", False),
+        "exported_skills": exports,
+    }}
+
+
 @app.get("/runs/query")
 def query_runs(rec_id: str | None = None, success: bool | None = None, limit: int = 50):
     """运行历史查询(SQLite 索引;runs/*.json 仍为事实源)。"""
@@ -790,11 +1022,9 @@ def start_replay(req: ReplayRequest):
 
     with _player_lock:
         current = _player
-    if current is not None:
-        if not current.paused:
-            return {"ok": False, "msg": "已有回放进行中"}
-        # 暂停残留（等待人工接管）被新的回放指令替换。等待旧线程真正释放，
-        # 避免两条线程同时向桌面注入输入。
+    if current is not None and current.paused:
+        # 暂停残留（等待人工接管）被新的回放指令替换。等待旧线程真正释放；
+        # 未暂停的忙状态在校验完成后入队而非拒绝。
         current.stop()
         deadline = time.time() + 5.0
         while time.time() < deadline:
@@ -804,7 +1034,7 @@ def start_replay(req: ReplayRequest):
             time.sleep(0.05)
         with _player_lock:
             if _player is not None:
-                return {"ok": False, "msg": "上一轮回放仍在停止，请稍后重试"}
+                pass  # 旧线程释放慢也继续走校验,末尾统一入队
 
     # 找到要回放的录制（不持锁执行磁盘 IO；_launch_replay 会再次原子检查）。
     if req.recording_id:
@@ -849,7 +1079,12 @@ def start_replay(req: ReplayRequest):
             return {"ok": False, "msg": "前置状态不符：" + "；".join(gate_failures)
                     + "。请先打开目标应用（或在高级选项跳过门禁）",
                     "preflight": gate_failures}
-    if _launch_replay(rec_dir.name, req.variables or {}, from_step, req.trigger):
+    state = _start_or_enqueue(rec_dir.name, req.variables or {}, from_step, req.trigger)
+    if state == "queued":
+        with _replay_queue_lock:
+            position = len(_replay_queue)
+        return {"ok": True, "recording_id": rec_dir.name, "queued": True, "position": position}
+    if state == "started":
         return {"ok": True, "recording_id": rec_dir.name}
     return {"ok": False, "msg": "没有可回放的内容"}
 

@@ -61,11 +61,22 @@ class LLMHealer:
     def heal(self, failed_step: dict, context: list, error: str = "") -> dict | None:
         if not self.enabled:
             return None
+        from services.network_guard import outbound_allowed
+        if not outbound_allowed(paths.BASE_DIR, self._config["api_base"]):
+            log.warning("网络白名单拦截 LLM 调用")
+            return None
         api_base = self._config["api_base"].rstrip("/")
         api_key = self._config["api_key"]
         model = self._config.get("model", "gpt-4o-mini")
 
         prompt = self._build_prompt(failed_step, context, error)
+        try:
+            from services.memory_store import context as memory_context
+            extra = memory_context(paths.BASE_DIR)
+            if extra:
+                prompt = extra + "\n" + prompt
+        except Exception:
+            pass
         try:
             req = urllib.request.Request(
                 f"{api_base}/chat/completions",

@@ -317,6 +317,47 @@ def build_router(data_dir: Path, scheduler: Scheduler, autostart_sync=None) -> A
             log.exception("导出任务产物失败: %s", rec_id)
             return {"ok": False, "msg": str(exc)}
 
+    # ---------- 任务依赖链 ----------
+
+    @router.get("/{rec_id}/pipeline")
+    def get_pipeline(rec_id: str):
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        meta_path = d / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {}
+        return {"ok": True, "pipeline": meta.get("pipeline", {"steps": []})}
+
+    @router.put("/{rec_id}/pipeline")
+    def set_pipeline(rec_id: str, body: dict):
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        steps = body.get("steps")
+        if not isinstance(steps, list):
+            return {"ok": False, "msg": "steps 必填"}
+        cleaned = []
+        for item in steps:
+            nxt = str(item.get("rec_id") or "").strip()
+            if not nxt or not _resolve(nxt):
+                return {"ok": False, "msg": f"联动任务不存在: {nxt or '(空)'}"}
+            if item.get("on") not in ("success", "fail", "always"):
+                return {"ok": False, "msg": "on 必须是 success/fail/always"}
+            if nxt == rec_id:
+                return {"ok": False, "msg": "不能联动自身(会成环)"}
+            cleaned.append({"rec_id": nxt, "on": item["on"]})
+        meta_path = d / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {}
+        meta["pipeline"] = {"steps": cleaned}
+        store.save_meta(rec_id, meta)
+        return {"ok": True, "pipeline": meta["pipeline"]}
+
     # ---------- 意图分析(移植 skill-recorder describer 的最小版) ----------
 
     @router.get("/{rec_id}/analysis")

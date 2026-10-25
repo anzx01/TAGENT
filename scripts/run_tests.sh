@@ -47,6 +47,15 @@ UNIT_TESTS=(
     python/tests/test_replay_control.py
     python/tests/test_replay_diagnostics.py
     python/tests/test_replay_failure_boundary.py
+    python/tests/test_replay_gate.py
+    python/tests/test_intent_analyst.py
+    python/tests/test_regression_baseline.py
+    python/tests/test_capability_deps.py
+    python/tests/test_run_store.py
+    python/tests/test_step_ids.py
+    python/tests/test_compiler_seed.py
+    python/tests/test_pii_corpus.py
+    python/tests/test_agent_features.py
     python/tests/test_uitars_actions.py
     python/tests/test_visual_agent.py
     python/tests/test_outlook_fields.py
