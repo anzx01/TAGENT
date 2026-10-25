@@ -72,7 +72,13 @@ def _window_appears(value: str, enumerate_windows=None) -> bool:
             win32gui.EnumWindows(lambda h, l: (l.append(win32gui.GetWindowText(h)), True)[1], out)
             return out
     needle = str(value).casefold()
-    return any(needle in str(t).casefold() for t in enumerate_windows())
+    titles = [str(t) for t in enumerate_windows()]
+    if any(needle in t.casefold() for t in titles):
+        return True
+    # 标题漂移容忍（与 replay_gate/player 同源）：录制带状态后缀、
+    # 出现时后缀消失（[管理员模式]/扩展名等）不应让盯守永远等不到
+    from services.title_match import titles_similar
+    return any(titles_similar(str(value), t) for t in titles)
 
 
 def evaluate(condition: dict, *, file_exists=None, window_appears=None) -> bool:

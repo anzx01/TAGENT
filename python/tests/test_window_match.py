@@ -140,6 +140,41 @@ def main():
             {"action": "switch_window", "window": "文档C - 演示应用"}, "")
         assert "「演示应用」有 2 个窗口但标题均不符" in d, d
 
+    # 13. 桌面动作防盲点：具名 UIA 失效且坐标命中 → 拒绝；uia/ocr 锚定 → 放行
+    icon_step = {"action": "double_click", "window": "Program Manager",
+                 "locator": [{"type": "uia", "name": "新建 DOCX 文档"},
+                             {"type": "coord", "pct_x": 30, "pct_y": 40}]}
+    p = object.__new__(player.Player)
+    p._last_coords_source = "coord"
+    assert p._named_uia_missing(icon_step) == "新建 DOCX 文档"
+    p._last_coords_source = None  # 全链失败回退 raw 也算盲点
+    assert p._named_uia_missing(icon_step) == "新建 DOCX 文档"
+    p._last_coords_source = "uia"
+    assert p._named_uia_missing(icon_step) is None
+    p._last_coords_source = "ocr"
+    assert p._named_uia_missing(icon_step) is None
+    assert p._named_uia_missing({"action": "click", "window": "Program Manager",
+                                 "locator": [{"type": "coord", "pct_x": 1}]}) is None
+
+    # 14. 盯守 window_appears 漂移容忍
+    from services.watchers import _window_appears
+    assert _window_appears("维多利亚 - Everything [管理员模式]",
+                           lambda: ["维多利亚 - Everything"])
+    assert not _window_appears("报告A - WPS Office", lambda: ["报告B - WPS Office"])
+
+    # 15. 能力完成条件 window 漂移容忍（短片段仍走包含语义）
+    from services.capability_verifier import verify_postcondition
+    ok, _ = verify_postcondition({"type": "window", "value": "Notepad"},
+                                 window_title="新建 文本文档.txt - Notepad")
+    assert ok
+    ok, _ = verify_postcondition(
+        {"type": "window", "value": "新建 文本文档.txt - Notepad [未保存]"},
+        window_title="*新建 文本文档.txt - Notepad")
+    assert ok
+    ok, _ = verify_postcondition({"type": "window", "value": "计算器"},
+                                 window_title="新建 文本文档.txt - Notepad")
+    assert not ok
+
     print("window_match PASS")
 
 

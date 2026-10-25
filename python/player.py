@@ -62,6 +62,7 @@ class Player:
         self._last_pause_reason = ""
         self._pause_kind = ""
         self._desktop_menu_open = False
+        self._last_coords_source = None
         self._session_steps = set(session_steps or [])  # 阶段2.4
         self.checkpoint_path = None  # 阶段5.1：断点续跑
         self._corrections = corrections or []  # 阶段3.3：自愈库
@@ -151,6 +152,7 @@ class Player:
         self._pause_kind = ""
         self._typed_windows = set()
         self._desktop_menu_open = False
+        self._last_coords_source = None
         expects_text_document = any(
             step.get("semantic") == "shell_create_text_document" for step in self.steps
         )
@@ -772,9 +774,13 @@ class Player:
     # ============ 定位 ============
 
     def _resolve_coords(self, step):
-        """用定位策略链找到目标屏幕坐标，返回 (x, y)"""
+        """用定位策略链找到目标屏幕坐标，返回 (x, y)。
+        副作用：self._last_coords_source 记录实际命中的定位器类型
+        （"uia"/"coord"/"ocr"/...；None=全部失败回退原始坐标），
+        供桌面动作判断"具名定位失效、坐标是盲点"。"""
         locators = step.get("locator", [])
         raw = (step.get("screen_x"), step.get("screen_y"))
+        self._last_coords_source = None
         # 如果没有 locator，用原始坐标
         if not locators:
             return raw
@@ -782,10 +788,25 @@ class Player:
         for loc in locators:
             x, y = self._try_locator(loc, raw)
             if x is not None and y is not None:
+                self._last_coords_source = loc.get("type")
                 return x, y
 
         # 全部失败，用原始坐标
         return raw
+
+    def _named_uia_missing(self, step):
+        """桌面动作防盲点：录制时定位的是具名 UIA 元素（如图标），
+        回放时该元素不存在而坐标链"成功"就是盲点——桌面盲点双击会打开
+        完全无关的文件。返回缺失的图标名；None=无具名定位或已锚定
+        （uia 命中，或 ocr 等证据级定位命中）。"""
+        named = [str(loc.get("name") or "").strip() for loc in step.get("locator", [])
+                 if loc.get("type") == "uia"]
+        named = [n for n in named if n]
+        if not named:
+            return None
+        if getattr(self, "_last_coords_source", None) in ("uia", "ocr"):
+            return None
+        return named[0]
 
     def _try_locator(self, loc, raw=(None, None)):
         loc_type = loc.get("type")
@@ -1413,7 +1434,12 @@ class Player:
         if x is None or y is None:
             return self._fail("click", "no_coords")
         if self._is_desktop_action(step):
-            log.info("  -> 桌面点击 (%d,%d)", x, y)
+            missing = self._named_uia_missing(step)
+            if missing:
+                log.warning("  -> 桌面图标未找到: %r，拒绝盲点坐标", missing)
+                return self._fail("click", f"桌面图标未找到: {missing}")
+            log.info("  -> 桌面点击 (%d,%d) [%s]", x, y,
+                     self._last_coords_source or "raw")
             if not self._desktop_menu_open:
                 _show_desktop()
             if not _desktop_window_at(x, y, allow_menu=self._desktop_menu_open):
@@ -1705,7 +1731,12 @@ class Player:
         if x is None or y is None:
             return self._fail("double_click", "no_coords")
         if self._is_desktop_action(step):
-            log.info("  -> 桌面双击 (%d,%d)", x, y)
+            missing = self._named_uia_missing(step)
+            if missing:
+                log.warning("  -> 桌面图标未找到: %r，拒绝盲点双击", missing)
+                return self._fail("double_click", f"桌面图标未找到: {missing}")
+            log.info("  -> 桌面双击 (%d,%d) [%s]", x, y,
+                     self._last_coords_source or "raw")
             if not self._desktop_menu_open:
                 _show_desktop()
             if not _desktop_window_at(x, y, allow_menu=self._desktop_menu_open):
@@ -2445,6 +2476,8 @@ def _pause_detail_text(step, reason=""):
     只含窗口标题，不含任何按键文本（隐私边界与日志一致）。"""
     target = str((step or {}).get("window", "") or "").strip()
     if not target:
+        if "桌面图标未找到" in reason:
+            return reason + "；录制时的桌面文件已不存在，请先恢复它或重新录制该段"
         return ""
     bits = []
     try:

@@ -17,6 +17,11 @@ def verify_postcondition(condition: dict, *, window_title: str = "",
         return False, "完成条件未填写"
     if kind == "window":
         passed = expected.casefold() in window_title.casefold()
+        if not passed:
+            # 标题漂移容忍（与 player/replay_gate 同源）：录制带状态后缀、
+            # 验证时后缀消失不应让完成条件永远不通过
+            from services.title_match import titles_similar
+            passed = titles_similar(expected, window_title)
         return passed, "窗口标题匹配" if passed else f"当前窗口不包含「{expected}」"
     if kind == "text":
         return text_found, "屏幕文字已找到" if text_found else f"屏幕未找到「{expected}」"
