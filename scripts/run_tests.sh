@@ -56,6 +56,7 @@ UNIT_TESTS=(
     python/tests/test_compiler_seed.py
     python/tests/test_pii_corpus.py
     python/tests/test_agent_features.py
+    python/tests/test_hardening.py
     python/tests/test_uitars_actions.py
     python/tests/test_visual_agent.py
     python/tests/test_outlook_fields.py

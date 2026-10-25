@@ -91,9 +91,12 @@ class Scheduler:
                     day = now.strftime("%Y%m%d")
                     due = (now.hour, now.minute) >= (sched.get("hour", 9), sched.get("minute", 0))
                     if due and sched.get("last_run_day") != day:
-                        if self._maybe_fire(rec_id, ("daily", day)):
-                            sched["last_run_day"] = day
-                            self.save(config)
+                        # 先落盘再触发:触发后崩溃只漏跑不重跑;启动失败则回滚保住重试资格
+                        previous_day = sched.get("last_run_day")
+                        sched["last_run_day"] = day
+                        self.save(config)
+                        if not self._maybe_fire(rec_id, ("daily", day)):
+                            self._rollback(rec_id, "last_run_day", previous_day)
                     continue
                 if kind == "interval":
                     minutes = max(1, int(sched.get("minutes", 60)))
@@ -102,9 +105,19 @@ class Scheduler:
                         sched["next_run_at"] = now.timestamp() + minutes * 60
                         self.save(config)
                     elif now.timestamp() >= due:
-                        if self._maybe_fire(rec_id, ("interval", str(due))):
-                            sched["next_run_at"] = now.timestamp() + minutes * 60
-                            self.save(config)
+                        sched["next_run_at"] = now.timestamp() + minutes * 60
+                        self.save(config)
+                        if not self._maybe_fire(rec_id, ("interval", str(due))):
+                            self._rollback(rec_id, "next_run_at", due)
+
+
+    def _rollback(self, rec_id: str, field: str, previous):
+        """启动失败时恢复触发资格(重新加载,避免覆盖并发删除)。"""
+        with self._lock:
+            config = self.load()
+            if rec_id in config and config[rec_id].get(field) is not None:
+                config[rec_id][field] = previous
+                self.save(config)
 
     def _maybe_fire(self, rec_id: str, key: tuple[str, str]):
         if key in self._marks:

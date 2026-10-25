@@ -1,10 +1,15 @@
+# 全量精确锁定(2026-10 现场 venv 版本);升级时按对重新验证 exe 体积与全部测试
 pywin32==312
-Pillow>=10.0.0
-numpy>=1.24.0
+Pillow==13.0.0
+numpy==2.4.6
 uiautomation==2.0.29
-fastapi==0.141.1
-uvicorn==0.52.1
-mss>=10.0.0
-cryptography>=42.0.0
-playwright>=1.40.0
-pytesseract>=0.3.10
+fastapi==0.162.0
+uvicorn==0.54.0
+mss==10.2.0
+cryptography==50.0.2
+playwright==1.64.1
+pytesseract==0.3.13
+# 测试配套
+httpx==0.28.1
+pyinstaller==6.22.3
+psutil==7.2.2

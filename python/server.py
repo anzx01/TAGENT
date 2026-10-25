@@ -48,11 +48,32 @@ app.add_middleware(
 )
 
 
+ALLOWED_HOSTS = {"127.0.0.1:18899", "localhost:18899", "testserver"}  # testserver=测试客户端默认 Host
+# 需要令牌的"服务中断类"端点:任意脚本不应能悄悄杀后端/改生命周期
+TOKEN_GUARDED = ("/shutdown", "/lifecycle/")
+
+
+def _api_token() -> str:
+    """本机令牌,首启生成;UI 经同源 /api-token 取得(跨站读不到)。"""
+    path = BASE_DIR / "data" / "api_token"
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    import secrets
+    token = secrets.token_hex(16)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(token, encoding="utf-8")
+    return token
+
+
 @app.middleware("http")
 async def guard(request: Request, call_next):
-    """写操作校验 Origin，防跨站请求伪造。
-    策略：浏览器请求必须带允许的 Origin；无 Origin 的非浏览器客户端（curl/测试脚本）放行。
-    """
+    """Host 校验防 DNS rebinding;写操作校验 Origin 防跨站伪造;
+    中断类端点(/shutdown、/lifecycle/*)另需本机令牌。"""
+    if request.headers.get("host", "").lower() not in ALLOWED_HOSTS:
+        log.warning("拒绝非法 Host: %r %s", request.headers.get("host"), request.url.path)
+        return JSONResponse({"ok": False, "msg": "forbidden"}, status_code=403)
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return await call_next(request)
     origin = request.headers.get("origin")
@@ -60,7 +81,16 @@ async def guard(request: Request, call_next):
         log.warning("拒绝跨站写请求: %s %s origin=%s",
                     request.method, request.url.path, origin)
         return JSONResponse({"ok": False, "msg": "forbidden"}, status_code=403)
+    if request.url.path.startswith(TOKEN_GUARDED) or request.url.path == "/shutdown":
+        if request.headers.get("x-tagent-token") != _api_token():
+            return JSONResponse({"ok": False, "msg": "missing token"}, status_code=401)
     return await call_next(request)
+
+
+@app.get("/api-token")
+def get_api_token():
+    """同源 UI 取令牌(CORS 拦截跨站读取);仅用于中断类端点防误触。"""
+    return {"ok": True, "token": _api_token()}
 
 
 DATA_DIR = BASE_DIR / "recordings"
@@ -99,14 +129,21 @@ QUEUE_CAP = 10
 
 def _start_or_enqueue(rec_id: str, variables: dict | None, from_step: int = 0,
                       trigger: str = "manual", depth: int = 0) -> str:
-    """直接启动回放;有回放进行中则入队串行,返回 started/queued/failed。"""
+    """直接启动回放;有回放进行中则入队串行,返回 started/queued/failed。
+
+    同一任务不重复入队(进行中或已排队即视为已受理),避免盯守+定时+手动
+    叠加时同一自动化连跑两遍(桌面操作里的"重复下单")。"""
     if _launch_replay(rec_id, variables, from_step, trigger, depth):
         return "started"
     with _player_lock:
         busy = _player is not None
+        playing_same = getattr(_player, "_rec_id", "") == rec_id if _player else False
     if not busy:
         return "failed"  # 非忙却启动失败:任务本身不可回放,不重试
     with _replay_queue_lock:
+        if playing_same or any(job["rec_id"] == rec_id for job in _replay_queue):
+            log.info("任务 %s 已在执行/队列中,跳过重复入队 (trigger=%s)", rec_id, trigger)
+            return "queued"
         if len(_replay_queue) >= QUEUE_CAP:
             log.warning("回放队列已满,丢弃: %s", rec_id)
             return "failed"
@@ -210,6 +247,17 @@ def _watcher_loop():
 
 
 threading.Thread(target=_watcher_loop, name="tagent-watchers", daemon=True).start()
+
+
+def _retention_once():
+    try:
+        from services import retention
+        retention.apply(BASE_DIR)
+    except Exception:
+        log.exception("保留策略执行失败")
+
+
+threading.Thread(target=_retention_once, name="tagent-retention", daemon=True).start()
 app.include_router(build_router(
     DATA_DIR, _scheduler,
     _sync_startup if os.name == "nt" else None,
@@ -961,6 +1009,13 @@ def audit_summary():
         "network_whitelist": network_guard.load(BASE_DIR).get("enabled", False),
         "exported_skills": exports,
     }}
+
+
+@app.post("/maintenance/retention")
+def run_retention():
+    """手动执行存储保留策略(启动时也会自动跑一次)。"""
+    from services import retention
+    return {"ok": True, "stats": retention.apply(BASE_DIR)}
 
 
 @app.get("/runs/query")

@@ -104,7 +104,7 @@ def wait_replay_done(timeout=60):
     raise TimeoutError("replay not finished")
 
 
-def record(script, title, keep_open=False):
+def record(script, title):
     """按 [(type,文本)|(press,vk)] 脚本录制;返回 (rec_id, hwnd)。"""
     hwnd = find_window(title)
     assert hwnd, f"{title} 未打开"

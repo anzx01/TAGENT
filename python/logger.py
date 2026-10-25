@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from paths import BASE_DIR
@@ -9,6 +10,8 @@ from paths import BASE_DIR
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = "tagent.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+LOG_MAX_BYTES = 5 * 1024 * 1024   # 日志含窗口标题等敏感上下文,限容量+轮换,避免无限留底
+LOG_BACKUP_COUNT = 3
 
 
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
@@ -20,7 +23,8 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     root.setLevel(level)
     formatter = logging.Formatter(LOG_FORMAT)
 
-    file_handler = logging.FileHandler(LOG_DIR / LOG_FILE, encoding="utf-8")
+    file_handler = RotatingFileHandler(LOG_DIR / LOG_FILE, encoding="utf-8",
+                                       maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 

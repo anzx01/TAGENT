@@ -259,8 +259,9 @@ class Recorder:
         self._drain_quiet(1.0)
         if self._proc_thread:
             self._proc_thread.join(timeout=3.0)
-        log.info("stop: pending_text=%r pending_scroll=%r 队列剩余=%d",
-                 self._pending_text, self._pending_scroll, self.hook._queue.qsize())
+        log.info("stop: pending_text=%d chars pending_scroll=%r 队列剩余=%d",
+                 len(str(self._pending_text.get("text", "") if self._pending_text else "")),
+                 bool(self._pending_scroll), self.hook._queue.qsize())
         # 冲刷未完成状态
         self._flush_pending()
         # 等后台截图线程收尾。截图落盘前要过 OCR 敏感遮挡（串行锁，
@@ -514,7 +515,9 @@ class Recorder:
         self._add_step("scroll", s["x"], s["y"], delta=s["delta"])
 
     def _finalize_text(self, t):
-        log.info("finalize_text %r (recording=%s)", t["text"], self.recording)
+        # 日志只记长度:键入原文可能含敏感值,task.json 才是落盘位置(且过 PII 脱敏)
+        log.info("finalize_text (%d chars, recording=%s)",
+                 len(str(t.get("text", ""))), self.recording)
         try:
             step = self._add_step("input_text", text=t["text"], fg_hwnd=t.get("fg_hwnd", 0))
             # 阶段4.3 安全：若输入目标是密码框，明文不落盘，替换为占位

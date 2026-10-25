@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS step_logs (
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")  # 回放线程写+查询并发读,避免 database is locked
     conn.executescript(_SCHEMA)
     return conn
 

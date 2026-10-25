@@ -48,10 +48,28 @@ fn should_stay_running_in_status_value(body: &[u8]) -> Option<bool> {
         })
 }
 
+fn api_token() -> String {
+    // 与后端 data/api_token 约定一致:源码模式在仓库根,打包后在 LOCALAPPDATA\TAGENT
+    let mut candidates = Vec::new();
+    if let Ok(root) = std::env::current_dir() {
+        candidates.push(root.join("data").join("api_token"));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join("TAGENT").join("data").join("api_token"));
+    }
+    for path in candidates {
+        if let Ok(token) = std::fs::read_to_string(&path) {
+            return token.trim().to_string();
+        }
+    }
+    String::new()
+}
+
 fn request_backend_lifecycle(action: &str) {
     if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", BACKEND_PORT)) {
+        let token = api_token();
         let request = format!(
-            "POST /lifecycle/{action} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "POST /lifecycle/{action} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-TAGENT-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             BACKEND_PORT,
         );
         let _ = stream.write_all(request.as_bytes());

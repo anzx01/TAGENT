@@ -31,7 +31,7 @@ goto menu
 :stop
 echo.
 echo Stopping TAGENT backend...
-powershell -NoProfile -Command "try { Invoke-RestMethod http://127.0.0.1:18899/shutdown -Method Post -TimeoutSec 3 | Out-Null } catch { Write-Host 'Backend endpoint is not reachable; no process was force-killed.' }"
+powershell -NoProfile -Command "try { $tk = (Get-Content -Raw datapi_token.txt -ErrorAction Stop).Trim(); Invoke-RestMethod http://127.0.0.1:18899/shutdown -Method Post -Headers @{ 'X-TAGENT-Token' = $tk } -TimeoutSec 3 | Out-Null } catch { Write-Host 'Backend endpoint is not reachable; no process was force-killed.' }"
 echo Done.
 timeout /t 2 /nobreak >nul
 goto menu

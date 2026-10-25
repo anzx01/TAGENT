@@ -1,5 +1,6 @@
 """E2E：桌面新建文本文档写入 123 的录制->回放复现验证
 
+
 环境适配结论（本机踩坑记录，详见探针过程）：
 - 「桌面右键->新建」子菜单无「文本文档」项（WPS/DOCX 项占据）
 - Win11 系统 UI（运行框/开始菜单）拒绝键盘注入，IME 随机吃字母输入
@@ -130,8 +131,12 @@ def wait_foreground(substr, timeout=8.0):
 
 
 def post(url, data=b"{}"):
-    req = urllib.request.Request(url, method="POST",
-                                 headers={"Content-Type": "application/json"}, data=data)
+    headers = {"Content-Type": "application/json"}
+    try:
+        headers["X-TAGENT-Token"] = open("data/api_token", encoding="utf-8").read().strip()
+    except OSError:
+        pass
+    req = urllib.request.Request(url, method="POST", headers=headers, data=data)
     return json.loads(urllib.request.urlopen(req, timeout=30).read())
 
 

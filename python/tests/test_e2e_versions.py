@@ -1,5 +1,12 @@
 """E2E：task.json 版本化全链路（真实 HTTP 服务端，无需真实应用）
 
+def _token():
+    try:
+        return open("data/api_token", encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
 链路：伪造录制 A/B -> POST /merge（触发 Compiler -> v1 compiled）
    -> PUT /tasks/{id}/vars/{i}（人工编辑 -> v2 variable_changed）
    -> GET /tasks/{id}/versions / /versions/1/diff 校验历史与结构化 diff
@@ -29,8 +36,12 @@ DATA_DIR = REPO / "recordings"
 
 def req(method, url, data=None, timeout=15):
     body = json.dumps(data).encode() if data is not None else (b"{}" if method == "POST" else None)
-    r = urllib.request.Request(url, method=method,
-                               headers={"Content-Type": "application/json"}, data=body)
+    headers = {"Content-Type": "application/json"}
+    try:
+        headers["X-TAGENT-Token"] = open("data/api_token", encoding="utf-8").read().strip()
+    except OSError:
+        pass
+    r = urllib.request.Request(url, method=method, headers=headers, data=body)
     with urllib.request.urlopen(r, timeout=timeout) as resp:
         return json.loads(resp.read())
 
