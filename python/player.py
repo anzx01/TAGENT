@@ -74,6 +74,7 @@ class Player:
         self._step_results = []  # 阶段5.2：逐步结果
         self._from_step = 0
         self._checkpoint_error = ""
+        self._typed_windows = set()  # 本轮已输入过的目标窗口（同窗多段输入保真用）
         self._pause_reasons = []  # 阶段5.2：暂停原因
         self._agent_suggestions = []  # bounded suggestions; never executed in-run
         self._last_correction_id = ""
@@ -140,6 +141,7 @@ class Player:
         self._pause_reason = ""
         self._last_pause_reason = ""
         self._checkpoint_error = ""
+        self._typed_windows = set()
         self._desktop_menu_open = False
         expects_text_document = any(
             step.get("semantic") == "shell_create_text_document" for step in self.steps
@@ -1795,7 +1797,9 @@ class Player:
         log.info("  输入: %d chars", len(text))
         # Replace the captured field value so replay remains repeatable when
         # the target contains data from an earlier run.
-        if step.get("replace", True):
+        overwrite = self._should_overwrite(hwnd, text, step)
+        self._typed_windows.add(hwnd)
+        if overwrite:
             # Native editors (including modern Notepad) may expose no usable
             # UIA ValuePattern.  Set the actual child edit control directly
             # when available; this makes replacement deterministic across
@@ -1808,6 +1812,11 @@ class Player:
                     cls = win32gui.GetClassName(child).lower()
                     if "edit" in cls or "richedit" in cls:
                         win32gui.SendMessage(child, win32con.WM_SETTEXT, 0, text)
+                        # 光标移到末尾：后续按键/追加输入才不会插到段首
+                        try:
+                            win32gui.SendMessage(child, win32con.EM_SETSEL, -1, -1)
+                        except Exception:
+                            pass
                         return self._ok("win32_settext")
             except Exception:
                 pass
@@ -1859,6 +1868,52 @@ class Player:
         return self._engine.type_text(hwnd, text, keystroke_only=ime_flow or
                                       (text.endswith(" ") and text.rstrip(" ").isascii()
                                        and text.rstrip(" ").isalpha()))
+
+    def _field_text(self, hwnd) -> str | None:
+        """读取目标窗口编辑区当前文本；读不到返回 None。
+
+        传统 Edit 子控件的窗口文本即内容；Win11 记事本等 RichEditD2DPT
+        控件 GetWindowText 读不回内容，必须走 UIA ValuePattern。
+        """
+        if not hwnd:
+            return None
+        try:
+            children = []
+            win32gui.EnumChildWindows(hwnd, lambda h, _: children.append(h), None)
+            for child in children:
+                if win32gui.GetClassName(child).lower() == "edit":
+                    return win32gui.GetWindowText(child) or ""
+        except Exception:
+            pass
+        try:
+            import uiautomation as ua
+            root = ua.ControlFromHandle(hwnd)
+            if root:
+                for kind in ("DocumentControl", "EditControl"):
+                    try:
+                        control = getattr(root, kind)(searchDepth=10)
+                        if control and control.Exists(0.3):
+                            pattern = control.GetValuePattern()
+                            if pattern:
+                                return pattern.Value or ""
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return None
+
+    def _should_overwrite(self, hwnd, text: str, step) -> bool:
+        """决定 input_text 是覆写字段还是光标处追加。
+
+        覆写保证重复回放幂等（清掉上一轮残留）；但同一窗口本轮已输入过
+        多段（输入→按键→输入）时，后段覆写会把前段清掉，破坏录制保真——
+        此时若字段内容不是本步文本的残留，改为光标处追加。
+        """
+        if not step.get("replace", True):
+            return False
+        if hwnd not in self._typed_windows:
+            return True
+        return self._field_text(hwnd) in (None, "", text)
 
     def _ok(self, method):
         from services.input.common import StepResult
