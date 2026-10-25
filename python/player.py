@@ -795,9 +795,9 @@ class Player:
         return raw
 
     def _named_uia_missing(self, step):
-        """桌面动作防盲点：录制时定位的是具名 UIA 元素（如图标），
+        """桌面动作防盲点：录制时定位的是具名 UIA 元素（如图标/菜单项），
         回放时该元素不存在而坐标链"成功"就是盲点——桌面盲点双击会打开
-        完全无关的文件。返回缺失的图标名；None=无具名定位或已锚定
+        完全无关的文件。返回缺失的目标名；None=无具名定位或已锚定
         （uia 命中，或 ocr 等证据级定位命中）。"""
         named = [str(loc.get("name") or "").strip() for loc in step.get("locator", [])
                  if loc.get("type") == "uia"]
@@ -807,6 +807,34 @@ class Player:
         if getattr(self, "_last_coords_source", None) in ("uia", "ocr"):
             return None
         return named[0]
+
+    def _expand_new_flyout(self):
+        """右键菜单"新建"飞出层恢复：飞出子菜单（DOC 文档等）依赖悬停打开，
+        而录制器不记悬停。在存活的菜单里找"新建/创建/New"项并悬停，
+        打开飞出层后调用方重新解析定位。返回是否悬停成功。"""
+        import ctypes
+        import uiautomation as ua
+        targets = []
+        try:
+            for root in self._shell_menu_roots():
+                for item in root.GetChildren():
+                    name = str(item.Name or "").strip()
+                    if "新建" in name or "创建" in name or name.upper() in ("NEW", "NEW (CTRL+N)"):
+                        targets.append(item)
+        except Exception:
+            return False
+        if not targets:
+            return False
+        try:
+            rect = targets[0].BoundingRectangle
+            x = int(rect.xcenter())
+            y = int(rect.ycenter())
+            ctypes.windll.user32.SetCursorPos(x, y)
+            time.sleep(0.8)
+            log.info("  已悬停菜单项 %r 打开飞出层 (%d,%d)", targets[0].Name, x, y)
+            return True
+        except Exception:
+            return False
 
     def _try_locator(self, loc, raw=(None, None)):
         loc_type = loc.get("type")
@@ -1091,6 +1119,13 @@ class Player:
         title = step.get("window", "")
         hwnd = step.get("hwnd")
         if not title and not hwnd:
+            return True
+
+        # ---- 策略-1: 右键菜单上下文存活时，切到菜单宿主不许动前台 ----
+        # _force_foreground 的 ALT 手法会把打开中的上下文菜单拍死，
+        # 后续菜单项点击全部落空。菜单本来就显示着，视为已切换。
+        if title == "主机弹出窗口" and getattr(self, "_desktop_menu_open", False):
+            log.info("  菜单宿主已显示（菜单上下文存活），跳过切换")
             return True
 
         # ---- 策略0: 切到桌面（Program Manager）时先真正显示桌面 ----
@@ -1435,9 +1470,12 @@ class Player:
             return self._fail("click", "no_coords")
         if self._is_desktop_action(step):
             missing = self._named_uia_missing(step)
+            if missing and self._desktop_menu_open and self._expand_new_flyout():
+                x, y = self._resolve_coords(step)  # 飞出层已开，重新解析
+                missing = self._named_uia_missing(step)
             if missing:
-                log.warning("  -> 桌面图标未找到: %r，拒绝盲点坐标", missing)
-                return self._fail("click", f"桌面图标未找到: {missing}")
+                log.warning("  -> 桌面目标未找到: %r，拒绝盲点坐标", missing)
+                return self._fail("click", f"桌面目标未找到: {missing}")
             log.info("  -> 桌面点击 (%d,%d) [%s]", x, y,
                      self._last_coords_source or "raw")
             if not self._desktop_menu_open:
@@ -1732,9 +1770,12 @@ class Player:
             return self._fail("double_click", "no_coords")
         if self._is_desktop_action(step):
             missing = self._named_uia_missing(step)
+            if missing and self._desktop_menu_open and self._expand_new_flyout():
+                x, y = self._resolve_coords(step)
+                missing = self._named_uia_missing(step)
             if missing:
-                log.warning("  -> 桌面图标未找到: %r，拒绝盲点双击", missing)
-                return self._fail("double_click", f"桌面图标未找到: {missing}")
+                log.warning("  -> 桌面目标未找到: %r，拒绝盲点双击", missing)
+                return self._fail("double_click", f"桌面目标未找到: {missing}")
             log.info("  -> 桌面双击 (%d,%d) [%s]", x, y,
                      self._last_coords_source or "raw")
             if not self._desktop_menu_open:
@@ -2476,8 +2517,9 @@ def _pause_detail_text(step, reason=""):
     只含窗口标题，不含任何按键文本（隐私边界与日志一致）。"""
     target = str((step or {}).get("window", "") or "").strip()
     if not target:
-        if "桌面图标未找到" in reason:
-            return reason + "；录制时的桌面文件已不存在，请先恢复它或重新录制该段"
+        if "桌面目标未找到" in reason or "桌面图标未找到" in reason:
+            return (reason + "；录制时的桌面文件或菜单项已不存在，"
+                    "请先恢复它或重新录制该段")
         return ""
     bits = []
     try:

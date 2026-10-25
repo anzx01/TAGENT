@@ -175,6 +175,17 @@ def main():
                                  window_title="新建 文本文档.txt - Notepad")
     assert not ok
 
+    # 16. 菜单宿主切窗：菜单上下文存活时直接视为已切换（ALT 手法会拍死菜单）
+    pm = object.__new__(player.Player)
+    pm._desktop_menu_open = True
+    pm._stopped = False
+    assert pm._do_switch_window({"action": "switch_window", "window": "主机弹出窗口"}) is True
+
+    # 17. 接管指引文案：菜单项缺失给恢复建议
+    d = player._pause_detail_text(
+        {}, "执行失败: click (桌面目标未找到: DOC 文档)")
+    assert "桌面目标未找到" in d and "重新录制该段" in d, d
+
     print("window_match PASS")
 
 

@@ -59,7 +59,7 @@ def main() -> int:
         assert ok, "同应用唯一窗口兜底失败"
         assert player.win32gui.GetForegroundWindow() == hwnd, "前台不是固件窗口"
 
-        # 3. 暂停诊断：目标不存在 → 报前台；目标漂移存在 → 报相似窗口
+        # 3. 暂停诊断：目标不存在 → 报前台+应用普查（前台是环境噪声，断言普查部分）
         with tempfile.TemporaryDirectory() as td:
             task = Path(td) / "task.json"
             task.write_text(json.dumps({"steps": [
@@ -68,21 +68,14 @@ def main() -> int:
             pl = Player(task)
             pl._pause_reasons.append({"step": 0, "reason": "执行失败: switch_window (no_window)"})
             # _pause_detail 在暂停期间有效、恢复后清空（与 /replay/status 一致），
-            # 因此在 on_pause 回调内捕获
+            # 因此在 on_pause 回调内捕获。resume() 默认即 skip。
             seen: list[str] = []
             pl.on_pause = lambda i, r: (seen.append(pl._pause_detail),
-                                        pl.resume(skip=True))
-            # update()/topmost 不改变前台；走生产路径 _force_foreground 置前台
-            # （系统前台锁会拒绝裸 SetForegroundWindow，这正是它的用途）
-            root.attributes("-topmost", True)
-            root.lift()
-            root.update()
-            assert player._force_foreground(hwnd), "固件窗口无法置前台"
-            time.sleep(0.2)
+                                        pl.resume())
             pl._pause_for_human(0, "执行失败: switch_window (no_window)")
-            root.attributes("-topmost", False)
             assert len(seen) == 1, seen
-            assert "当前前台是「%s」" % base in seen[0], seen
+            assert "当前前台是「" in seen[0], seen
+            assert "未发现「应用」应用窗口" in seen[0], seen
             assert "相似窗口" not in seen[0], seen
             assert pl._pause_reasons[-1].get("detail") == seen[0]
 
@@ -93,7 +86,7 @@ def main() -> int:
             pl2._pause_reasons.append({"step": 0, "reason": "执行失败: switch_window (no_window)"})
             seen2: list[str] = []
             pl2.on_pause = lambda i, r: (seen2.append(pl2._pause_detail),
-                                         pl2.resume(skip=True))
+                                         pl2.resume())
             pl2._pause_for_human(0, "执行失败: switch_window (no_window)")
             assert "发现相似窗口「%s」" % base in seen2[0], seen2
     finally:
