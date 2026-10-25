@@ -13,6 +13,14 @@ def main():
     assert not window_exists("计算器", lambda: titles)
     assert window_exists("", lambda: titles)
 
+    # 标题漂移：录制带状态后缀、回放时后缀消失，门禁不能误拦
+    assert window_exists("维多利亚 - Everything [管理员模式]",
+                         lambda: ["维多利亚 - Everything", "微信"])
+    assert window_exists("各种用户名和密码（维多利亚）.docx - WPS Office",
+                         lambda: ["各种用户名和密码（维多利亚） - WPS Office"])
+    # 同应用不同文档仍要拦（避免门禁形同虚设）
+    assert not window_exists("报告A - WPS Office", lambda: ["报告B - WPS Office"])
+
     task = {"steps": [
         {"action": "wait", "duration": 1},
         {"action": "input_text", "window": "*报告.txt - Notepad", "text": "x"},

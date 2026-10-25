@@ -5,9 +5,12 @@
 """
 from __future__ import annotations
 
+from services.title_match import titles_similar
+
 
 def window_exists(title: str, enumerate_windows=None) -> bool:
-    """窗口标题包含匹配(去掉录制时的未保存标记 *,避免误拦)。"""
+    """窗口存在性探针:包含匹配(去掉未保存 *) + 标题漂移容忍
+    (录制带 [管理员模式]/扩展名等状态后缀、回放时后缀消失)。"""
     if not title:
         return True
     title = str(title).lstrip("*").strip()
@@ -20,7 +23,9 @@ def window_exists(title: str, enumerate_windows=None) -> bool:
             win32gui.EnumWindows(lambda h, l: (l.append(win32gui.GetWindowText(h)), True)[1], out)
             return out
     needle = title.casefold()
-    return any(needle in str(t).casefold() for t in enumerate_windows())
+    titles = [str(t) for t in enumerate_windows() if str(t or "").strip()]
+    return any(needle in t.casefold() for t in titles) or any(
+        titles_similar(title, t) for t in titles)
 
 
 def label_visible(window_title: str, label: str, finder=None) -> bool:

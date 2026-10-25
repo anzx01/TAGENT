@@ -17,6 +17,7 @@
       total: 0,
       stepDesc: "",
       reason: "",
+      pauseDetail: "",
       recordingId: "",
     };
     let takeoverOpen = false;
@@ -301,6 +302,7 @@
       playback.total = Number((d && d.total) || 0);
       playback.stepDesc = (d && (d.step_desc || d.stepDesc)) || "";
       playback.reason = (d && (d.pause_reason || d.reason)) || "";
+      playback.pauseDetail = (d && (d.pause_detail || d.pauseDetail)) || "";
 
       if (!playing) {
         playback.playing = false;
@@ -412,11 +414,13 @@
       const stepLabel = info.stepDesc
         ? `${stepNo}${total ? `/${total}` : ""}：${escapeHtml(info.stepDesc)}` : "当前步骤";
       const reason = escapeHtml(info.reason || "定位、输入或安全检查未能自动完成");
+      const detail = escapeHtml(info.pauseDetail || "");
       const verifying = String(info.stepDesc || "").startsWith("核实「");
       showModal(`
         <h4>请接管操作</h4>
         <p style="font-size:12px;color:#ccc;margin-bottom:10px;">
           回放已暂停（${stepLabel}）。<br/><span style="color:#aaa">原因：${reason}</span>
+          ${detail ? `<br/><span style="color:#888;font-size:11px;">${detail}</span>` : ""}
         </p>
         <button class="primary" id="takeoverResume">${verifying ? "人工确认完成，继续" : "已接管完成，继续"}</button>
         <button class="cancel" id="takeoverRetry">${verifying ? "重新检查完成条件" : "重试当前步骤"}</button>

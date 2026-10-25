@@ -3,7 +3,6 @@
 定位优先级：UIA 锚点 > 坐标百分比 > 原始屏幕坐标
 """
 import ctypes
-import difflib
 import json
 import time
 from pathlib import Path
@@ -13,6 +12,9 @@ import win32process
 from logger import get_logger
 from services.input import InputEngine
 from services.input.web_channel import get_web_channel
+from services.title_match import title_parts as _title_parts
+from services.title_match import score_parts as _fuzzy_title_score
+from services.title_match import titles_similar
 
 log = get_logger("player")
 
@@ -55,6 +57,7 @@ class Player:
         self._resume_action = None
         self._waiting_step = None
         self._pause_reason = ""
+        self._pause_detail = ""
         self._last_pause_reason = ""
         self._pause_kind = ""
         self._desktop_menu_open = False
@@ -141,6 +144,7 @@ class Player:
         self._resume_action = None
         self._waiting_step = None
         self._pause_reason = ""
+        self._pause_detail = ""
         self._last_pause_reason = ""
         self._checkpoint_error = ""
         self._pause_kind = ""
@@ -462,6 +466,12 @@ class Player:
         self._paused = True
         self._waiting_step = step_index
         self._pause_reason = reason or "需要人工接管"
+        steps = getattr(self, "steps", None) or []
+        step = (steps[step_index]
+                if isinstance(step_index, int) and 0 <= step_index < len(steps) else None)
+        self._pause_detail = _pause_detail_text(step, reason)
+        if self._pause_detail:
+            log.info("接管诊断: %s", self._pause_detail)
         # CALL_USER 语义(移植 mano 终态机):带原因的暂停=失败后求人工;无原因=确认流程
         self._pause_kind = "call_user" if reason else "confirm"
         try:
@@ -486,6 +496,7 @@ class Player:
         self._paused = False
         self._waiting_step = None
         self._pause_reason = ""
+        self._pause_detail = ""
         return action
 
     def _save_checkpoint(self, next_idx):
@@ -2198,44 +2209,6 @@ def _window_exists(title):
     return bool(_find_window_by_title(title))
 
 
-def _title_parts(title):
-    """归一化标题并拆成 "主内容 - 应用后缀" 两段，供模糊匹配用。"""
-    norm = " ".join(title.strip().lstrip("*").split()).casefold()
-    if " - " in norm:
-        pref, suf = norm.rsplit(" - ", 1)
-    else:
-        pref, suf = norm, ""
-    return norm, pref, suf
-
-
-def _fuzzy_title_score(rec_parts, w_parts):
-    """录制标题与实际标题的相似度评分，0 表示不认。
-    覆盖标题漂移场景：回放时应用状态后缀消失或变化
-    （Everything 的 [管理员模式]、WPS 的 [只读]/扩展名显隐等），
-    录制标题比实际标题"多字"，单向包含失效。
-    防误判：后缀（应用名）不同直接拒绝；文档名过短（<4字）时
-    只在几乎全等时才认，避免同应用切错文档。"""
-    rec_norm, rec_pref, rec_suf = rec_parts
-    w_norm, w_pref, w_suf = w_parts
-    if len(rec_norm) < 6 or len(w_norm) < 6:
-        return 0.0
-    full = difflib.SequenceMatcher(None, rec_norm, w_norm).ratio()
-    if full < 0.6:
-        return 0.0
-    if rec_suf and w_suf:
-        if difflib.SequenceMatcher(None, rec_suf, w_suf).ratio() < 0.6:
-            return 0.0
-        if not rec_pref or not w_pref:
-            return 0.0
-        pref = difflib.SequenceMatcher(None, rec_pref, w_pref).ratio()
-        # 文档名过短（<4字）时后缀占全串大头、全串相似度失真，
-        # 必须要求文档名本身几乎全等，避免同应用切错文档
-        if len(rec_pref) < 4 or len(w_pref) < 4:
-            return 1.5 if pref >= 0.9 else 0.0
-        return 1.5 if pref >= 0.6 else 0.0
-    return 1.5 if full >= 0.75 else 0.0
-
-
 def _find_window_by_title(title):
     """查找窗口（照抄 AHK SetTitleMatchMode + winappCli fail-fast 精神）。
     匹配优先级：精确 > 去星精确 > 单向包含 > 标题相似 > 类名+进程名（兜底）。
@@ -2350,7 +2323,8 @@ def _same_window_kind(hwnd, title):
             ti = a.rfind(" - ")
             if ti != -1 and b.endswith(a[ti:]):
                 return True
-        return False
+        # 标题漂移兜底：后缀带状态标记（[管理员模式] 等）时 endswith 失效
+        return titles_similar(title, wtext)
     except Exception:
         return False
 
@@ -2370,7 +2344,7 @@ def _find_dialog(title=None):
                     l.append(w)
                     return True
                 wtext = win32gui.GetWindowText(w)
-                if title in wtext:
+                if title in wtext or titles_similar(title, wtext):
                     l.append(w)
                     return True
         except Exception:
@@ -2379,6 +2353,61 @@ def _find_dialog(title=None):
 
     win32gui.EnumWindows(cb, found)
     return found[0] if found else None
+
+
+def _visible_dialog_titles(limit=2):
+    """当前可见的标准对话框标题（#32770），供接管弹窗诊断提示。"""
+    out = []
+
+    def cb(w, l):
+        try:
+            if win32gui.IsWindowVisible(w) and win32gui.GetClassName(w) == "#32770":
+                t = win32gui.GetWindowText(w)
+                if t:
+                    l.append(t)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(cb, out)
+    except Exception:
+        return []
+    return out[:limit]
+
+
+def _pause_detail_text(step, reason=""):
+    """接管诊断：目标窗口、当前前台、相似窗口与可见弹窗，
+    让用户一眼看出该点什么，而不是只看到"步骤执行失败"。
+    只含窗口标题，不含任何按键文本（隐私边界与日志一致）。"""
+    target = str((step or {}).get("window", "") or "").strip()
+    if not target:
+        return ""
+    bits = []
+    try:
+        fg = win32gui.GetWindowText(win32gui.GetForegroundWindow() or 0)
+        if fg and fg != target:
+            bits.append(f"当前前台是「{fg}」")
+        similar = []
+
+        def _cb(w, _):
+            try:
+                t = win32gui.GetWindowText(w)
+                if t and t != target and win32gui.IsWindowVisible(w) and titles_similar(target, t):
+                    similar.append(t)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(_cb, None)
+        if similar:
+            bits.append(f"发现相似窗口「{similar[0]}」（标题有变化，可核对）")
+        dialogs = _visible_dialog_titles()
+        if dialogs:
+            bits.append("检测到弹窗 " + "、".join(f"「{t}」" for t in dialogs) + "，可能挡住了操作")
+    except Exception:
+        pass
+    return "；".join(bits)
 
 
 def _control_type_by_name(name):

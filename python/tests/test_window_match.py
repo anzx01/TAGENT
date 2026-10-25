@@ -9,20 +9,26 @@ import player
 
 
 class _FakeDesktop:
-    """把 win32gui 枚举替换为固定的 (hwnd, title) 列表。"""
+    """把 win32gui 枚举替换为固定的窗口/对话框/前台。"""
 
-    def __init__(self, windows):
+    def __init__(self, windows, dialogs=(), foreground=0):
         self.windows = windows
+        self.dialogs = dict(dialogs)
+        self.foreground = foreground
         self._saved = {}
 
     def __enter__(self):
+        allwin = dict(self.windows)
+        allwin.update(self.dialogs)
         for name, fn in (
             ("FindWindow", lambda cls, title: 0),
-            ("EnumWindows", lambda cb, arg: [cb(w, arg) for w, _t in self.windows]),
+            ("EnumWindows", lambda cb, arg: [cb(w, arg)
+                                             for w, _t in list(self.windows) + list(self.dialogs.items())]),
             ("IsWindowVisible", lambda w: True),
-            ("GetWindowText", lambda w: dict(self.windows).get(w, "")),
-            ("GetForegroundWindow", lambda: 0),
+            ("GetWindowText", lambda w: allwin.get(w, "")),
+            ("GetForegroundWindow", lambda: self.foreground),
             ("IsIconic", lambda w: False),
+            ("GetClassName", lambda w: "#32770" if w in self.dialogs else "Normal"),
         ):
             self._saved[name] = getattr(player.win32gui, name)
             setattr(player.win32gui, name, fn)
@@ -79,6 +85,25 @@ def main():
         assert player._fuzzy_title_score(
             player._title_parts("报告A - WPS Office"),
             player._title_parts("报告B - WPS Office")) == 0
+
+    # 9. _same_window_kind（陈旧句柄/前台兜底判定）同样容忍标题漂移
+    with _FakeDesktop([(601, "维多利亚 - Everything")]):
+        assert player._same_window_kind(601, "维多利亚 - Everything [管理员模式]")
+        assert not player._same_window_kind(601, "报告A - WPS Office")
+
+    # 10. 接管诊断：漂移窗口在但标题变了 → 提示相似窗口；有 #32770 → 提示弹窗
+    with _FakeDesktop(
+            [(701, "维多利亚 - Everything"), (702, "微信")],
+            dialogs=[(703, "是否保存更改?")], foreground=702):
+        detail = player._pause_detail_text(
+            {"action": "switch_window", "window": "维多利亚 - Everything [管理员模式]"},
+            "执行失败: switch_window (no_window)")
+        assert "相似窗口「维多利亚 - Everything」" in detail, detail
+        assert "当前前台是「微信」" in detail, detail
+        assert "检测到弹窗" in detail and "是否保存更改?" in detail, detail
+        # 无窗口信息的步骤不给诊断
+        assert player._pause_detail_text({"action": "wait"}, "") == ""
+        assert player._visible_dialog_titles() == ["是否保存更改?"]
 
     print("window_match PASS")
 

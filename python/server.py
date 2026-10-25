@@ -1248,6 +1248,7 @@ def replay_status():
         "error": step_error,
         "waiting_step": getattr(player, "_waiting_step", None),
         "pause_reason": pause_category(getattr(player, "_pause_reason", "")),
+        "pause_detail": getattr(player, "_pause_detail", "") or "",
     }
 
 
