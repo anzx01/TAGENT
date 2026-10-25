@@ -21,6 +21,12 @@ def main():
     # 同应用不同文档仍要拦（避免门禁形同虚设）
     assert not window_exists("报告A - WPS Office", lambda: ["报告B - WPS Office"])
 
+    # switch_window 也推导门禁探针（真实故障：33 步任务第 4 步才弹接管）
+    ok, fails = check_preflight(
+        {"steps": [{"action": "switch_window", "window": "不存在的窗口XYZ - 应用"}]},
+        probe_window=lambda v: False)
+    assert not ok and fails == ["目标窗口未打开: 不存在的窗口XYZ - 应用"], fails
+
     task = {"steps": [
         {"action": "wait", "duration": 1},
         {"action": "input_text", "window": "*报告.txt - Notepad", "text": "x"},

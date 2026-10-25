@@ -65,7 +65,8 @@ def check_preflight(task: dict, *, probe_window=window_exists) -> tuple[bool, li
         for step in task.get("steps", []):
             win = str(step.get("window", "") or "")
             if win and step.get("action") in ("input_text", "click", "key_press",
-                                              "double_click", "right_click"):
+                                              "double_click", "right_click",
+                                              "switch_window"):
                 items = [{"kind": "window", "value": win}]
                 break
     failures: list[str] = []
