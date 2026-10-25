@@ -260,6 +260,8 @@ def build_router(data_dir: Path, scheduler: Scheduler, autostart_sync=None) -> A
                         "step_count": len(steps),
                         "pause_count": len(report.get("pause_reasons", [])),
                         "failed_capability": report.get("failed_capability"),
+                        "baseline_pass": report.get("baseline", {}).get("pass")
+                        if report.get("baseline", {}).get("checked") else None,
                         "eval": report.get("eval"),
                     })
                 except (OSError, ValueError):
@@ -306,14 +308,66 @@ def build_router(data_dir: Path, scheduler: Scheduler, autostart_sync=None) -> A
         d = _resolve(rec_id)
         if d is None:
             return {"ok": False, "msg": "找不到任务"}
-        if body.kind not in {"skill", "automation"}:
-            return {"ok": False, "msg": "kind 必须是 skill 或 automation"}
+        if body.kind not in {"skill", "automation", "bundle"}:
+            return {"ok": False, "msg": "kind 必须是 skill、automation 或 bundle"}
         try:
             path = export_artifact(d, body.kind)
             return {"ok": True, "kind": body.kind, "path": str(path)}
         except Exception as exc:
             log.exception("导出任务产物失败: %s", rec_id)
             return {"ok": False, "msg": str(exc)}
+
+    # ---------- 意图分析(移植 skill-recorder describer 的最小版) ----------
+
+    @router.get("/{rec_id}/analysis")
+    def get_analysis(rec_id: str):
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        path = d / "analysis.json"
+        if not path.exists():
+            return {"ok": True, "analysis": None}
+        try:
+            return {"ok": True, "analysis": json.loads(path.read_text(encoding="utf-8"))}
+        except (OSError, ValueError):
+            return {"ok": True, "analysis": None}
+
+    @router.post("/{rec_id}/analysis")
+    def run_analysis(rec_id: str):
+        """启发式生成意图+步骤概览;LLM 配置存在时仅润色标题(intent_analyst 三重防御)。"""
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        task_path = d / "task.json"
+        if not task_path.exists():
+            return {"ok": False, "msg": "没有可分析的任务"}
+        from services.intent_analyst import analyze
+        from services.llm_heal import get_healer
+        healer = get_healer()
+        result = analyze(json.loads(task_path.read_text(encoding="utf-8")),
+                         llm_client=healer if healer.enabled else None)
+        (d / "analysis.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "analysis": result}
+
+    @router.put("/{rec_id}/analysis")
+    def update_analysis(rec_id: str, body: dict):
+        """人工编辑/批准分析结果;批准后意图进入导出的 Skill.md。"""
+        d = _resolve(rec_id)
+        if d is None:
+            return {"ok": False, "msg": "找不到任务"}
+        path = d / "analysis.json"
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"ok": False, "msg": "请先生成分析"}
+        for key in ("title", "intent"):
+            if isinstance(body.get(key), str) and body[key].strip():
+                current[key] = body[key].strip()[:120]
+        if "approved" in body:
+            current["approved"] = bool(body["approved"])
+        path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "analysis": current}
 
     @router.get("/{rec_id}/review")
     def get_review(rec_id: str):
@@ -401,11 +455,36 @@ def build_router(data_dir: Path, scheduler: Scheduler, autostart_sync=None) -> A
 
     # ---------- 阶段2.1 变量标注 ----------
 
+    @router.post("/dev/seed-recording")
+    def seed_recording(body: dict):
+        """E2E fixture(移植 openskills seed-recording):注入原始事件流,
+        走真实编译管道并返回 task.json——编译器测试完全数据驱动。
+        仅在 TAGENT_E2E_FIXTURES=1 时存在,生产不可见。"""
+        import os
+        if os.environ.get("TAGENT_E2E_FIXTURES") != "1":
+            return {"ok": False, "msg": "fixture API 未启用"}
+        events = body.get("events")
+        if not isinstance(events, list) or not events:
+            return {"ok": False, "msg": "events 必填"}
+        from compiler import Compiler
+        with tempfile.TemporaryDirectory(dir=data_dir.parent) as staging:
+            target = Path(staging) / "seed"
+            target.mkdir()
+            (target / "events.json").write_text(
+                json.dumps({"steps": events}), encoding="utf-8")
+            try:
+                path = Compiler(target).compile()
+                task = json.loads(Path(path).read_text(encoding="utf-8"))
+            except Exception as exc:
+                return {"ok": False, "msg": f"编译失败: {exc}"}
+            return {"ok": True, "task": task}
+
     @router.get("/{rec_id}/vars")
     def get_variables(rec_id: str):
         if _resolve(rec_id) is None:
             return {"ok": False, "msg": "找不到任务"}
-        return {"ok": True, "vars": store.variables(rec_id)}
+        return {"ok": True, "vars": store.variables(rec_id),
+                "details": store.variables_with_examples(rec_id)}
 
     @router.put("/{rec_id}/vars/{step_index}")
     def set_variable(rec_id: str, step_index: int, var: str = ""):
@@ -623,6 +702,14 @@ def build_router(data_dir: Path, scheduler: Scheduler, autostart_sync=None) -> A
             cap_registry.mark_used(cap_id)
         return {"ok": True, "task": {"id": rec_id, "name": body.name.strip(), "steps": len(task["steps"])}}
 
+    @router.post("/capabilities/coverage")
+    def capability_coverage(body: dict):
+        """能力覆盖表(移植 flows.json Flow-First):哪些段可复用、哪些需录制。"""
+        steps = body.get("steps")
+        if not isinstance(steps, list) or not steps:
+            return {"ok": False, "msg": "steps 必填"}
+        from services.capability_compose import coverage
+        return {"ok": True, "coverage": coverage(steps, cap_registry.list())}
     @router.post("/capabilities")
     def register_capability(body: CapRegisterBody):
         if body.postcondition and (body.postcondition.get("type") not in {"window", "text"}

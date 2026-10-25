@@ -23,6 +23,9 @@ class CapabilityEntry:
     steps: list[dict] = field(default_factory=list)
     var_sources: dict = field(default_factory=dict)
     session_steps: list[int] = field(default_factory=list)
+    # 依赖图(移植 flows.json):前置/依赖用于组合排序与失败回溯
+    preconditions: list[dict] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
     runs: int = 0
     last_used: str = ""
@@ -59,7 +62,9 @@ class CapabilityRegistry:
     def register(self, name: str, source_task: str,
                  step_range: List[int], description: str = "", source_hash: str = "",
                  postcondition: dict | None = None, steps: List[dict] | None = None,
-                 var_sources: dict | None = None, session_steps: List[int] | None = None) -> CapabilityEntry:
+                 var_sources: dict | None = None, session_steps: List[int] | None = None,
+                 preconditions: List[dict] | None = None,
+                 depends_on: List[str] | None = None) -> CapabilityEntry:
         self._refresh()
         name = name.strip()
         if not name or not source_task or len(step_range) != 2:
@@ -68,7 +73,9 @@ class CapabilityRegistry:
                                 step_range=step_range, description=description,
                                 source_hash=source_hash, postcondition=postcondition or {},
                                 steps=steps or [], var_sources=var_sources or {},
-                                session_steps=session_steps or [])
+                                session_steps=session_steps or [],
+                                preconditions=preconditions or [],
+                                depends_on=depends_on or [])
         self._entries.append(entry)
         self._save()
         return entry

@@ -55,6 +55,7 @@ class Player:
         self._waiting_step = None
         self._pause_reason = ""
         self._last_pause_reason = ""
+        self._pause_kind = ""
         self._desktop_menu_open = False
         self._session_steps = set(session_steps or [])  # 阶段2.4
         self.checkpoint_path = None  # 阶段5.1：断点续跑
@@ -141,6 +142,7 @@ class Player:
         self._pause_reason = ""
         self._last_pause_reason = ""
         self._checkpoint_error = ""
+        self._pause_kind = ""
         self._typed_windows = set()
         self._desktop_menu_open = False
         expects_text_document = any(
@@ -169,6 +171,14 @@ class Player:
                 from services.capability_verifier import verify_current_screen
                 condition = step.get("postcondition") or {}
                 passed, detail = verify_current_screen(condition)
+                if not passed:
+                    # 失败回溯(移植 flows.json Failure Backtracking):先核上一能力后置条件
+                    prev_cap = next((s for s in reversed(self.steps[:i])
+                                     if s.get("capability_end") and s.get("postcondition")), None)
+                    if prev_cap is not None:
+                        prev_ok, prev_detail = verify_current_screen(prev_cap["postcondition"])
+                        name = (prev_cap.get("capability") or {}).get("name", "上一能力")
+                        detail += f"（回溯:{name}后置条件{'仍通过' if prev_ok else '已失效:根因可能在前面'}）"
                 verification = "passed" if passed else "failed"
                 while not passed and not self._stopped:
                     self._pause_reasons.append({"step": i, "reason": f"能力完成条件未通过: {detail}"})
@@ -451,6 +461,8 @@ class Player:
         self._paused = True
         self._waiting_step = step_index
         self._pause_reason = reason or "需要人工接管"
+        # CALL_USER 语义(移植 mano 终态机):带原因的暂停=失败后求人工;无原因=确认流程
+        self._pause_kind = "call_user" if reason else "confirm"
         self._last_pause_reason = self._pause_reason
         self._resume_action = None
         log.info("会话步骤 %d：等待人工登录/验证", step_index)
@@ -475,6 +487,8 @@ class Player:
             return
         try:
             checkpoint = {"next_step": next_idx, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+            if 0 <= next_idx < len(self.steps):
+                checkpoint["next_step_id"] = self.steps[next_idx].get("step_id", "")
             if self._run_context is not None:
                 checkpoint["source_hash"] = self._run_context.source_hash
             tmp = self.checkpoint_path.with_suffix(".json.tmp")

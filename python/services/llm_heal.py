@@ -98,6 +98,24 @@ class LLMHealer:
             log.warning("LLM 自愈请求失败: %s", e)
             return None
 
+    def ask_json(self, prompt: str) -> dict:
+        """通用 JSON 问答(意图分析等复用);失败抛异常,由调用方降级。"""
+        if not self.enabled:
+            raise RuntimeError("llm disabled")
+        req = urllib.request.Request(
+            f"{self._config['api_base'].rstrip('/')}/chat/completions",
+            method="POST",
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {self._config['api_key']}"},
+            data=json.dumps({"model": self._config.get("model", "gpt-4o-mini"),
+                             "messages": [{"role": "system", "content": "只返回 JSON,不要解释。"},
+                                          {"role": "user", "content": prompt}],
+                             "temperature": 0.2, "max_tokens": 600}).encode("utf-8"))
+        content = json.loads(urllib.request.urlopen(req, timeout=15).read())["choices"][0]["message"]["content"]
+        if "```" in content:
+            content = content.split("```", 2)[1].removeprefix("json").strip()
+        return json.loads(content)
+
     def _build_prompt(self, failed_step: dict, context: list, error: str) -> str:
         lines = ["请分析以下 RPA 操作失败并给出纠正步骤。\n"]
         lines.append(f"失败步骤: {json.dumps(failed_step, ensure_ascii=False)}")

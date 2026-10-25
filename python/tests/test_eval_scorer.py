@@ -53,4 +53,12 @@ import json
 json.dumps(r.to_dict())
 assert r4.to_dict()["noise_ratio"] == 0.25
 
+# forbidden 一票否决:录制器自身 UI/权限框噪声不得成为步骤
+from services.eval_scorer import forbidden_hits
+act = [{"action": "click", "text": "", "window": "同意访问 - 权限对话框"},
+       {"action": "input_text", "text": "hello", "window": "W"}]
+assert forbidden_hits(act, ["权限对话框", "智能操作助手"]) == ["权限对话框"]
+assert forbidden_hits(act, []) == []
+assert forbidden_hits(act, ["不存在的词"]) == []
+
 print("eval_scorer 全部断言通过")

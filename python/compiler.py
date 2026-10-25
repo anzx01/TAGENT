@@ -27,10 +27,20 @@ class Compiler:
 
     def __init__(self, recording_dir):
         self.dir = Path(recording_dir)
+        self._prev_task = None
+        prev = self.dir / "task.json"
+        if prev.exists():
+            try:
+                self._prev_task = json.loads(prev.read_text(encoding="utf-8"))
+            except Exception:
+                self._prev_task = None
         events_path = self.dir / "events.json"
         with open(events_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         self.steps = data.get("steps", [])
+
+    def _previous_steps(self) -> list:
+        return (self._prev_task or {}).get("steps", [])
 
     def compile(self):
         """编译录制数据为 task.json，过滤冗余步骤 + 语义折叠"""
@@ -127,6 +137,10 @@ class Compiler:
             "segment_count": segment + 1,
             "steps": task_steps,
         }
+        # 稳定 step_id + 场景段（移植 desktop-recorder screenplay 的全局锚点）：
+        # 重编译/编辑后 id 按内容对齐保留，checkpoint/corrections 挂 id 而非易漂移的 index
+        _assign_stable_ids(task_steps, self._previous_steps())
+        task["scenes"] = _scenes(task_steps)
         # Persist a review-only plan alongside legacy steps. Player remains
         # backward compatible, while UI/governance can distinguish
         # deterministic, agent-assisted and human-required work.
@@ -418,3 +432,45 @@ class Compiler:
             "window_sequence": window_sequence,
             "app_count": len(apps),
         }
+
+
+def _step_key(step: dict) -> tuple:
+    """内容指纹：动作 + 窗口 + 文本/按键（不含定位与时间，编辑定位不改 id）。"""
+    return (step.get("action"), str(step.get("window", "")),
+            str(step.get("text", step.get("key", ""))))
+
+
+def _assign_stable_ids(new_steps: list[dict], old_steps: list[dict]) -> None:
+    """按内容指纹顺序对齐保留旧 id；未命中的按序补新 id。"""
+    old_pool = [s for s in old_steps if s.get("step_id")]
+    used = {s.get("step_id") for s in old_pool}
+    pool_iter = iter(old_pool)
+    candidate = next(pool_iter, None)
+    counter = 0
+    for step in new_steps:
+        while candidate is not None and _step_key(candidate) != _step_key(step):
+            candidate = next(pool_iter, None)
+        if candidate is not None:
+            step["step_id"] = candidate["step_id"]
+            candidate = next(pool_iter, None)
+        else:
+            counter += 1
+            sid = f"s{counter}"
+            while sid in used:  # 避免与保留的旧 id 撞号
+                counter += 1
+                sid = f"s{counter}"
+            used.add(sid)
+            step["step_id"] = sid
+
+
+def _scenes(steps: list[dict]) -> list[dict]:
+    """按目标窗口分段的信息性场景表（player 不读，编辑器/诊断用）。"""
+    scenes = []
+    for i, step in enumerate(steps):
+        win = str(step.get("window", "") or "")
+        if not scenes or scenes[-1]["window"] != win:
+            scenes.append({"id": f"scene{len(scenes) + 1}", "window": win,
+                           "from": i, "to": i + 1})
+        else:
+            scenes[-1]["to"] = i + 1
+    return scenes

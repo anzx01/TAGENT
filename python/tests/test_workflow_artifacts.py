@@ -40,15 +40,38 @@ def main() -> int:
         assert skill.exists() and "order_id" in skill.read_text(encoding="utf-8")
         payload = json.loads(automation.read_text(encoding="utf-8"))
         assert payload["trigger"]["type"] == "manual"
-        assert payload["steps"][0]["text"] == "{{ order_id }}"
+        assert payload["trigger"]["natural_language"] == "手动触发"
         (root / "meta.json").write_text(json.dumps({"schedule": {
             "kind": "daily", "hour": 9, "minute": 30}}), encoding="utf-8")
         payload = json.loads(export_artifact(root, "automation").read_text(encoding="utf-8"))
-        assert payload["trigger"] == {"type": "schedule", "kind": "daily", "hour": 9, "minute": 30}
+        assert payload["trigger"] == {"type": "schedule", "kind": "daily", "hour": 9, "minute": 30,
+                                      "natural_language": "每天 09:30"}
         (root / "meta.json").write_text(json.dumps({"schedule": {
             "kind": "interval", "minutes": 15, "next_run_at": 123}}), encoding="utf-8")
         payload = json.loads(export_artifact(root, "automation").read_text(encoding="utf-8"))
-        assert payload["trigger"] == {"type": "schedule", "kind": "interval", "minutes": 15}
+        assert payload["trigger"] == {"type": "schedule", "kind": "interval", "minutes": 15,
+                                      "natural_language": "每 15 分钟"}
+        # 已批准的意图分析进入 Skill.md;未批准不进
+        skill_text = export_artifact(root, "skill").read_text(encoding="utf-8")
+        assert skill_text.startswith("---") and "no API or CLI exists" in skill_text
+        assert "## Capability boundaries" in skill_text
+        (root / "analysis.json").write_text(json.dumps(
+            {"title": "报销", "intent": "提交每日报销单", "approved": False}), encoding="utf-8")
+        skill_text = export_artifact(root, "skill").read_text(encoding="utf-8")
+        assert "提交每日报销单" not in skill_text
+        analysis = json.loads((root / "analysis.json").read_text(encoding="utf-8"))
+        analysis["approved"] = True
+        (root / "analysis.json").write_text(json.dumps(analysis), encoding="utf-8")
+        skill_text = export_artifact(root, "skill").read_text(encoding="utf-8")
+        assert "提交每日报销单" in skill_text
+        # 证据包 zip:文档 + 步骤截图
+        (root / "screenshots").mkdir()
+        (root / "screenshots" / "step1.jpg").write_bytes(b"x")
+        bundle = export_artifact(root, "bundle")
+        import zipfile
+        with zipfile.ZipFile(bundle) as zf:
+            names = set(zf.namelist())
+        assert {"skill.md", "automation.json", "screenshots/step1.jpg"} <= names, names
     print("workflow_artifacts PASS")
     return 0
 

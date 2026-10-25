@@ -80,3 +80,34 @@ def compose_task(data_dir: Path, entries: list[dict], capability_ids: list[str],
                                 "session_steps": session_steps}}
     result["plan"] = build_plan(result, session_steps=session_steps)
     return result
+
+
+def coverage(steps: list[dict], entries: list[dict]) -> dict:
+    """能力覆盖表(移植 flows.json Flow-First Planning):新任务的哪些连续段
+    可由已登记能力复用、哪些缺失需录制。按动作序列精确匹配,贪心不重叠。"""
+    used = [False] * len(steps)
+    acts = [s.get("action", "") for s in steps]
+    reusable = []
+    for entry in entries:
+        cap_acts = [s.get("action", "") for s in (entry.get("steps") or [])]
+        if not cap_acts:
+            continue
+        for i in range(len(acts) - len(cap_acts) + 1):
+            if acts[i:i + len(cap_acts)] == cap_acts and not any(used[i:i + len(cap_acts)]):
+                reusable.append({"id": entry["id"], "capability": entry["name"],
+                                 "range": [i, i + len(cap_acts)]})
+                for j in range(i, i + len(cap_acts)):
+                    used[j] = True
+                break
+    missing = []
+    i = 0
+    while i < len(used):
+        if not used[i]:
+            j = i
+            while j < len(used) and not used[j]:
+                j += 1
+            missing.append({"range": [i, j]})
+            i = j
+        else:
+            i += 1
+    return {"reusable": reusable, "missing": missing}

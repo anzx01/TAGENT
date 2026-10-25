@@ -76,6 +76,36 @@ def main():
         assert detail["report"]["plan_revision"] == 3
         assert not client.get(f"/tasks/{task_dir.name}/runs/invalid.id").json()["ok"]
         assert not client.get(f"/tasks/{empty_dir.name}/runs/{run_file.stem}").json()["ok"]
+
+        # 变量示例回填 + 意图分析(独立任务目录,不污染上方 fixture)
+        var_dir = root / "20990101_010101"
+        var_dir.mkdir()
+        var_task = {"version": 2, "source": var_dir.name, "steps": [
+            {"index": 0, "action": "input_text", "text": "ORDER-001", "window": "W"}]}
+        (var_dir / "task.json").write_text(json.dumps(var_task, ensure_ascii=False), encoding="utf-8")
+        assert client.put(f"/tasks/{var_dir.name}/vars/0?var=order_id").json()["ok"]
+        vars_resp = client.get(f"/tasks/{var_dir.name}/vars").json()
+        assert vars_resp["vars"] == ["order_id"]
+        assert vars_resp["details"][0] == {"name": "order_id", "example": "ORDER-001"}
+
+        analysis = client.post(f"/tasks/{var_dir.name}/analysis").json()
+        assert analysis["ok"] and analysis["analysis"]["generated_by"] == "heuristic"
+        assert analysis["analysis"]["steps"], "分析应包含步骤概览"
+        assert "ORDER-001" not in json.dumps(analysis)
+        edited = client.put(f"/tasks/{var_dir.name}/analysis",
+                            json={"intent": "提交订单", "approved": True}).json()
+        assert edited["ok"] and edited["analysis"]["approved"]             and edited["analysis"]["intent"] == "提交订单"
+        assert client.get(f"/tasks/{var_dir.name}/analysis").json()["analysis"]["approved"]
+        import shutil as _shutil
+        _shutil.rmtree(var_dir)  # 不影响下方"仅剩 2 个任务目录"的删除断言
+
+        # 能力覆盖表
+        cov = client.post("/tasks/capabilities/coverage", json={
+            "steps": [{"action": "click"}, {"action": "input_text"},
+                      {"action": "scroll"}]}).json()
+        assert cov["ok"] and "reusable" in cov["coverage"] and "missing" in cov["coverage"]
+        assert not client.post("/tasks/capabilities/coverage", json={"steps": []}).json()["ok"]
+
         discovery = client.get("/tasks/discovery").json()["candidates"]
         assert next(item for item in discovery if item["task_id"] == task_dir.name)["success_rate"] == 0
         url = "/tasks/capabilities"

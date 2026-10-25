@@ -3,6 +3,14 @@
 
 def verify_postcondition(condition: dict, *, window_title: str = "",
                          text_found: bool = False) -> tuple[bool, str]:
+    # any_of:任一子条件满足即通过(正向成功+反向拒绝成对回归,移植 createNamedRecord 双期望)
+    if isinstance(condition.get("any_of"), list):
+        results = [verify_postcondition(c, window_title=window_title, text_found=text_found)
+                   for c in condition["any_of"] if isinstance(c, dict)]
+        if not results:
+            return False, "any_of 为空"
+        passed = any(ok for ok, _ in results)
+        return passed, "任一完成条件满足" if passed else "；".join(d for _, d in results)
     kind = condition.get("type")
     expected = str(condition.get("value", "")).strip()
     if not expected:
@@ -20,11 +28,21 @@ def verify_current_screen(condition: dict) -> tuple[bool, str]:
         import win32gui
         hwnd = win32gui.GetForegroundWindow()
         title = win32gui.GetWindowText(hwnd) if hwnd else ""
-        text_found = False
-        if condition.get("type") == "text" and hwnd:
-            from services.ocr_locator import capture_and_find
-            text_found = capture_and_find(str(condition.get("value", "")), hwnd=hwnd) is not None
-        return verify_postcondition(condition, window_title=title, text_found=text_found)
+
+        def one(cond: dict) -> tuple[bool, str]:
+            text_found = False
+            if cond.get("type") == "text" and hwnd:
+                from services.ocr_locator import capture_and_find
+                text_found = capture_and_find(str(cond.get("value", "")), hwnd=hwnd) is not None
+            return verify_postcondition(cond, window_title=title, text_found=text_found)
+
+        if isinstance(condition.get("any_of"), list):
+            results = [one(c) for c in condition["any_of"] if isinstance(c, dict)]
+            if not results:
+                return False, "any_of 为空"
+            passed = any(ok for ok, _ in results)
+            return passed, "任一完成条件满足" if passed else "；".join(d for _, d in results)
+        return one(condition)
     except Exception:
         return False, "无法读取当前窗口或屏幕"
 

@@ -119,6 +119,14 @@ def score(expected: list, actual: list, config: EvalConfig | None = None) -> Eva
     return score_
 
 
+def forbidden_hits(actual: list, forbidden: list[str]) -> list[str]:
+    """回放步骤(文本/窗口)命中禁用噪声词(录制器自身 UI、权限对话框等)即列出
+    (移植 skill-recorder forbidden 一票否决;调用方非空即判 fail)。"""
+    blob = " ".join(f"{s.get('text', '')} {s.get('window', '')}"
+                    for s in actual if isinstance(s, dict)).casefold()
+    return [f for f in forbidden if f and str(f).casefold() in blob]
+
+
 if __name__ == "__main__":
     exp = [{"action": "click"}, {"action": "input_text", "text": "hello"},
            {"action": "click"}, {"action": "input_text", "text": "world"}]

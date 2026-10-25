@@ -461,9 +461,10 @@
       }
 
       setReplaying(true);
-      if (d.paused || d.state === "paused") {
+      if (d.paused || d.state === "paused" || d.state === "call_user") {
         setReplayPaused(true);
-        setStatus(`等待接管${playback.stepDesc ? `（${playback.currentStep + 1}/${playback.total}: ${playback.stepDesc}）` : ""}`, "paused");
+        const prefix = d.state === "call_user" ? "需人工接管（步骤失败）" : "等待接管";
+        setStatus(`${prefix}${playback.stepDesc ? `（${playback.currentStep + 1}/${playback.total}: ${playback.stepDesc}）` : ""}`, "paused");
         setTakeover({ ...playback, waitingStep: d.waiting_step, reason: playback.reason });
       } else {
         // A stale modal can survive a WebView reconnect.  Close it only after
@@ -800,6 +801,7 @@
         : null;
       const sch = aBtn("定时", "mini sched", () => schedModal(task));
       const plan = aBtn("方案", "mini plan", () => showPlan(task));
+      const intent = aBtn("意图", "mini var", () => analyzeIntent(task));
       const exportBtn = aBtn("导出", "mini export", () => exportModal(task));
       const reuse = aBtn("保存能力", "mini var", () => saveCapability(task));
       const vars = aBtn("步骤/变量", "mini var", async () => {
@@ -821,7 +823,7 @@
       });
       btns.appendChild(run);
       if (resume) btns.appendChild(resume);
-      btns.appendChild(plan); btns.appendChild(exportBtn); btns.appendChild(reuse); btns.appendChild(sch); btns.appendChild(vars);
+      btns.appendChild(plan); btns.appendChild(intent); btns.appendChild(exportBtn); btns.appendChild(reuse); btns.appendChild(sch); btns.appendChild(vars);
       btns.appendChild(appd); btns.appendChild(del);
       card.appendChild(btns);
       return card;
@@ -921,9 +923,11 @@
         <div class="hint">先审阅 Plan，再选择可移植的 Skill 或 Automation。导出不会自动运行任务。</div>
         <button class="primary" id="exportSkill">导出 Skill.md</button>
         <button class="primary" id="exportAutomation">导出 automation.json</button>
+        <button class="primary" id="exportBundle">导出证据包(zip)</button>
         <button class="cancel" onclick="hideModal()">取消</button>`);
       $("exportSkill").onclick = () => doExport(task, "skill");
       $("exportAutomation").onclick = () => doExport(task, "automation");
+      $("exportBundle").onclick = () => doExport(task, "bundle");
     }
     async function doExport(task, kind) {
       try {
@@ -933,8 +937,34 @@
         });
         if (!data.ok) { setStatus(data.msg || "导出失败", "error"); return; }
         showModal(`<h4>文件已生成</h4><p class="hint">保存在本机：</p><code style="display:block;overflow-wrap:anywhere;user-select:text">${escapeHtml(data.path || "")}</code><button class="cancel" onclick="hideModal()">关闭</button>`);
-        setStatus(`${kind === "skill" ? "Skill.md" : "automation.json"} 已生成`, "replaying");
+        setStatus(`${kind === "skill" ? "Skill.md" : kind === "bundle" ? "证据包" : "automation.json"} 已生成`, "replaying");
       } catch (err) { setStatus(apiErrorMessage(err, "导出失败"), "error"); }
+    }
+    async function analyzeIntent(task) {
+      try {
+        const d = await apiJson(`/tasks/${task.id}/analysis`, { method: "POST" });
+        if (!d.ok) { setStatus(d.msg || "分析失败", "error"); return; }
+        const a = d.analysis;
+        window.__analysisTask = task;
+        showModal(`
+          <h4>意图分析 - ${escapeHtml(task.name || task.id)}</h4>
+          <div class="hint">标题</div><input id="analysisTitle" value="${escapeHtml(a.title || "")}" />
+          <div class="hint">意图</div><input id="analysisIntent" value="${escapeHtml(a.intent || "")}" />
+          <div class="hint">${a.steps.length} 步（${a.steps.filter(s => s.kind === "action").length} 个改状态动作）· ${escapeHtml(a.generalization || "")}</div>
+          <button class="primary" onclick="saveAnalysis('${task.id}')">保存并批准</button>
+          <button class="cancel" onclick="hideModal()">取消</button>
+        `);
+      } catch (err) { setStatus(apiErrorMessage(err, "分析失败"), "error"); }
+    }
+    async function saveAnalysis(id) {
+      try {
+        const d = await apiJson(`/tasks/${id}/analysis`, {
+          method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: $("analysisTitle").value, intent: $("analysisIntent").value, approved: true }),
+        });
+        setStatus(d.ok ? "意图分析已批准（导出 Skill.md 将包含该意图）" : (d.msg || "保存失败"), d.ok ? "" : "error");
+        hideModal();
+      } catch (err) { setStatus(apiErrorMessage(err, "保存失败"), "error"); }
     }
     let pendingAppendTarget = null;
     async function appendTask(task) {
@@ -997,11 +1027,12 @@
         try {
           const d = await apiJson("/tasks/" + task.id + "/vars", {}, 5000);
           const names = d.vars || ["value"];
+          const examples = Object.fromEntries((d.details || []).map(x => [x.name, x.example]));
           showModal(`
             <h4>${fromStep ? "续跑" : "运行"}「${task.name}」</h4>
-            <div class="hint">填写本次运行的变量值：</div>
+            <div class="hint">填写本次运行的变量值（已预填录制示例，可直接运行）：</div>
             ${names.map((n, i) =>
-              `<input id="varInput${i}" data-name="${n}" placeholder="${n}" />`).join("")}
+              `<input id="varInput${i}" data-name="${n}" placeholder="${n}" value="${escapeHtml(examples[n] || "")}" />`).join("")}
             <button class="primary" onclick="runWithVars('${task.id}',${names.length},${fromStep})">${fromStep ? "续跑" : "运行"}</button>
             <button class="cancel" onclick="hideModal()">取消</button>
           `);

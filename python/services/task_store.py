@@ -110,20 +110,25 @@ class TaskStore:
 
     def variables(self, rec_id: str) -> list[str]:
         """扫描 task 步骤文本中的 {{var}} 占位符，返回变量名列表"""
+        return [item["name"] for item in self.variables_with_examples(rec_id)]
+
+    def variables_with_examples(self, rec_id: str) -> list[dict]:
+        """变量名 + 录制时的示例值(来自 _raw_text),供回放表单预填
+        (移植 openskills parameters[].example 一键回放闭环)。"""
         p = self.task_path(rec_id)
         if not p.exists():
             return []
         data = json.loads(p.read_text(encoding="utf-8"))
-        names: list[str] = []
         import re
-        seen = set()
+        out: list[dict] = []
+        seen: set[str] = set()
         for s in data.get("steps", []):
-            text = s.get("text", "") or ""
-            for m in re.finditer(r"\{\{\s*(\w+)\s*\}\}", text):
-                if m.group(1) not in seen:
-                    seen.add(m.group(1))
-                    names.append(m.group(1))
-        return names
+            m = re.fullmatch(r"\{\{\s*(\w+)\s*\}\}", str(s.get("text", "")).strip())
+            if m and m.group(1) not in seen:
+                seen.add(m.group(1))
+                out.append({"name": m.group(1),
+                            "example": str(s.get("_raw_text") or "")})
+        return out
 
     def set_variable(self, rec_id: str, step_index: int, var_name: str) -> bool:
         """把某一步的文本替换为 {{var}} 占位符；var_name 为空则还原为原文本"""

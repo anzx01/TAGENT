@@ -563,9 +563,24 @@ def _write_report(rec_id: str, result, run_context=None):
             )
             fname = f"{report['run_id']}_{rec_id}.json"
         _attach_eval(rec_id, report)
+        # golden-vs-buggy 基线:成功即存黄金用例,之后每次运行与基线确定性比对
+        try:
+            from services import regression_baseline
+            rec_root = BASE_DIR / "recordings" / rec_id
+            report["baseline"] = regression_baseline.compare(rec_root, report)
+            if report.get("success") and report.get("steps"):
+                regression_baseline.save(rec_root, report)
+        except Exception:
+            log.exception("回归基线处理失败")
         (report_dir / fname).write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8")
+        # 运行历史 SQLite 镜像(可查询索引;JSON 仍是事实源)
+        try:
+            from services import run_store
+            run_store.index_one(BASE_DIR / "data" / "runs.db", report, fname)
+        except Exception:
+            log.exception("运行历史入库失败")
     except Exception:
         log.exception("REPORT 写入失败")
 
@@ -614,6 +629,7 @@ class ReplayRequest(BaseModel):
     from_step: int = 0
     resume_checkpoint: bool = False
     trigger: str = "manual"
+    skip_preflight: bool = False
 
 
 @app.get("/")
@@ -715,6 +731,14 @@ def lifecycle_status():
             "startup_enabled": startup_preference(BASE_DIR)}
 
 
+@app.get("/runs/query")
+def query_runs(rec_id: str | None = None, success: bool | None = None, limit: int = 50):
+    """运行历史查询(SQLite 索引;runs/*.json 仍为事实源)。"""
+    from services import run_store
+    return {"ok": True,
+            "runs": run_store.query(BASE_DIR / "data" / "runs.db", rec_id, success, limit)}
+
+
 @app.post("/record/start")
 def start_recording():
     """开始录制。阶段4.5：录制前检测前台应用边界（黑名单进程即时提示）。"""
@@ -802,15 +826,30 @@ def start_replay(req: ReplayRequest):
         step_count = 0
     if step_count == 0:
         return {"ok": False, "msg": "该录制没有捕获任何步骤，请重新录制后再回放"}
+    from_step = req.from_step
     if req.resume_checkpoint:
-        from services.checkpoints import resume_step
+        from services.checkpoints import resume_step, resolve_resume_index
         try:
             task = json.loads(task_file.read_text(encoding="utf-8"))
-            if not resume_step(BASE_DIR / "data" / f"ckpt_{rec_dir.name}.json", task, req.from_step):
+            ckpt = BASE_DIR / "data" / f"ckpt_{rec_dir.name}.json"
+            if not resume_step(ckpt, task, req.from_step):
                 return {"ok": False, "msg": "断点已失效，请从头运行任务"}
+            from_step = resolve_resume_index(ckpt, task, req.from_step)  # 步骤编辑后按 step_id 对齐
         except (OSError, ValueError, TypeError, KeyError):
             return {"ok": False, "msg": "断点已失效，请从头运行任务"}
-    if _launch_replay(rec_dir.name, req.variables or {}, req.from_step, req.trigger):
+    # 回放前置门禁(移植 desktop-recorder 状态指纹):起始窗口不在就拒绝开跑
+    if not req.skip_preflight:
+        from services.replay_gate import check_preflight
+        try:
+            gate_ok, gate_failures = check_preflight(
+                json.loads(task_file.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            gate_ok, gate_failures = True, []
+        if not gate_ok:
+            return {"ok": False, "msg": "前置状态不符：" + "；".join(gate_failures)
+                    + "。请先打开目标应用（或在高级选项跳过门禁）",
+                    "preflight": gate_failures}
+    if _launch_replay(rec_dir.name, req.variables or {}, from_step, req.trigger):
         return {"ok": True, "recording_id": rec_dir.name}
     return {"ok": False, "msg": "没有可回放的内容"}
 
@@ -905,6 +944,8 @@ def replay_status():
         last = player._step_results[-1]
         step_error = last.get("status") == "paused" and "失败" in last.get("detail", "")
     current_state = "paused" if player.paused else state.get("state", "playing")
+    if player.paused and getattr(player, "_pause_kind", "") == "call_user":
+        current_state = "call_user"  # 移植 mano 终态:失败后明确求人工,而非含混 paused
     return {
         "ok": True,
         "playing": True,
