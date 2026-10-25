@@ -41,7 +41,7 @@ py -3 -m venv .venv
 
 ```bash
 ./scripts/build_app.sh        # 先构建 dist/tagent-server.exe(PyInstaller),再打 Tauri 安装包
-# 产物: src-tauri/target/release/bundle/{nsisi,msi}/
+# 产物: src-tauri/target/release/bundle/{nsis,msi}/
 ```
 
 > 打包 exe 必须使用干净的最小依赖 venv(见 `python/requirements.txt`);系统 Python 里若装有 pandas/scipy 会使 exe 体积翻倍。
